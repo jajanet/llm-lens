@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Web UI for browsing/editing/deleting Claude CLI conversation history."""
+"""llm-lens: web UI for browsing/editing/deleting LLM CLI conversation history.
+
+Currently Claude Code only. Provider-specific bits are confined to:
+  - CLAUDE_PROJECTS_DIR (storage location)
+  - _peek_jsonl_cached / _parse_messages_cached (JSONL format parsers)
+  - the mutation endpoints (line-level JSONL ops)
+When adding a second provider, extract these behind a Provider protocol.
+"""
 
 import json
 import os
@@ -373,10 +380,26 @@ def api_delete_project(folder):
 
 @app.route("/")
 def index():
-    return send_from_directory("static", "index.html")
+    return send_from_directory(app.static_folder, "index.html")
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print("Usage: llm-lens [PORT]\n\n"
+              "  PORT    port to bind (default: 5111)\n\n"
+              "Environment:\n"
+              "  LLM_LENS_DEBUG=1   enable Flask auto-reload (dev only)\n")
+        return
+    try:
+        port = int(args[0]) if args else 5111
+    except ValueError:
+        print(f"Error: invalid port '{args[0]}'. Expected an integer.", file=sys.stderr)
+        sys.exit(2)
+    debug = os.environ.get("LLM_LENS_DEBUG") == "1"
+    print(f"llm-lens: http://localhost:{port}")
+    app.run(host="0.0.0.0", port=port, debug=debug)
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5111
-    print(f"Claude Session Browser: http://localhost:{port}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    main()
