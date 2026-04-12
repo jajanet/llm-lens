@@ -1,2 +1,10 @@
 .DS_Store
 .serena
+
+# Python packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
