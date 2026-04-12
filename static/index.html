@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Session Browser</title>
+<link rel="stylesheet" href="/static/css/styles.css">
+<script type="module" src="/static/js/main.js"></script>
+</head>
+<body>
+
+<header>
+  <h1 data-action="nav-projects">Claude Sessions</h1>
+  <div class="breadcrumb" id="breadcrumb"></div>
+  <div class="header-controls">
+    <button class="btn" id="edit-toggle" data-action="toggle-edit" style="display:none">Edit</button>
+    <button class="btn" id="theme-toggle" data-action="toggle-theme">Light</button>
+  </div>
+</header>
+
+<div id="toolbar-area">
+  <div id="toolbar-row">
+    <input id="search-box" placeholder="Filter...">
+    <span class="spacer"></span>
+    <span id="toolbar-extra"></span>
+  </div>
+</div>
+
+<div id="app"><div class="loading">Loading...</div></div>
+
+</body>
+</html>
