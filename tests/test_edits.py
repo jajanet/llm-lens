@@ -11,7 +11,7 @@ import llm_lens
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_lens, "CLAUDE_PROJECTS_DIR", tmp_path)
     llm_lens._peek_jsonl_cached.cache_clear()
-    llm_lens._parse_messages_cached.cache_clear() if hasattr(llm_lens, "_parse_messages_cached") else None
+    llm_lens._parse_messages_cached.cache_clear()
     llm_lens.app.config["TESTING"] = True
     return llm_lens.app.test_client()
 
@@ -365,6 +365,154 @@ def test_resume_safe_after_extract_partial_tool_pair(client, tmp_path):
     )
     new_id = resp.get_json()["new_id"]
     assert_resume_safe(read_jsonl(tmp_path / "proj" / f"{new_id}.jsonl"))
+
+
+# ---------------------------------------------------------------------------
+# Branching (forked conversations)
+# ---------------------------------------------------------------------------
+
+def test_delete_message_with_multiple_children_relinks_all(client, tmp_path):
+    """Deleting B where B has children C and D must re-parent both to A."""
+    convo = "fork1"
+    path = tmp_path / "proj" / f"{convo}.jsonl"
+    write_jsonl(path, [
+        msg("a", None, "root"),
+        msg("b", "a", "fork point"),
+        msg("c", "b", "branch-1"),
+        msg("d", "b", "branch-2"),
+    ])
+
+    resp = client.delete(f"/api/projects/proj/conversations/{convo}/messages/b")
+    assert resp.status_code == 200
+
+    entries = read_jsonl(path)
+    uuids = [e["uuid"] for e in entries]
+    assert "b" not in uuids
+    parents = {e["uuid"]: e["parentUuid"] for e in entries}
+    assert parents["c"] == "a"
+    assert parents["d"] == "a"
+
+
+def test_resume_safe_after_delete_forked_message(client, tmp_path):
+    convo = "fork-r"
+    path = tmp_path / "proj" / f"{convo}.jsonl"
+    write_jsonl(path, [
+        msg("a", None),
+        msg("b", "a"),
+        msg("c", "b"),
+        msg("d", "b"),  # second child of b
+    ])
+    client.delete(f"/api/projects/proj/conversations/{convo}/messages/b")
+    assert_resume_safe(read_jsonl(path))
+
+
+# ---------------------------------------------------------------------------
+# Duplicate: structural integrity
+# ---------------------------------------------------------------------------
+
+def test_duplicate_copies_full_chain_intact(client, tmp_path):
+    convo = "dup1"
+    path = tmp_path / "proj" / f"{convo}.jsonl"
+    write_jsonl(path, [
+        msg("a", None, "root"),
+        msg("b", "a", "child"),
+        tool_use_msg("c", "b", "t1"),
+        tool_result_msg("d", "c", "t1"),
+    ])
+
+    resp = client.post(f"/api/projects/proj/conversations/{convo}/duplicate")
+    assert resp.status_code == 200
+    new_id = resp.get_json()["new_id"]
+    assert new_id != convo
+
+    orig = read_jsonl(path)
+    dup = read_jsonl(tmp_path / "proj" / f"{new_id}.jsonl")
+
+    assert [e["uuid"] for e in orig] == [e["uuid"] for e in dup]
+    assert [e["parentUuid"] for e in orig] == [e["parentUuid"] for e in dup]
+    assert_resume_safe(dup)
+    assert_resume_safe(orig)
+
+
+# ---------------------------------------------------------------------------
+# Bulk-delete edge case
+# ---------------------------------------------------------------------------
+
+def test_bulk_delete_empty_ids_returns_400_or_zero(client, tmp_path):
+    (tmp_path / "proj").mkdir()
+    resp = client.post(
+        "/api/projects/proj/conversations/bulk-delete",
+        json={"ids": []},
+    )
+    assert resp.status_code in (200, 400)
+    if resp.status_code == 200:
+        assert resp.get_json()["deleted"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Multi-tool-use partial orphaning
+# ---------------------------------------------------------------------------
+
+def test_extract_strips_only_orphaned_tool_use_in_multi_block(client, tmp_path):
+    """Assistant message has two tool_use blocks. Extract includes the
+    result for t2 but not t1 — only t1's block should be stripped."""
+    convo = "multi_tool"
+    path = tmp_path / "proj" / f"{convo}.jsonl"
+    write_jsonl(path, [
+        msg("a", None),
+        {
+            "uuid": "b", "parentUuid": "a", "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "t2", "name": "Write", "input": {}},
+            ]},
+        },
+        tool_result_msg("c", "b", "t1"),
+        tool_result_msg("d", "b", "t2"),
+    ])
+
+    # extract b and d only — t1 is orphaned, t2 is intact
+    resp = client.post(
+        f"/api/projects/proj/conversations/{convo}/extract",
+        json={"uuids": ["a", "b", "d"]},
+    )
+    assert resp.status_code == 200
+    new_id = resp.get_json()["new_id"]
+
+    entries = read_jsonl(tmp_path / "proj" / f"{new_id}.jsonl")
+    b_entry = next(e for e in entries if e["uuid"] == "b")
+    tool_ids = [
+        blk["id"] for blk in b_entry["message"]["content"]
+        if blk.get("type") == "tool_use"
+    ]
+    assert "t1" not in tool_ids  # orphaned → stripped
+    assert "t2" in tool_ids      # paired → kept
+    assert_resume_safe(entries)
+
+
+# ---------------------------------------------------------------------------
+# Malformed JSONL
+# ---------------------------------------------------------------------------
+
+def test_malformed_jsonl_line_is_skipped_not_crashed(client, tmp_path):
+    """A truncated / non-JSON line should not crash parse or mutation paths."""
+    convo = "bad1"
+    path = tmp_path / "proj" / f"{convo}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(json.dumps(msg("a", None, "alpha")) + "\n")
+        f.write("this is not json\n")
+        f.write(json.dumps(msg("b", "a", "bravo")) + "\n")
+
+    # parse via GET should not 500
+    resp = client.get(f"/api/projects/proj/conversations/{convo}?limit=1000")
+    assert resp.status_code == 200
+    uuids = [m["uuid"] for m in resp.get_json()["main"]]
+    assert uuids == ["a", "b"]
+
+    # mutation on a file with a bad line should also not 500
+    resp = client.delete(f"/api/projects/proj/conversations/{convo}/messages/a")
+    assert resp.status_code == 200
 
 
 def test_extract_empty_selection_returns_400(client, tmp_path):

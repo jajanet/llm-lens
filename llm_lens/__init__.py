@@ -250,10 +250,7 @@ def api_conversation(folder, convo_id):
     main, side = _parse_messages_cached(str(filepath), stat.st_mtime, stat.st_size)
 
     total_main = len(main)
-    if offset == 0 and limit < total_main:
-        page_start = max(0, total_main - limit)
-    else:
-        page_start = offset
+    page_start = offset
     page_main = main[page_start:page_start + limit]
 
     return jsonify({

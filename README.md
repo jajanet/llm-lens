@@ -2,13 +2,29 @@
 
 ![demo](https://raw.githubusercontent.com/jajanet/llm-lens/main/demo.gif)
 
-A local web UI for browsing, searching, and managing the conversation history stored by LLM CLIs. Currently supports [Claude Code](https://claude.ai/code), which saves every session as a `.jsonl` file under `~/.claude/projects/`. `llm-lens-web` gives you a browser-based interface into that data so you don't have to dig through raw JSON on the command line.
+A local, offline web UI for browsing and pruning the conversation history your LLM CLI has already written to disk. Currently supports [Claude Code](https://claude.ai/code), which saves every session as a `.jsonl` file under `~/.claude/projects/`.
+
+**No API key. No auth. No agent.** This tool never talks to Anthropic's API, never invokes the `claude` CLI, and can't send new messages — it only reads and rewrites the JSONL files on your machine. Everything is local filesystem I/O.
 
 The architecture is designed to accommodate other provider backends (OpenAI Codex CLI, Gemini CLI, etc.) — see [Extending to other providers](#extending-to-other-providers) — but today only Claude Code is implemented.
 
 ## Why this exists
 
-Claude Code accumulates session history fast. After a few weeks of active use you can have hundreds of conversations spread across dozens of projects, with no built-in way to browse, search, or prune them. This tool solves that — it reads the same directory Claude Code writes to and gives you a real UI to manage it.
+Claude Code accumulates session history fast. After a few weeks of active use you can have hundreds of conversations spread across dozens of projects, with no built-in way to browse or prune them. This tool is a light browser-based UI for that directory.
+
+A few read-only viewers already cover the browsing side well (see [Related tools](#related-tools) below). What this tool adds beyond browsing today is **basic message-level editing** — delete individual messages, extract a subset of messages into a new conversation, duplicate or bulk-delete conversations. These edits are still **best-effort**: Claude Code's `/resume` replay semantics aren't publicly documented, so a destructive edit can in some cases break resume of that conversation. See [Editing conversations: prefer non-destructive actions](#editing-conversations-prefer-non-destructive-actions) for the warning, and `docs/issue-1-diagnose.md` / `docs/issue-2-repair.md` / `docs/issue-3-synthesize.md` for the planned work to make editing robust (diagnose / repair / synthesize).
+
+## Related tools
+
+If all you need is a read-only browser, these cover that ground well:
+
+- [d-kimuson/claude-code-viewer](https://github.com/d-kimuson/claude-code-viewer) — web UI that also runs Claude Code itself (needs an API key or the `claude` CLI)
+- [jhlee0409/claude-code-history-viewer](https://github.com/jhlee0409/claude-code-history-viewer) — multi-provider desktop app, session-level delete only
+- [InDate/claude-log-viewer](https://github.com/InDate/claude-log-viewer) — read-only live viewer with usage analytics
+- [matt1398/claude-devtools](https://github.com/matt1398/claude-devtools) — DevTools-style inspector (token attribution, compaction viz)
+- [raine/claude-history](https://github.com/raine/claude-history) — fuzzy-search CLI
+
+`llm-lens-web`'s positioning vs those: **offline-only** (no API key, no agent) and the only one that attempts **message-level editing** of existing conversations — with the caveats above.
 
 ## What it does
 
