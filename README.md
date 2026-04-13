@@ -1,5 +1,7 @@
 # llm-lens
 
+![demo](https://raw.githubusercontent.com/jajanet/llm-lens/main/demo.gif)
+
 A local web UI for browsing, searching, and managing the conversation history stored by LLM CLIs. Currently supports [Claude Code](https://claude.ai/code), which saves every session as a `.jsonl` file under `~/.claude/projects/`. `llm-lens` gives you a browser-based interface into that data so you don't have to dig through raw JSON on the command line.
 
 The architecture is designed to accommodate other provider backends (OpenAI Codex CLI, Gemini CLI, etc.) — see [Extending to other providers](#extending-to-other-providers) — but today only Claude Code is implemented.

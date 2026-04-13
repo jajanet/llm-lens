@@ -52,9 +52,8 @@ if [[ "$TARGET" == "test" ]]; then
     TWINE_USERNAME="__token__" TWINE_PASSWORD="$TESTPYPI_TOKEN" \
         twine upload --repository testpypi dist/*
     echo
-    echo "Done. Smoke-test with:"
-    echo "  pipx install --index-url https://test.pypi.org/simple/ \\"
-    echo "    --pip-args='--extra-index-url https://pypi.org/simple/' llm-lens"
+    echo "Done. Smoke-test with (one line, no backslash):"
+    echo "  pipx install --index-url https://test.pypi.org/simple/ --pip-args='--extra-index-url https://pypi.org/simple/' llm-lens"
 else
     : "${PYPI_TOKEN:?PYPI_TOKEN not set in .pypi-token}"
     echo

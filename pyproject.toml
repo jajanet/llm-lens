@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-lens"
-version = "0.1.1"
+version = "0.1.3"
 description = "Local web UI for browsing and managing LLM CLI conversation history (currently: Claude Code)."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -29,8 +29,8 @@ dependencies = [
 llm-lens = "llm_lens:main"
 
 [project.urls]
-Homepage = "https://github.com/janet/llm-lens"
-Repository = "https://github.com/janet/llm-lens"
+Homepage = "https://github.com/jajanet/llm-lens"
+Repository = "https://github.com/jajanet/llm-lens"
 
 [tool.setuptools.packages.find]
 include = ["llm_lens*"]
