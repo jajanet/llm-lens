@@ -1,8 +1,8 @@
-# llm-lens
+# llm-lens-web
 
 ![demo](https://raw.githubusercontent.com/jajanet/llm-lens/main/demo.gif)
 
-A local web UI for browsing, searching, and managing the conversation history stored by LLM CLIs. Currently supports [Claude Code](https://claude.ai/code), which saves every session as a `.jsonl` file under `~/.claude/projects/`. `llm-lens` gives you a browser-based interface into that data so you don't have to dig through raw JSON on the command line.
+A local web UI for browsing, searching, and managing the conversation history stored by LLM CLIs. Currently supports [Claude Code](https://claude.ai/code), which saves every session as a `.jsonl` file under `~/.claude/projects/`. `llm-lens-web` gives you a browser-based interface into that data so you don't have to dig through raw JSON on the command line.
 
 The architecture is designed to accommodate other provider backends (OpenAI Codex CLI, Gemini CLI, etc.) — see [Extending to other providers](#extending-to-other-providers) — but today only Claude Code is implemented.
 
@@ -55,16 +55,16 @@ The recommended way is [`pipx`](https://pipx.pypa.io/) or [`uv tool`](https://do
 
 ```bash
 # with pipx
-pipx install llm-lens
+pipx install llm-lens-web
 
 # or with uv
-uv tool install llm-lens
+uv tool install llm-lens-web
 ```
 
 Then run:
 
 ```bash
-llm-lens
+llm-lens-web
 ```
 
 and open [http://localhost:5111](http://localhost:5111) in your browser.
@@ -72,7 +72,7 @@ and open [http://localhost:5111](http://localhost:5111) in your browser.
 To use a different port:
 
 ```bash
-llm-lens 8080
+llm-lens-web 8080
 ```
 
 The server binds to `0.0.0.0` so it is also reachable from other devices on your local network on whatever port you choose. It has no authentication — only run it on a trusted network.
@@ -80,15 +80,15 @@ The server binds to `0.0.0.0` so it is also reachable from other devices on your
 ### Alternative: plain pip
 
 ```bash
-pip install llm-lens
-llm-lens
+pip install llm-lens-web
+llm-lens-web
 ```
 
 ### Upgrading / uninstalling
 
 ```bash
-pipx upgrade llm-lens      # or: uv tool upgrade llm-lens
-pipx uninstall llm-lens    # or: uv tool uninstall llm-lens
+pipx upgrade llm-lens-web      # or: uv tool upgrade llm-lens-web
+pipx uninstall llm-lens-web    # or: uv tool uninstall llm-lens-web
 ```
 
 ---
@@ -126,7 +126,7 @@ No frontend build step. No bundler. No npm. The frontend is plain ES modules loa
 git clone <repo-url>
 cd llm-lens
 pip install -e .
-LLM_LENS_DEBUG=1 llm-lens
+LLM_LENS_DEBUG=1 llm-lens-web
 ```
 
 `-e` (editable) installs the package so code edits take effect immediately. Setting `LLM_LENS_DEBUG=1` enables Flask's auto-reloader.
@@ -175,7 +175,7 @@ All mutation endpoints invalidate the in-process LRU cache and return `{"ok": tr
 
 ## Extending to other providers
 
-Today `llm-lens` only supports Claude Code. The codebase is single-provider but structured so a second provider is straightforward to add. The Claude-specific surface area is small:
+Today `llm-lens-web` only supports Claude Code. The codebase is single-provider but structured so a second provider is straightforward to add. The Claude-specific surface area is small:
 
 - `CLAUDE_PROJECTS_DIR` — where to look on disk
 - `_peek_jsonl_cached` / `_parse_messages_cached` — JSONL shape (`message.role`, content blocks `text`/`tool_use`/`tool_result`/`thinking`, `isSidechain`, `isMeta`, `file-history-snapshot`, `uuid`, `cwd`, `timestamp`)
@@ -187,6 +187,6 @@ When adding a second provider, the recommended refactor is:
 2. Move the existing Claude logic into `llm_lens/providers/claude_code.py` behind that interface.
 3. Add the new provider as a sibling module.
 4. Add a `:provider` segment to API routes (`/api/:provider/projects/...`) and a provider selector to the frontend.
-5. Declare per-provider dependencies as `[project.optional-dependencies]` extras in `pyproject.toml`, e.g. `pip install llm-lens[codex]`.
+5. Declare per-provider dependencies as `[project.optional-dependencies]` extras in `pyproject.toml`, e.g. `pip install llm-lens-web[codex]`.
 
 Don't pre-build this abstraction before the second provider exists — extract it from two working implementations rather than guessing.

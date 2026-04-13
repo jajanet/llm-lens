@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release flow for llm-lens.
+# Release flow for llm-lens-web.
 #
 # Usage:
 #   ./release.sh test    # upload to TestPyPI
@@ -36,7 +36,7 @@ for tool in pyproject-build twine; do
 done
 
 VERSION=$(grep -E '^version' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-echo "Building llm-lens $VERSION..."
+echo "Building llm-lens-web $VERSION..."
 
 rm -rf dist/ build/
 pyproject-build
@@ -53,11 +53,11 @@ if [[ "$TARGET" == "test" ]]; then
         twine upload --repository testpypi dist/*
     echo
     echo "Done. Smoke-test with (one line, no backslash):"
-    echo "  pipx install --index-url https://test.pypi.org/simple/ --pip-args='--extra-index-url https://pypi.org/simple/' llm-lens"
+    echo "  pipx install --index-url https://test.pypi.org/simple/ --pip-args='--extra-index-url https://pypi.org/simple/' llm-lens-web"
 else
     : "${PYPI_TOKEN:?PYPI_TOKEN not set in .pypi-token}"
     echo
-    read -r -p "Upload llm-lens $VERSION to real PyPI? [y/N] " ans
+    read -r -p "Upload llm-lens-web $VERSION to real PyPI? [y/N] " ans
     if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
         echo "Aborted."
         exit 0
@@ -66,5 +66,5 @@ else
         twine upload dist/*
     echo
     echo "Done. Users can install with:"
-    echo "  pipx install llm-lens"
+    echo "  pipx install llm-lens-web"
 fi
