@@ -186,7 +186,10 @@ export function openConvo(id) {
 export function deleteConvo(id) {
   showConfirmModal({
     title: "Delete conversation?",
-    body: "Permanently delete this conversation?",
+    body: `Permanently deletes the <code>.jsonl</code> file from
+      <code>~/.claude/projects/</code>. <strong>Cannot be undone</strong>, and
+      you won't be able to <code>/resume</code> it after.
+      <br><br>Click <em>Dup</em> first if you want a backup.`,
     onConfirm: async () => {
       await api.deleteConversation(state.folder, id);
       invalidateProjectsCache();
@@ -206,7 +209,9 @@ export function bulkDelete() {
   if (!ids.length) return;
   showConfirmModal({
     title: `Delete ${ids.length} conversations?`,
-    body: "Cannot be undone.",
+    body: `Permanently deletes ${ids.length} <code>.jsonl</code> files from
+      <code>~/.claude/projects/</code>. <strong>Cannot be undone</strong>, and
+      you won't be able to <code>/resume</code> any of them after.`,
     onConfirm: async () => {
       await api.bulkDeleteConversations(state.folder, ids);
       state.selected.clear();

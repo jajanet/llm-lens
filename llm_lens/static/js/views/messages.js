@@ -205,7 +205,12 @@ export async function copyMsg(uuid) {
 export function deleteMsg(uuid) {
   showConfirmModal({
     title: "Delete message?",
-    body: "Remove this message from the conversation?",
+    body: `Rewrites the original conversation file in place. This may break
+      <code>/resume</code> for this conversation — Claude Code's replay
+      semantics aren't publicly documented.
+      <br><br><strong>Prefer Edit mode → "Save to new convo"</strong> to curate
+      non-destructively, or duplicate this conversation first if you care
+      about preserving it.`,
     onConfirm: async () => {
       await api.deleteMessage(state.folder, state.convoId, uuid);
       show(state.folder, state.convoId);
@@ -246,7 +251,12 @@ export function deleteSelected() {
   if (!uuids.length) return;
   showConfirmModal({
     title: `Delete ${uuids.length} messages?`,
-    body: "Cannot be undone.",
+    body: `Rewrites the original conversation file in place. Cannot be undone,
+      and may break <code>/resume</code> for this conversation — Claude Code's
+      replay semantics aren't publicly documented.
+      <br><br><strong>Prefer "Save to new convo"</strong> (non-destructive,
+      creates a copy), or duplicate this conversation first if you care about
+      preserving it.`,
     onConfirm: async () => {
       for (const u of uuids) {
         await api.deleteMessage(state.folder, state.convoId, u);

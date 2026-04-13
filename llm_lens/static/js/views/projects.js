@@ -140,7 +140,10 @@ export function openProject(folder, path) {
 export function deleteProject(folder, name) {
   showConfirmModal({
     title: "Delete project?",
-    body: `Permanently delete ${esc(name)}?`,
+    body: `Permanently deletes <strong>${esc(name)}</strong> and every
+      conversation inside it from <code>~/.claude/projects/</code>.
+      <strong>Cannot be undone</strong>, and none of these conversations will
+      be resumable after.`,
     onConfirm: async () => {
       await api.deleteProject(folder);
       invalidateProjectsCache();
