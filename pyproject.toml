@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-lens"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local web UI for browsing and managing LLM CLI conversation history (currently: Claude Code)."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "janet" }]
 keywords = ["claude", "claude-code", "llm", "cli", "history", "sessions"]
 classifiers = [
@@ -16,7 +16,6 @@ classifiers = [
     "Environment :: Web Environment",
     "Framework :: Flask",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
