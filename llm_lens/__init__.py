@@ -297,27 +297,83 @@ def api_duplicate_conversation(folder, convo_id):
     return jsonify({"ok": True, "new_id": new_id})
 
 
+def _tool_use_ids(entry):
+    msg = entry.get("message") or {}
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return []
+    return [b.get("id") for b in content if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")]
+
+
+def _strip_blocks(entry, drop_tool_use_ids=None, drop_tool_result_ids=None):
+    """Remove tool_use/tool_result blocks whose ids are in the given sets.
+    Returns True if the message still has content, False if it's now empty."""
+    msg = entry.get("message") or {}
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return True
+    drop_tu = drop_tool_use_ids or set()
+    drop_tr = drop_tool_result_ids or set()
+    kept = []
+    for b in content:
+        if not isinstance(b, dict):
+            kept.append(b)
+            continue
+        if b.get("type") == "tool_use" and b.get("id") in drop_tu:
+            continue
+        if b.get("type") == "tool_result" and b.get("tool_use_id") in drop_tr:
+            continue
+        kept.append(b)
+    msg["content"] = kept
+    return bool(kept)
+
+
 @app.route("/api/projects/<folder>/conversations/<convo_id>/messages/<msg_uuid>", methods=["DELETE"])
 def api_delete_message(folder, convo_id, msg_uuid):
     filepath = CLAUDE_PROJECTS_DIR / folder / f"{convo_id}.jsonl"
     if not filepath.exists():
         return jsonify({"error": "Not found"}), 404
-    lines = []
+
     with open(filepath, "r") as f:
-        for line in f:
-            stripped = line.strip()
-            if not stripped:
-                lines.append(line)
+        raw_lines = f.readlines()
+
+    entries = []
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            entries.append(json.loads(stripped))
+        except json.JSONDecodeError:
+            continue
+
+    deleted = next((e for e in entries if e.get("uuid") == msg_uuid), None)
+    if not deleted:
+        return jsonify({"error": "Message not found"}), 404
+
+    deleted_parent = deleted.get("parentUuid")
+    orphaned_tool_use_ids = set(_tool_use_ids(deleted))
+
+    out = []
+    for e in entries:
+        if e.get("uuid") == msg_uuid:
+            continue
+        if e.get("parentUuid") == msg_uuid:
+            e["parentUuid"] = deleted_parent
+        if orphaned_tool_use_ids:
+            has_content = _strip_blocks(e, drop_tool_result_ids=orphaned_tool_use_ids)
+            if not has_content:
+                # message became empty after stripping refs — skip it and
+                # re-point its children to its parent
+                for child in entries:
+                    if child.get("parentUuid") == e.get("uuid"):
+                        child["parentUuid"] = e.get("parentUuid")
                 continue
-            try:
-                entry = json.loads(stripped)
-                if entry.get("uuid") == msg_uuid:
-                    continue
-            except json.JSONDecodeError:
-                pass
-            lines.append(line)
+        out.append(e)
+
     with open(filepath, "w") as f:
-        f.writelines(lines)
+        for e in out:
+            f.write(json.dumps(e) + "\n")
     _invalidate_cache_for(filepath)
     return jsonify({"ok": True})
 
@@ -334,20 +390,62 @@ def api_extract_messages(folder, convo_id):
 
     new_id = str(uuid_mod.uuid4())
     dst = CLAUDE_PROJECTS_DIR / folder / f"{new_id}.jsonl"
-    with open(src, "r") as fin, open(dst, "w") as fout:
+
+    with open(src, "r") as fin:
+        all_entries = []
         for line in fin:
             stripped = line.strip()
             if not stripped:
                 continue
             try:
-                entry = json.loads(stripped)
+                all_entries.append(json.loads(stripped))
             except json.JSONDecodeError:
                 continue
-            if entry.get("type") == "file-history-snapshot":
-                fout.write(line)
+
+    by_uuid = {e.get("uuid"): e for e in all_entries if e.get("uuid")}
+
+    # Walk up to nearest extracted ancestor; None if none exist above.
+    def remap_parent(entry):
+        p = entry.get("parentUuid")
+        while p and p not in uuids:
+            parent = by_uuid.get(p)
+            if not parent:
+                return None
+            p = parent.get("parentUuid")
+        return p
+
+    # Any tool_use/tool_result whose counterpart isn't in the extracted set
+    # gets its block stripped (not the whole message dropped).
+    extracted_tool_use_ids = set()
+    extracted_tool_result_ids = set()
+    for e in all_entries:
+        if e.get("uuid") in uuids:
+            extracted_tool_use_ids.update(_tool_use_ids(e))
+            extracted_tool_result_ids.update(
+                b.get("tool_use_id") for b in (e.get("message") or {}).get("content", [])
+                if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id")
+            )
+
+    orphan_tool_uses = extracted_tool_use_ids - extracted_tool_result_ids
+    orphan_tool_results = extracted_tool_result_ids - extracted_tool_use_ids
+
+    with open(dst, "w") as fout:
+        for e in all_entries:
+            if e.get("type") == "file-history-snapshot":
+                fout.write(json.dumps(e) + "\n")
                 continue
-            if entry.get("uuid") in uuids:
-                fout.write(line)
+            if e.get("uuid") not in uuids:
+                continue
+            has_content = _strip_blocks(
+                e,
+                drop_tool_use_ids=orphan_tool_uses,
+                drop_tool_result_ids=orphan_tool_results,
+            )
+            if not has_content:
+                continue
+            e["parentUuid"] = remap_parent(e)
+            fout.write(json.dumps(e) + "\n")
+
     _invalidate_cache_for(dst)
     return jsonify({"ok": True, "new_id": new_id})
 
