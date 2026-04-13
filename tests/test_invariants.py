@@ -530,29 +530,43 @@ def test_offset_zero_with_limit_ge_total_returns_head(client, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Dedup behavior (parser collapses repeated content)
+# Dedup behavior (parser collapses true replay duplicates, not repeated content)
 # ---------------------------------------------------------------------------
 
-def test_parser_dedups_messages_with_identical_content(client, tmp_path):
-    """Entries sharing content collapse to one. Asserts only that dedup
-    happened — not which copy won — so the test doesn't break if the
-    keep-first/keep-last policy flips."""
+def test_parser_keeps_distinct_uuids_even_with_identical_content(client, tmp_path):
+    """Different uuids with the same content must ALL survive. Claude Code
+    convos legitimately repeat strings like '[Tool Result]' across dozens
+    of messages — collapsing those by content hid hundreds of real messages."""
     path = tmp_path / "proj" / "c.jsonl"
     write_jsonl(path, [
         msg("a", None, "duplicate text"),
         msg("b", "a", "middle unique"),
-        msg("c", "b", "duplicate text"),     # same content as "a"
+        msg("c", "b", "duplicate text"),     # same content, different uuid
         msg("d", "c", "tail unique"),
     ])
 
     data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
     uuids = [m["uuid"] for m in data["main"]]
 
-    assert data["total"] == 3                # 4 entries → 3 after dedup
-    assert "b" in uuids and "d" in uuids
-    # exactly one of the duplicate-content pair survives
-    surviving = [u for u in uuids if u in ("a", "c")]
-    assert len(surviving) == 1
+    assert data["total"] == 4
+    assert uuids == ["a", "b", "c", "d"]
+
+
+def test_parser_dedups_repeated_uuids(client, tmp_path):
+    """Same uuid appearing twice (a /resume replay) collapses to one entry."""
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [
+        msg("a", None, "hello"),
+        msg("b", "a", "world"),
+        msg("a", None, "hello"),             # replay duplicate
+        msg("c", "b", "bye"),
+    ])
+
+    data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
+    uuids = [m["uuid"] for m in data["main"]]
+
+    assert data["total"] == 3
+    assert uuids == ["a", "b", "c"]
 
 
 # ---------------------------------------------------------------------------

@@ -118,14 +118,20 @@ def _parse_messages_cached(filepath_str: str, mtime: float, size: int):
             (side if is_sidechain else main).append(msg)
 
     def dedup(msgs):
+        # Drop duplicate uuids (can happen when Claude Code /resume appends
+        # replay entries). Keep the first occurrence so chronological order
+        # and parent links stay stable. Content-based dedup was wrong: tool
+        # messages like "[Tool Result]" repeat legitimately and must not
+        # collapse.
         seen = set()
         out = []
-        for m in reversed(msgs):
-            if m["content"] and m["content"] in seen:
-                continue
-            seen.add(m["content"])
+        for m in msgs:
+            uid = m.get("uuid")
+            if uid is not None:
+                if uid in seen:
+                    continue
+                seen.add(uid)
             out.append(m)
-        out.reverse()
         return out
 
     return dedup(main), dedup(side)
