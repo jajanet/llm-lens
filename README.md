@@ -39,6 +39,16 @@ Three-level navigation mirroring Claude Code's own storage layout:
 
 **What it doesn't do:** it has no write path back to Claude Code. Deleting or editing sessions here does not affect any running Claude Code process — it only modifies the files on disk.
 
+### Editing conversations: prefer non-destructive actions
+
+Claude Code's `/resume` replay semantics aren't publicly documented, so any destructive edit to a conversation `.jsonl` is best-effort. If you care about being able to `/resume` an edited conversation:
+
+- **Prefer *Extract* (Edit mode → "Save to new convo")** over deleting messages. It writes a new conversation file and leaves the original untouched, so you can always fall back to the original if replay misbehaves.
+- **If you must delete**, duplicate the conversation first (Conversations view → Dup), so the original is preserved.
+- Deleting a whole conversation or project is fine — those just remove files and don't touch message chains.
+
+The tool tries to keep edits "resume-safe" (re-links `parentUuid` chains, strips orphan `tool_use` / `tool_result` blocks), but there may be other undocumented invariants Claude Code's replay relies on.
+
 ---
 
 ## For users: running it

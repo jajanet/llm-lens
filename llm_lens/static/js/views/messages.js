@@ -88,8 +88,8 @@ export function render() {
       <div class="sel-bar">
         <span>${state.msgSelected.size} selected</span>
         <button class="btn" data-action="copy-selected">Copy</button>
-        <button class="btn" data-action="save-selected">Save to new convo</button>
-        <button class="btn-danger" style="border-color:rgba(255,255,255,0.4);color:#fff" data-action="delete-selected">Delete</button>
+        <button class="btn" data-action="save-selected" title="Non-destructive: creates a new conversation, leaves this one intact. Preferred for curation.">Save to new convo</button>
+        <button class="btn-danger" style="border-color:rgba(255,255,255,0.4);color:#fff" data-action="delete-selected" title="Rewrites original file in place. May break /resume in edge cases — duplicate the conversation first if you care about it.">Delete</button>
         <span style="flex:1"></span>
         <button class="btn" data-action="clear-selection">Clear</button>
       </div>
@@ -152,7 +152,7 @@ function renderChatMessages(msgs, query) {
     const actionsHtml = m.uuid
       ? `<span class="msg-actions-row">
           <button class="btn btn-sm" data-action="copy-msg" data-uuid="${escAttr(m.uuid)}" title="Copy">Copy</button>
-          <button class="btn-danger btn-sm btn-del-msg" data-action="delete-msg" data-uuid="${escAttr(m.uuid)}" title="Delete">x</button>
+          <button class="btn-danger btn-sm btn-del-msg" data-action="delete-msg" data-uuid="${escAttr(m.uuid)}" title="Delete this message (rewrites file — may break /resume). Prefer Edit mode → Save to new convo for curation.">x</button>
         </span>`
       : "";
 
