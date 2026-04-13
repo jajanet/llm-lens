@@ -249,14 +249,19 @@ def api_conversation(folder, convo_id):
     if not filepath.exists():
         return jsonify({"error": "Conversation not found"}), 404
 
-    offset = int(request.args.get("offset", 0))
     limit = int(request.args.get("limit", 50))
+    offset_arg = request.args.get("offset")
 
     stat = filepath.stat()
     main, side = _parse_messages_cached(str(filepath), stat.st_mtime, stat.st_size)
 
     total_main = len(main)
-    page_start = offset
+    # Default to the most recent page (chat-style), so long conversations
+    # open at the latest messages and the "Earlier" button can page backwards.
+    if offset_arg is None:
+        page_start = max(0, total_main - limit)
+    else:
+        page_start = max(0, min(int(offset_arg), total_main))
     page_main = main[page_start:page_start + limit]
 
     return jsonify({
