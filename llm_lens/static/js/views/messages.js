@@ -2,9 +2,9 @@
 
 import { state } from "../state.js";
 import { api } from "../api.js";
-import { esc, escAttr, highlightText } from "../utils.js";
+import { esc, escAttr, highlightText, renderStatsModalBody } from "../utils.js";
 import { configureToolbar } from "../toolbar.js";
-import { showConfirmModal } from "../modal.js";
+import { showConfirmModal, showInfoModal } from "../modal.js";
 import { navigate } from "../router.js";
 
 const app = document.getElementById("app");
@@ -77,7 +77,7 @@ export function render() {
     for (const m of side) {
       const role = m.role === "user" ? "user" : "assistant";
       const c = processContent(m.content || "");
-      if (c) h += `<div class="side-msg ${role}"><div class="msg-content">${c}</div></div>`;
+      if (c.html) h += `<div class="side-msg ${role}"><div class="msg-content">${c.html}</div></div>`;
     }
     h += "</div>";
   }
@@ -114,53 +114,132 @@ function processContent(raw) {
   });
 
   const toolBadges = [];
+  const toolNames = [];
   c = c.replace(/\[Tool: ([^\]]+)\]/g, (_, name) => {
     const ph = `__TOOL_${toolBadges.length}__`;
     toolBadges.push(`<span class="tool-badge">${esc(name)}</span>`);
+    toolNames.push(name);
     return ph;
   });
   c = c.replace(/\[Tool Result\]/g, () => {
     const ph = `__TOOL_${toolBadges.length}__`;
     toolBadges.push('<span class="tool-badge">Result</span>');
+    toolNames.push("Result");
     return ph;
   });
 
   c = c.replace(/\n{3,}/g, "\n\n").trim();
 
   const visible = c.replace(/__THINK_\d+__/g, "").replace(/__TOOL_\d+__/g, "").trim();
-  if (!visible && !thinkingBlocks.length && !toolBadges.length) return "";
+  const hasText = Boolean(visible);
+  const hasTools = toolBadges.length > 0;
+  if (!hasText && !thinkingBlocks.length && !hasTools) return { html: "", hasText: false, toolNames: [] };
 
   c = esc(c);
   thinkingBlocks.forEach((html, i) => { c = c.replace(`__THINK_${i}__`, html); });
   toolBadges.forEach((html, i) => { c = c.replace(`__TOOL_${i}__`, html); });
   c = c.replace(/\n/g, "<br>");
-  return c;
+  return { html: c, hasText, toolNames };
 }
 
 function renderChatMessages(msgs, query) {
-  let h = "";
+  // First pass: process each message and compute {rendered, hasText, toolNames}.
+  const processed = [];
   for (const m of msgs) {
-    const role = m.role === "user" ? "user" : "assistant";
-    let c = processContent(m.content || "");
-    if (!c) continue;
-    if (query) c = highlightText(c, query);
+    const c = processContent(m.content || "");
+    if (!c.html) continue;
+    const finalHtml = query ? highlightText(c.html, query) : c.html;
+    processed.push({ m, html: finalHtml, hasText: c.hasText, toolNames: c.toolNames });
+  }
 
-    const ck = state.msgSelected.has(m.uuid) ? "checked" : "";
-    const checkHtml = m.uuid
-      ? `<input type="checkbox" class="chat-check" ${ck} data-action="toggle-msg-sel" data-uuid="${escAttr(m.uuid)}">`
-      : "";
-    const actionsHtml = m.uuid
-      ? `<span class="msg-actions-row">
-          <button class="btn btn-sm" data-action="copy-msg" data-uuid="${escAttr(m.uuid)}" title="Copy">Copy</button>
-          <button class="btn-danger btn-sm btn-del-msg" data-action="delete-msg" data-uuid="${escAttr(m.uuid)}" title="Delete this message (rewrites file — may break /resume). Prefer Edit mode → Save to new convo for curation.">x</button>
-        </span>`
-      : "";
+  // Second pass: coalesce consecutive tool-only messages into groups. A match
+  // in the query forces a group open so search hits stay visible.
+  const qLower = (query || "").toLowerCase();
+  const groups = [];
+  let i = 0;
+  while (i < processed.length) {
+    const p = processed[i];
+    const isToolOnly = !p.hasText && p.toolNames.length > 0;
+    if (!isToolOnly) {
+      groups.push({ kind: "msg", items: [p] });
+      i++;
+      continue;
+    }
+    // Collect run of tool-only messages
+    const run = [];
+    let forceOpen = false;
+    while (i < processed.length) {
+      const q = processed[i];
+      const qToolOnly = !q.hasText && q.toolNames.length > 0;
+      if (!qToolOnly) break;
+      run.push(q);
+      if (qLower && (q.m.content || "").toLowerCase().includes(qLower)) forceOpen = true;
+      i++;
+    }
+    if (run.length === 1) {
+      // Don't bother grouping a single tool bubble — render it directly
+      // in the compact-tool style via the normal path below.
+      groups.push({ kind: "msg", items: run, compact: true });
+    } else {
+      groups.push({ kind: "group", items: run, forceOpen });
+    }
+  }
 
-    const ts = m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : "";
-
-    h += `<div class="chat-msg ${role}">${checkHtml}<div class="chat-bubble">${actionsHtml}<div class="chat-meta"><span class="role-lbl">${role}</span><span>${ts}</span></div><div class="msg-content">${c}</div></div></div>`;
+  let h = "";
+  for (const g of groups) {
+    if (g.kind === "group") {
+      const firstUuid = g.items[0]?.m?.uuid || "";
+      const expanded = g.forceOpen || expandedGroups.has(firstUuid);
+      h += renderToolGroup(g.items, firstUuid, expanded);
+    } else {
+      for (const p of g.items) h += renderSingleMsg(p, g.compact);
+    }
   }
   return h;
+}
+
+
+// Tracked per module so collapse/expand survives re-renders without plumbing
+// new fields through state.js. Keyed on the first message's uuid in a group.
+const expandedGroups = new Set();
+
+function renderSingleMsg(p, compact) {
+  const { m, html: c } = p;
+  const role = m.role === "user" ? "user" : "assistant";
+  const ck = state.msgSelected.has(m.uuid) ? "checked" : "";
+  const checkHtml = m.uuid
+    ? `<input type="checkbox" class="chat-check" ${ck} data-action="toggle-msg-sel" data-uuid="${escAttr(m.uuid)}">`
+    : "";
+  const actionsHtml = m.uuid
+    ? `<span class="msg-actions-row">
+        <button class="btn btn-sm" data-action="copy-msg" data-uuid="${escAttr(m.uuid)}" title="Copy">Copy</button>
+        <button class="btn-danger btn-sm btn-del-msg" data-action="delete-msg" data-uuid="${escAttr(m.uuid)}" title="Delete this message (rewrites file — may break /resume). Prefer Edit mode → Save to new convo for curation.">x</button>
+      </span>`
+    : "";
+  const ts = m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : "";
+  const bubbleCls = compact ? "chat-bubble tool-bubble" : "chat-bubble";
+  const metaHtml = compact
+    ? ""
+    : `<div class="chat-meta"><span class="role-lbl">${role}</span><span>${ts}</span></div>`;
+  return `<div class="chat-msg ${role}${compact ? " compact" : ""}">${checkHtml}<div class="${bubbleCls}">${actionsHtml}${metaHtml}<div class="msg-content">${c}</div></div></div>`;
+}
+
+function renderToolGroup(items, groupId, expanded) {
+  const names = items.flatMap((p) => p.toolNames);
+  const preview = names.slice(0, 6).map(esc).join(" · ");
+  const more = names.length > 6 ? ` …+${names.length - 6}` : "";
+  const caret = expanded ? "▾" : "▸";
+  const summary = `<div class="tool-group-summary" data-action="toggle-tool-group" data-group-id="${escAttr(groupId)}">
+    <span class="tool-caret">${caret}</span>
+    <span class="tool-group-label">${items.length} tool calls</span>
+    <span class="tool-group-names">— ${preview}${more}</span>
+  </div>`;
+
+  if (!expanded) {
+    return `<div class="tool-group collapsed">${summary}</div>`;
+  }
+  const inner = items.map((p) => renderSingleMsg(p, true)).join("");
+  return `<div class="tool-group expanded">${summary}${inner}</div>`;
 }
 
 // === Actions ===
@@ -266,3 +345,31 @@ export function deleteSelected() {
     },
   });
 }
+
+
+// Stats modal for the currently-open conversation. Fetches the detailed stats
+// endpoint (same shape as the batch one used on the list view) and renders
+// a structured table rather than the compact inline chip strip.
+export async function showStats() {
+  if (!state.folder || !state.convoId) return;
+  showInfoModal({ title: "Conversation stats", body: '<div class="stats-loading">loading...</div>' });
+  let s;
+  try {
+    s = await api.singleConversationStats(state.folder, state.convoId);
+  } catch {
+    const box = document.querySelector(".modal .modal-body");
+    if (box) box.innerHTML = '<div class="stats-dim">Failed to load stats.</div>';
+    return;
+  }
+  const box = document.querySelector(".modal .modal-body");
+  if (box) box.innerHTML = renderStatsModalBody(s);
+}
+
+
+export function toggleToolGroup(groupId) {
+  if (expandedGroups.has(groupId)) expandedGroups.delete(groupId);
+  else expandedGroups.add(groupId);
+  render();
+}
+
+

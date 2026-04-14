@@ -24,3 +24,22 @@ export function showConfirmModal({ title, body, onConfirm, confirmLabel = "Delet
     }
   });
 }
+
+
+// Read-only info modal (no confirm action). Body may be HTML.
+export function showInfoModal({ title, body }) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>${title}</h3>
+      <div class="modal-body">${body}</div>
+      <div class="modal-actions">
+        <button class="btn-cancel" data-modal-cancel>Close</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay || e.target.matches("[data-modal-cancel]")) overlay.remove();
+  });
+}

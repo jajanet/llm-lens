@@ -30,8 +30,26 @@ export function hideToolbar() {
 
 export function updateEditButton() {
   const btn = document.getElementById("edit-toggle");
-  btn.style.display = state.view === "messages" ? "" : "none";
-  if (state.view !== "messages" && state.editMode) {
+  const editable = state.view === "messages" || state.view === "conversations" || state.view === "projects";
+  btn.style.display = editable ? "" : "none";
+  const refreshBtn = document.getElementById("refresh-toggle");
+  if (refreshBtn) refreshBtn.style.display = state.view === "conversations" ? "" : "none";
+  const statsBtn = document.getElementById("stats-toggle");
+  if (statsBtn) {
+    statsBtn.style.display = state.view === "messages" ? "" : "none";
+  }
+  const overviewStatsBtn = document.getElementById("overview-stats-toggle");
+  if (overviewStatsBtn) {
+    // The overview (and its Stats modal) now scopes automatically to the
+    // current folder when inside a project, so the same button serves both
+    // the global landing page and per-project conversations view.
+    overviewStatsBtn.style.display =
+      (state.view === "projects" || state.view === "conversations") ? "" : "none";
+  }
+  const projectStatsBtn = document.getElementById("project-stats-toggle");
+  if (projectStatsBtn) projectStatsBtn.style.display = "none";
+  document.body.dataset.view = state.view || "";
+  if (!editable && state.editMode) {
     state.editMode = false;
     document.body.classList.remove("edit-mode");
     btn.textContent = "Edit";

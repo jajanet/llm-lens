@@ -24,8 +24,12 @@ function toggleEditMode() {
   const btn = document.getElementById("edit-toggle");
   btn.textContent = state.editMode ? "Done" : "Edit";
   btn.classList.toggle("active", state.editMode);
-  if (!state.editMode) state.msgSelected.clear();
+  if (!state.editMode) {
+    state.msgSelected.clear();
+    state.selected.clear();
+  }
   if (state.view === "messages") Messages.render();
+  else if (state.view === "conversations") Conversations.render();
 }
 
 // --- Routes ---
@@ -63,6 +67,12 @@ const actions = {
   // Projects view
   "sort-projects":    (_e, el) => Projects.sortBy(el.dataset.col),
   "delete-project":   (_e, el) => Projects.deleteProject(el.dataset.folder, el.dataset.name),
+  "set-overview-range":(e)     => Projects.setOverviewRange(e.target.value),
+  "overview-nav-prev":()       => Projects.navOverview(-1),
+  "overview-nav-next":()       => Projects.navOverview(+1),
+  "set-overview-mode":(e)      => Projects.setOverviewMode(e.target.value),
+  "set-overview-size":(e)      => Projects.setOverviewSize(e.target.value),
+  "open-overview-stats":()     => Projects.openOverviewStats(),
 
   // Conversations view
   "sort-convos":      (_e, el) => Conversations.sortBy(el.dataset.col),
@@ -72,9 +82,19 @@ const actions = {
   "duplicate-convo":  (_e, el) => Conversations.duplicateConvo(el.dataset.id),
   "bulk-delete-convos":()      => Conversations.bulkDelete(),
   "load-more-convos": ()       => Conversations.loadMore(),
+  "refresh-convos":   ()       => Conversations.refreshCache(),
+  "open-project-stats":()      => Conversations.openProjectStats(),
+  "copy-resume":      (_e, el) => Conversations.copyResume(el.dataset.id),
 
   // Messages view
   "load-earlier-msgs":()       => Messages.loadEarlier(),
+  "open-stats-modal": ()       => {
+    // Dispatch by view so the same header button works on both the project
+    // list (aggregated) and single-convo (detailed) pages.
+    if (state.view === "conversations") Conversations.showStats();
+    else Messages.showStats();
+  },
+  "toggle-tool-group":(_e, el) => Messages.toggleToolGroup(el.dataset.groupId),
   "toggle-side":      ()       => Messages.toggleSide(),
   "toggle-msg-sel":   (_e, el) => Messages.toggleMsgSel(el.dataset.uuid),
   "copy-msg":         (_e, el) => Messages.copyMsg(el.dataset.uuid),
@@ -95,6 +115,55 @@ const actions = {
     else if (state.view === "conversations") Conversations.setMode(mode);
   },
 };
+
+// <select> fires `change`, not `click` — delegate both so the actions map
+// stays the single source of truth.
+document.body.addEventListener("change", (e) => {
+  const el = e.target;
+  if (!el.matches || !el.matches("select[data-action]")) return;
+  const handler = actions[el.dataset.action];
+  if (handler) handler(e, el);
+});
+
+// Instant tooltip for the overview chart. SVG <title> has a browser-imposed
+// ~500ms delay; this mimics the behavior via a div shown on mouseover.
+document.body.addEventListener("mouseover", (e) => {
+  const group = e.target.closest && e.target.closest(".ov-bar-group");
+  if (!group) return;
+  const graph = group.closest(".overview-graph");
+  if (!graph) return;
+  const tip = graph.querySelector(":scope > .ov-tip");
+  if (!tip) return;
+  tip.innerHTML = group.dataset.tip || "";
+  tip.style.display = "block";
+});
+document.body.addEventListener("mousemove", (e) => {
+  const group = e.target.closest && e.target.closest(".ov-bar-group");
+  if (!group) return;
+  const graph = group.closest(".overview-graph");
+  if (!graph) return;
+  const tip = graph.querySelector(":scope > .ov-tip");
+  if (!tip || tip.style.display === "none") return;
+  const rect = graph.getBoundingClientRect();
+  const tipW = tip.offsetWidth || 180;
+  let x = e.clientX - rect.left + 14;
+  // Flip to the left side of the cursor if we'd overflow the graph's right edge.
+  if (x + tipW > rect.width - 4) x = e.clientX - rect.left - tipW - 14;
+  const y = e.clientY - rect.top + 14;
+  tip.style.left = Math.max(4, x) + "px";
+  tip.style.top = y + "px";
+});
+document.body.addEventListener("mouseout", (e) => {
+  const group = e.target.closest && e.target.closest(".ov-bar-group");
+  if (!group) return;
+  // Check if we're moving to another bar-group — if so, keep tip visible;
+  // the mouseover handler will repopulate.
+  const to = e.relatedTarget;
+  if (to && to.closest && to.closest(".ov-bar-group")) return;
+  const graph = group.closest(".overview-graph");
+  const tip = graph && graph.querySelector(":scope > .ov-tip");
+  if (tip) tip.style.display = "none";
+});
 
 document.body.addEventListener("click", (e) => {
   // closest() finds the nearest [data-action] ancestor-or-self, so clicks on

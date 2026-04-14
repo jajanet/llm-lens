@@ -86,6 +86,17 @@ table.tbl .col-size, table.tbl .col-count, table.tbl .col-time { white-space: no
 table.tbl .col-time { color: var(--text3); }
 table.tbl .col-actions { white-space: nowrap; text-align: right; }
 table.tbl .col-check { width: 28px; }
+table.tbl .col-name {
+  max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; color: var(--accent);
+}
+.card .card-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; color: var(--accent); margin-bottom: 6px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.card .card-name:empty { display: none; }
 
 /* Cards */
 .card-grid { max-width: 960px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
@@ -207,3 +218,263 @@ body.edit-mode .chat-bubble .msg-actions-row .btn-del-msg { display: inline-flex
 
 .highlight { background: yellow; color: #000; border-radius: 2px; }
 body.light .highlight { background: #fff59d; }
+
+table.tbl .col-name.col-name-dim, .card .card-name.card-name-dim { color: var(--text3); opacity: 0.55; }
+.col-name-clickable { cursor: copy; }
+.col-name-clickable:hover { text-decoration: underline; }
+
+#toast {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(8px);
+  background: var(--bg2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 14px; font-size: 13px;
+  opacity: 0; pointer-events: none; transition: opacity 0.15s, transform 0.15s; z-index: 200;
+}
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* Conversations view: gate selection + per-item delete/dup behind Edit mode,
+   matching how messages view gates its bubble actions. Always-on actions
+   (open, copy-resume, refresh) remain visible. */
+body[data-view="conversations"]:not(.edit-mode) .col-check,
+body[data-view="conversations"]:not(.edit-mode) .col-actions,
+body[data-view="conversations"]:not(.edit-mode) .item-check,
+body[data-view="conversations"]:not(.edit-mode) [data-action="duplicate-convo"],
+body[data-view="conversations"]:not(.edit-mode) [data-action="delete-convo"] {
+  display: none;
+}
+
+body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
+  display: none;
+}
+
+/* Per-convo stats block (card view only). Populated by hydrateStats once
+   server-side scanning finishes; shows "loading..." placeholder until then. */
+.card .card-stats {
+  display: flex; flex-wrap: wrap; gap: 4px 10px;
+  margin: 8px 0 6px; padding: 6px 8px;
+  background: var(--bg3); border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; color: var(--text2);
+}
+.card .card-stats .stats-pair { white-space: nowrap; }
+.card .card-stats .stats-pair .k { color: var(--text3); margin-right: 3px; }
+.card .card-stats .stats-models { flex-basis: 100%; }
+.card .card-stats .stats-dim { color: var(--text3); font-style: italic; }
+.is-loading { animation: lens-pulse 1.2s ease-in-out infinite; }
+@keyframes lens-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.8; }
+}
+
+/* Stats modal (messages view). Uses existing .modal shell from modal.js. */
+.modal .modal-body { margin: 8px 0 14px; }
+.modal .stats-loading { color: var(--text3); font-style: italic; animation: lens-pulse 1.2s ease-in-out infinite; }
+.modal .stats-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.modal .stats-table td { padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.modal .stats-table td.stats-k { color: var(--text2); width: 50%; }
+.modal .stats-table td.stats-v {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+}
+.modal .stats-table .stats-dim { color: var(--text3); font-style: italic; }
+
+/* Stats modal additions — caveat note + tool breakdown subheading. */
+.modal .stats-table .stats-note { font-size: 10px; color: var(--text3); font-style: italic; font-weight: normal; }
+.modal .stats-subheading { font-size: 12px; color: var(--text2); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: 0.3px; font-weight: 600; }
+.modal .stats-total td { border-top: 2px solid var(--border); border-bottom: none; font-weight: 600; }
+.card .card-stats .stats-tools { flex-basis: 100%; }
+
+/* Tool-only message compaction. A consecutive run of tool_use/tool_result
+   messages collapses into one summary row. A single tool message gets the
+   .compact class directly. Text bubbles are unchanged. */
+.chat-msg.compact { margin-bottom: 2px; }
+.chat-msg.compact .chat-bubble.tool-bubble {
+  padding: 3px 8px; font-size: 11px; line-height: 1.3;
+  background: var(--bg3); border: 1px solid var(--border);
+  color: var(--text2); max-width: 75%; border-radius: 6px;
+}
+.chat-msg.compact .chat-bubble.tool-bubble .msg-content { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.chat-msg.compact .chat-bubble.tool-bubble .tool-badge {
+  background: transparent; border: none; padding: 0; font-size: 11px; color: var(--text2);
+}
+
+.tool-group {
+  margin: 2px 0;
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+}
+.tool-group-summary {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; color: var(--text3); cursor: pointer;
+  padding: 3px 4px; user-select: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.tool-group-summary:hover { color: var(--text); }
+.tool-group-summary .tool-caret { color: var(--text2); width: 12px; text-align: center; }
+.tool-group-summary .tool-group-label { color: var(--text2); }
+.tool-group-summary .tool-group-names {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;
+}
+.tool-group.expanded .tool-group-summary { border-bottom: 1px dotted var(--border); margin-bottom: 4px; }
+
+/* Collapsible stats sections in the modal. <details>/<summary> gives native
+   behavior with zero JS; we just restyle the caret and spacing. */
+.modal .stats-section { margin-top: 10px; }
+.modal .stats-section:first-of-type { margin-top: 0; }
+.modal .stats-section > summary {
+  font-size: 12px; color: var(--text2); cursor: pointer;
+  padding: 4px 0; user-select: none;
+  text-transform: uppercase; letter-spacing: 0.3px; font-weight: 600;
+  list-style: none;
+}
+.modal .stats-section > summary::-webkit-details-marker { display: none; }
+.modal .stats-section > summary::before {
+  content: "▸"; display: inline-block; width: 14px; color: var(--text3);
+  transition: transform 0.1s;
+}
+.modal .stats-section[open] > summary::before { transform: rotate(90deg); }
+.modal .stats-section > summary:hover { color: var(--heading); }
+.modal .stats-section > .stats-table { margin-top: 4px; }
+
+/* "+N" badge for model / branches overflow in the compact card strip. */
+.card .card-stats .stats-more {
+  color: var(--text3); font-size: 10px;
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 0 5px; margin-left: 2px;
+}
+
+/* Landing-page overview bar: stats strip + daily token bar chart. */
+.overview-bar {
+  max-width: 960px; margin: 12px auto 8px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 8px;
+}
+.overview-header {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.overview-title {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.4px; color: var(--text2);
+}
+.overview-range {
+  background: var(--bg3); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 2px 6px; font-size: 11px; cursor: pointer;
+}
+.overview-stats { /* reuses .card-stats internals */ }
+.overview-meta { font-size: 11px; color: var(--text3); }
+.overview-graph { margin-top: 4px; }
+.overview-graph .overview-empty { font-size: 11px; color: var(--text3); padding: 8px 0; }
+.overview-bars {
+  width: 100%; height: 72px; display: block;
+  shape-rendering: crispEdges;
+}
+.overview-bars .ov-bar {
+  fill: var(--accent); opacity: 0.7;
+  transition: opacity 0.1s;
+}
+.overview-bars .ov-bar:hover { opacity: 1; }
+.overview-axis {
+  display: flex; justify-content: space-between;
+  font-size: 10px; color: var(--text3); margin-top: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Mirror card-stats chip rules for the overview bar's stats strip. */
+.overview-bar .overview-stats {
+  display: flex; flex-wrap: wrap; gap: 4px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; color: var(--text2);
+}
+.overview-bar .overview-stats .stats-pair { white-space: nowrap; }
+.overview-bar .overview-stats .stats-pair .k { color: var(--text3); margin-right: 3px; }
+.overview-bar .overview-stats .stats-tools,
+.overview-bar .overview-stats .stats-models { flex-basis: 100%; }
+.overview-bar .overview-stats .stats-dim { color: var(--text3); font-style: italic; }
+
+/* Stacked-bar overview graph. Each bar's height = sum of 4 segments; colors
+   disambiguate input/output/cache read/cache write. Hover invisible .ov-hit
+   gives a per-bucket <title> tooltip covering the full bar footprint. */
+.overview-bars { height: 120px; }
+.overview-bars .ov-bar { transition: filter 0.1s; }
+.overview-bars .ov-hit { cursor: pointer; }
+.overview-bars .seg-cread   { fill: var(--text3); opacity: 0.55; }
+.overview-bars .seg-cwrite  { fill: var(--accent); opacity: 0.45; }
+.overview-bars .seg-input   { fill: var(--accent); opacity: 0.75; }
+.overview-bars .seg-output  { fill: var(--accent); opacity: 1.0; }
+.overview-bars .ov-axis-label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px; fill: var(--text3);
+}
+.overview-bars .ov-max-label { font-size: 9px; fill: var(--text2); }
+
+.ov-legend {
+  display: flex; flex-wrap: wrap; gap: 10px;
+  font-size: 10px; color: var(--text2); margin-top: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.ov-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.ov-legend-sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.ov-legend-sw.seg-cread   { background: var(--text3); opacity: 0.55; }
+.ov-legend-sw.seg-cwrite  { background: var(--accent); opacity: 0.45; }
+.ov-legend-sw.seg-input   { background: var(--accent); opacity: 0.75; }
+.ov-legend-sw.seg-output  { background: var(--accent); }
+
+/* Per-bar hover: whole group (segments + hit rect) brightens together.
+   Fixes the old sibling-selector bug where wrong bars highlighted. */
+.overview-bars .ov-bar-group:hover .ov-bar { filter: brightness(1.35); }
+
+/* Size toggle: compact (default 120px) vs expanded (~320px). The viewBox's H
+   is set in JS; CSS just pins the rendered height. */
+.overview-bars.ov-size-compact  { height: 120px; }
+.overview-bars.ov-size-expanded { height: min(540px, 66vh); min-height: 280px; }
+
+/* Tools mode: segments get inline fill from the palette, but we still want
+   a sane default if any CSS-only bar leaks through. */
+.overview-bars .seg-tool-other { fill: var(--text3); opacity: 0.7; }
+
+/* Custom tooltip for overview chart. Positioned absolutely inside
+   .overview-graph, populated via delegated mouse handlers in main.js. No
+   browser-imposed delay — shows the instant you hover a bar. */
+.overview-graph { position: relative; }
+.overview-graph .ov-tip {
+  position: absolute; z-index: 10; pointer-events: none;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; min-width: 160px; max-width: 280px;
+  font-size: 11px; color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.overview-graph .ov-tip .ov-tip-hdr {
+  color: var(--heading); font-weight: 600; font-size: 11px;
+  margin-bottom: 4px; padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.overview-graph .ov-tip .ov-tip-row {
+  display: flex; justify-content: space-between; gap: 10px;
+  line-height: 1.5; color: var(--text2);
+}
+.overview-graph .ov-tip .ov-tip-k { display: inline-flex; align-items: center; gap: 5px; }
+.overview-graph .ov-tip .ov-tip-v { color: var(--text); }
+.overview-graph .ov-tip .ov-tip-total {
+  margin-top: 3px; padding-top: 3px;
+  border-top: 1px solid var(--border);
+  color: var(--heading); font-weight: 600;
+}
+.overview-graph .ov-tip .ov-tip-total .ov-tip-v { color: var(--heading); }
+
+/* 10x10 color chip for the inline segment labels in the tooltip. */
+.overview-graph .ov-tip .seg-swatch {
+  display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+  vertical-align: middle;
+}
+.overview-graph .ov-tip .seg-swatch.seg-cread   { background: var(--text3); opacity: 0.55; }
+.overview-graph .ov-tip .seg-swatch.seg-cwrite  { background: var(--accent); opacity: 0.45; }
+.overview-graph .ov-tip .seg-swatch.seg-input   { background: var(--accent); opacity: 0.75; }
+.overview-graph .ov-tip .seg-swatch.seg-output  { background: var(--accent); }
+
+/* Prominent period label next to "Overview" in the bar header. Updates on
+   every range/nav change so the user always sees what window they're on. */
+.overview-header .overview-period {
+  font-size: 13px; color: var(--heading); font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  margin-left: 8px;
+}

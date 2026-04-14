@@ -35,6 +35,39 @@ export const api = {
       body: JSON.stringify({ ids }),
     }),
 
+  conversationNames: (folder, ids) =>
+    json(`/api/projects/${folder}/names`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }),
+
+  refreshCache: (folder) =>
+    json(`/api/projects/${folder}/refresh-cache`, { method: "POST" }),
+
+  conversationStats: (folder, ids) =>
+    json(`/api/projects/${folder}/stats`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }),
+
+  singleConversationStats: (folder, convoId) =>
+    json(`/api/projects/${folder}/conversations/${convoId}/stats`),
+
+  projectStats: (folders) =>
+    json(`/api/projects/stats`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folders }),
+    }),
+
+  overview: (range = "all", offset = 0, folder = null) => {
+    const params = new URLSearchParams({ range, offset: String(offset) });
+    if (folder) params.set("folder", folder);
+    return json(`/api/overview?${params}`);
+  },
+
   deleteMessage: (folder, convoId, msgUuid) =>
     json(`/api/projects/${folder}/conversations/${convoId}/messages/${msgUuid}`, { method: "DELETE" }),
 

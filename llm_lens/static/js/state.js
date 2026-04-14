@@ -29,6 +29,13 @@ export const state = {
   msgData: null,
 
   projectsCache: null,
+
+  overviewRange: "day",
+  overviewOffset: 0,
+  overviewMode: "tools",
+  overviewSize: "compact",
+  overviewScope: null,   // null = global; or project folder id
+  overview: null,
 };
 
 export function persist(key, value) {
