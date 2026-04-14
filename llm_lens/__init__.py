@@ -16,9 +16,21 @@ import shutil
 import uuid as uuid_mod
 from functools import lru_cache
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _mtime_iso(mtime: float) -> str:
+    """Convert a POSIX mtime (UTC epoch) to an ISO-8601 UTC string.
+
+    Using `datetime.fromtimestamp(mtime)` (no tz) gives a naive *local* time;
+    suffixing `Z` would lie about the zone and cause the JS side to shift
+    by the server's UTC offset a second time. Always anchor to UTC.
+    """
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 from flask import Flask, jsonify, request, send_from_directory
+
+from . import peek_cache
 
 app = Flask(__name__, static_folder="static")
 
@@ -63,7 +75,126 @@ def _peek_jsonl_cached(filepath_str: str, mtime: float, size: int) -> dict:
 
 
 def _peek(filepath: Path, stat: os.stat_result) -> dict:
-    return _peek_jsonl_cached(str(filepath), stat.st_mtime, stat.st_size)
+    cached = peek_cache.get(filepath, stat)
+    if cached and "preview" in cached:
+        return {"cwd": cached.get("cwd"), "preview": cached["preview"], "first_ts": cached.get("first_ts")}
+    result = _peek_jsonl_cached(str(filepath), stat.st_mtime, stat.st_size)
+    peek_cache.set(filepath, stat, preview=result["preview"], cwd=result["cwd"], first_ts=result["first_ts"])
+    return result
+
+
+@lru_cache(maxsize=512)
+def _custom_title_cached(filepath_str: str, mtime: float, size: int):
+    """Scan a JSONL for a `{type: "custom-title", customTitle: "..."}` line.
+
+    `/rename` writes this line at whatever position it was issued, so the
+    head-only peek can't see it — we scan the whole file but short-circuit
+    JSON parsing with a substring pre-filter, and cache by (path,mtime,size).
+    """
+    try:
+        with open(filepath_str, "r") as fh:
+            for line in fh:
+                if '"custom-title"' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") == "custom-title" and entry.get("customTitle"):
+                    return entry["customTitle"]
+    except OSError:
+        pass
+    return None
+
+
+def _custom_title(filepath: Path, stat: os.stat_result):
+    cached = peek_cache.get(filepath, stat)
+    if cached and "custom_title" in cached:
+        return cached["custom_title"]
+    title = _custom_title_cached(str(filepath), stat.st_mtime, stat.st_size)
+    peek_cache.set(filepath, stat, custom_title=title)
+    return title
+
+
+# Keys extracted in one whole-file pass. Collected together so we pay the
+# I/O cost once per file rev.
+_STATS_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens",
+               "cache_creation_tokens", "models", "tool_uses",
+               "thinking_count", "git_branch")
+
+
+@lru_cache(maxsize=256)
+def _stats_cached(filepath_str: str, mtime: float, size: int):
+    """One-pass aggregation of model(s), token totals, tool-use and thinking
+    block counts, and the session's starting git branch. Token counts come
+    from each assistant message's real `message.usage` — no estimation.
+    """
+    input_tokens = output_tokens = cache_read = cache_creation = 0
+    models = []
+    tool_uses = {}
+    thinking_count = 0
+    git_branch = None
+
+    try:
+        with open(filepath_str, "r") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if git_branch is None and entry.get("gitBranch"):
+                    git_branch = entry["gitBranch"]
+
+                msg = entry.get("message") or {}
+                if msg.get("role") != "assistant":
+                    continue
+
+                model = msg.get("model")
+                if model and model not in models:
+                    models.append(model)
+
+                usage = msg.get("usage") or {}
+                input_tokens += int(usage.get("input_tokens") or 0)
+                output_tokens += int(usage.get("output_tokens") or 0)
+                cache_read += int(usage.get("cache_read_input_tokens") or 0)
+                cache_creation += int(usage.get("cache_creation_input_tokens") or 0)
+
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        t = block.get("type")
+                        if t == "tool_use":
+                            name = block.get("name") or "?"
+                            tool_uses[name] = tool_uses.get(name, 0) + 1
+                        elif t == "thinking":
+                            thinking_count += 1
+    except OSError:
+        pass
+
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read,
+        "cache_creation_tokens": cache_creation,
+        "models": models,
+        "tool_uses": tool_uses,
+        "thinking_count": thinking_count,
+        "git_branch": git_branch,
+    }
+
+
+def _stats(filepath, stat) -> dict:
+    cached = peek_cache.get(filepath, stat)
+    if cached and all(k in cached for k in _STATS_KEYS):
+        return {k: cached[k] for k in _STATS_KEYS}
+    stats = _stats_cached(str(filepath), stat.st_mtime, stat.st_size)
+    peek_cache.set(filepath, stat, **stats)
+    return stats
 
 
 @lru_cache(maxsize=128)
@@ -181,7 +312,7 @@ def api_projects():
             "path": peek["cwd"] or d.name,
             "conversation_count": len(files),
             "total_size_kb": round(total_kb, 1),
-            "last_activity": datetime.fromtimestamp(newest_stat.st_mtime).isoformat() + "Z",
+            "last_activity": _mtime_iso(newest_stat.st_mtime),
             "latest_preview": peek["preview"][:150],
         })
 
@@ -192,6 +323,189 @@ def api_projects():
 # ---------------------------------------------------------------------------
 # API: Conversations (paginated)
 # ---------------------------------------------------------------------------
+
+_RANGE_SECONDS = {
+    "day":   86_400,
+    "week":  7 * 86_400,
+    "month": 30 * 86_400,
+    "year":  365 * 86_400,
+}
+
+# Bucket granularity per range — each range's bar chart segments the span
+# into the next-smaller unit: all->year, year->month, month->week, week->day,
+# day->hour. Matches how people actually think about time filtering.
+_RANGE_BUCKET = {
+    "all":   "year",
+    "year":  "month",
+    "month": "week",
+    "week":  "day",
+    "day":   "hour",
+}
+
+
+def _bucket_key(mtime: float, bucket: str) -> str:
+    dt = datetime.fromtimestamp(mtime)
+    if bucket == "hour":  return dt.strftime("%Y-%m-%d %H")
+    if bucket == "day":   return dt.strftime("%Y-%m-%d")
+    if bucket == "week":
+        y, w, _ = dt.isocalendar()
+        return f"{y}-W{w:02d}"
+    if bucket == "month": return dt.strftime("%Y-%m")
+    if bucket == "year":  return dt.strftime("%Y")
+    return dt.strftime("%Y-%m-%d")
+
+
+@app.route("/api/overview")
+def api_overview():
+    """Account-wide totals + per-day buckets, filtered by convo mtime.
+
+    Cheap bucketing: each jsonl is assigned entirely to its last_modified date.
+    A session that spans multiple days lands on whatever day it was last
+    touched. Good enough for an activity heatmap; per-turn bucketing is a
+    future upgrade if needed.
+    """
+    import time
+    rng = request.args.get("range", "all")
+    try:
+        offset = int(request.args.get("offset", 0))
+    except ValueError:
+        offset = 0
+    now = time.time()
+    bucket_unit = _RANGE_BUCKET.get(rng, "day")
+
+    # Windowed filter: `offset=0` is the current period ending now; negative
+    # offsets page backward, positive would page forward (usually empty).
+    range_sec = _RANGE_SECONDS.get(rng)
+    if range_sec is None:
+        cutoff = None
+        cutoff_upper = None
+    else:
+        window_end = now + offset * range_sec
+        cutoff = window_end - range_sec
+        cutoff_upper = window_end
+    since_iso = (datetime.utcfromtimestamp(cutoff).isoformat() + "Z") if cutoff else None
+    until_iso = (datetime.utcfromtimestamp(cutoff_upper).isoformat() + "Z") if cutoff_upper else None
+
+    totals = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_creation_tokens": 0,
+        "tool_uses": {}, "thinking_count": 0,
+    }
+    models_seen: list = []
+    branches_seen: list = []
+    by_period: dict = {}
+    convo_count = 0
+
+    if not CLAUDE_PROJECTS_DIR.exists():
+        return jsonify({"range": rng, "bucket": bucket_unit, "offset": offset,
+                        "since": since_iso, "until": until_iso,
+                        "totals": totals, "convo_count": 0, "by_period": {}})
+
+    # Optional folder scope — when set, only that project's jsonls contribute.
+    folder = request.args.get("folder")
+    if folder:
+        scoped = CLAUDE_PROJECTS_DIR / folder
+        dirs = [scoped] if scoped.is_dir() else []
+    else:
+        dirs = [d for d in CLAUDE_PROJECTS_DIR.iterdir() if d.is_dir()]
+
+    for project_dir in dirs:
+        if not project_dir.is_dir():
+            continue
+        for fp in project_dir.glob("*.jsonl"):
+            try:
+                stat = fp.stat()
+            except OSError:
+                continue
+            if cutoff is not None and stat.st_mtime < cutoff:
+                continue
+            if cutoff_upper is not None and stat.st_mtime >= cutoff_upper:
+                continue
+            s = _stats(fp, stat)
+            convo_count += 1
+            for k in ("input_tokens", "output_tokens", "cache_read_tokens",
+                      "cache_creation_tokens", "thinking_count"):
+                totals[k] += s.get(k) or 0
+            for name, count in (s.get("tool_uses") or {}).items():
+                totals["tool_uses"][name] = totals["tool_uses"].get(name, 0) + count
+            for m in s.get("models") or []:
+                if m and m not in models_seen:
+                    models_seen.append(m)
+            b = s.get("git_branch")
+            if b and b not in branches_seen:
+                branches_seen.append(b)
+
+            key = _bucket_key(stat.st_mtime, bucket_unit)
+            bucket = by_period.setdefault(key, {
+                "input_tokens": 0, "cache_read_tokens": 0,
+                "cache_creation_tokens": 0, "output_tokens": 0,
+                "tool_calls": 0, "tool_uses": {}, "convos": 0,
+            })
+            bucket["input_tokens"] += s.get("input_tokens") or 0
+            bucket["cache_read_tokens"] += s.get("cache_read_tokens") or 0
+            bucket["cache_creation_tokens"] += s.get("cache_creation_tokens") or 0
+            bucket["output_tokens"] += s.get("output_tokens") or 0
+            for name, count in (s.get("tool_uses") or {}).items():
+                bucket["tool_uses"][name] = bucket["tool_uses"].get(name, 0) + count
+            bucket["tool_calls"] += sum((s.get("tool_uses") or {}).values())
+            bucket["convos"] += 1
+
+    totals["models"] = models_seen
+    totals["branches"] = branches_seen
+    return jsonify({
+        "range": rng,
+        "bucket": bucket_unit,
+        "offset": offset,
+        "since": since_iso,
+        "until": until_iso,
+        "totals": totals,
+        "convo_count": convo_count,
+        "by_period": by_period,
+    })
+
+
+@app.route("/api/projects/stats", methods=["POST"])
+def api_projects_stats():
+    """Aggregate per-convo stats up to the project level. Intended for the
+    landing page to hydrate its cards after the initial list renders.
+
+    Cold cache: scans every jsonl in every requested folder (cached per file
+    via peek_cache, so subsequent hits are ~free).
+    """
+    folders = (request.get_json(silent=True) or {}).get("folders") or []
+    out = {}
+    for folder in folders:
+        project_dir = CLAUDE_PROJECTS_DIR / folder
+        if not project_dir.exists():
+            continue
+        totals = {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "tool_uses": {}, "thinking_count": 0,
+        }
+        models_seen: list = []
+        branches_seen: list = []
+        for fp in project_dir.glob("*.jsonl"):
+            try:
+                s = _stats(fp, fp.stat())
+            except OSError:
+                continue
+            for k in ("input_tokens", "output_tokens", "cache_read_tokens",
+                      "cache_creation_tokens", "thinking_count"):
+                totals[k] += s.get(k) or 0
+            for name, count in (s.get("tool_uses") or {}).items():
+                totals["tool_uses"][name] = totals["tool_uses"].get(name, 0) + count
+            for m in s.get("models") or []:
+                if m and m not in models_seen:
+                    models_seen.append(m)
+            b = s.get("git_branch")
+            if b and b not in branches_seen:
+                branches_seen.append(b)
+        totals["models"] = models_seen
+        totals["branches"] = branches_seen
+        out[folder] = totals
+    return jsonify(out)
+
 
 @app.route("/api/projects/<folder>/conversations")
 def api_conversations(folder):
@@ -223,13 +537,18 @@ def api_conversations(folder):
         c = {
             "id": f.stem,
             "size_kb": round(size_kb, 1),
-            "last_modified": datetime.fromtimestamp(stat.st_mtime).isoformat() + "Z",
+            "last_modified": _mtime_iso(stat.st_mtime),
             "preview": peek["preview"][:150],
             "cwd": peek["cwd"],
         }
         if sort == "msgs":
-            with open(f, "rb") as fh:
-                c["message_count"] = sum(1 for _ in fh)
+            cached = peek_cache.get(f, stat)
+            if cached and "message_count" in cached:
+                c["message_count"] = cached["message_count"]
+            else:
+                with open(f, "rb") as fh:
+                    c["message_count"] = sum(1 for _ in fh)
+                peek_cache.set(f, stat, message_count=c["message_count"])
         convos.append(c)
 
     if sort == "msgs":
@@ -237,6 +556,75 @@ def api_conversations(folder):
         convos = convos[offset:offset + limit]
 
     return jsonify({"items": convos, "total": total, "offset": offset, "limit": limit})
+
+
+@app.route("/api/projects/<folder>/refresh-cache", methods=["POST"])
+def api_refresh_cache(folder):
+    """Drop all sidecar and in-process cache entries for this project.
+
+    Escape hatch for suspected cache staleness. Correctness shouldn't require
+    this (cache keys on mtime+size), but network-mounted dirs with clock skew
+    or manually rewritten jsonls can still surprise us.
+    """
+    project_dir = CLAUDE_PROJECTS_DIR / folder
+    if not project_dir.exists():
+        return jsonify({"error": "Project not found"}), 404
+    peek_cache.invalidate_folder(project_dir)
+    # Clear in-process lru_caches too. They're global (not per-folder), so
+    # this drops entries for every project — fine, they refill lazily.
+    _peek_jsonl_cached.cache_clear()
+    _custom_title_cached.cache_clear()
+    _parse_messages_cached.cache_clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/projects/<folder>/stats", methods=["POST"])
+def api_conversation_stats(folder):
+    """Batch lookup of per-convo stats (tokens, models, tool/thinking counts,
+    git branch). Separate endpoint so the list renders fast and cards
+    hydrate in the background; first scan is cached persistently.
+    """
+    project_dir = CLAUDE_PROJECTS_DIR / folder
+    if not project_dir.exists():
+        return jsonify({"error": "Project not found"}), 404
+
+    ids = (request.get_json(silent=True) or {}).get("ids") or []
+    out = {}
+    for convo_id in ids:
+        fp = project_dir / f"{convo_id}.jsonl"
+        if not fp.exists():
+            continue
+        out[convo_id] = _stats(fp, fp.stat())
+    return jsonify(out)
+
+
+@app.route("/api/projects/<folder>/conversations/<convo_id>/stats")
+def api_single_conversation_stats(folder, convo_id):
+    fp = CLAUDE_PROJECTS_DIR / folder / f"{convo_id}.jsonl"
+    if not fp.exists():
+        return jsonify({"error": "Conversation not found"}), 404
+    return jsonify(_stats(fp, fp.stat()))
+
+
+@app.route("/api/projects/<folder>/names", methods=["POST"])
+def api_conversation_names(folder):
+    """Batch lookup of `/rename`-assigned titles. Separate endpoint so the
+    conversations list can render immediately and hydrate names in the background.
+    """
+    project_dir = CLAUDE_PROJECTS_DIR / folder
+    if not project_dir.exists():
+        return jsonify({"error": "Project not found"}), 404
+
+    ids = (request.get_json(silent=True) or {}).get("ids") or []
+    out = {}
+    for convo_id in ids:
+        fp = project_dir / f"{convo_id}.jsonl"
+        if not fp.exists():
+            continue
+        title = _custom_title(fp, fp.stat())
+        if title:
+            out[convo_id] = title
+    return jsonify(out)
 
 
 # ---------------------------------------------------------------------------
