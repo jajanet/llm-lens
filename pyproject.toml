@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-lens-web"
-version = "0.1.6"
+version = "0.2.0"
 description = "Local web UI for browsing and managing LLM CLI conversation history (currently: Claude Code)."
 readme = "README.md"
 requires-python = ">=3.8"
