@@ -209,6 +209,8 @@ body.edit-mode .chat-bubble .msg-actions-row .btn-del-msg { display: inline-flex
   background: var(--modal-bg); display: flex; align-items: center; justify-content: center; z-index: 100;
 }
 .modal { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 24px; max-width: 400px; width: 90%; }
+.modal:has(.stats-matrix) { max-width: 780px; }
+.modal:has(.stats-matrix) .modal-body { overflow-x: auto; }
 .modal h3 { color: var(--red); margin-bottom: 12px; font-size: 16px; }
 .modal p { color: var(--text2); font-size: 13px; margin-bottom: 20px; }
 .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
@@ -220,8 +222,31 @@ body.edit-mode .chat-bubble .msg-actions-row .btn-del-msg { display: inline-flex
 body.light .highlight { background: #fff59d; }
 
 table.tbl .col-name.col-name-dim, .card .card-name.card-name-dim { color: var(--text3); opacity: 0.55; }
-.col-name-clickable { cursor: copy; }
-.col-name-clickable:hover { text-decoration: underline; }
+
+table.tbl .col-name .col-name-wrap { display: flex; align-items: center; gap: 6px; }
+table.tbl .col-name .col-name-text {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.card .card-name { display: flex; align-items: center; gap: 6px; }
+.card .card-name .card-name-text {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.copy-id-btn {
+  flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0; border: 1px solid transparent;
+  background: transparent; color: var(--text3); border-radius: 4px;
+  cursor: pointer; opacity: 0; transition: opacity 0.12s, color 0.12s, background 0.12s, border-color 0.12s;
+}
+.copy-id-btn:hover { color: var(--accent); background: var(--bg2); border-color: var(--border); }
+table.tbl tr:hover .copy-id-btn, .card:hover .copy-id-btn, .copy-id-btn:focus-visible { opacity: 1; }
+.copy-id-btn-inline { opacity: 0.6; vertical-align: middle; margin-left: 2px; }
+.copy-id-btn-inline:hover { opacity: 1; }
+
+.breadcrumb .bc-convo-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; color: var(--accent);
+}
 
 #toast {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(8px);
@@ -335,6 +360,68 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
 .modal .stats-section > summary:hover { color: var(--heading); }
 .modal .stats-section > .stats-table { margin-top: 4px; }
 
+.modal .stats-view-toggle {
+  display: inline-flex; gap: 14px;
+  padding: 4px 10px; margin-bottom: 10px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 6px;
+  font-size: 12px; color: var(--text2);
+}
+.modal .stats-view-toggle label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.modal .stats-view-toggle input { margin: 0; }
+
+.modal .stats-table.stats-matrix { table-layout: auto; }
+.modal .stats-table.stats-matrix th,
+.modal .stats-table.stats-matrix td {
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.modal .stats-table.stats-matrix th {
+  text-align: right; font-weight: 600;
+  color: var(--text2); font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.3px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+}
+.modal .stats-table.stats-matrix th.stats-k,
+.modal .stats-table.stats-matrix td.stats-k { text-align: left; width: auto; }
+.modal .stats-table.stats-matrix td.stats-v {
+  text-align: right; width: auto;
+  color: var(--text); font-weight: normal;
+}
+.modal .stats-table.stats-matrix tr:last-child td { border-bottom: none; }
+.modal .stats-table.stats-matrix .stats-total-col,
+.modal .stats-table.stats-matrix th:last-child {
+  color: var(--text); font-weight: 600;
+  border-left: 1px solid var(--border);
+}
+.modal .stats-table.stats-matrix tr.stats-total td {
+  border-top: 1px solid var(--border);
+  font-weight: 600; color: var(--text);
+}
+
+/* Tokens section with an added cost column. Pull back the 50% key width
+   from the base table rule so the 3 columns can breathe. */
+.modal .stats-table.stats-tokens-3col td.stats-k { width: auto; }
+.modal .stats-table.stats-tokens-3col td.stats-v {
+  text-align: right; width: auto; white-space: nowrap;
+}
+.modal .stats-table.stats-tokens-3col td.stats-c {
+  text-align: right; white-space: nowrap; padding: 4px 8px;
+  color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  border-bottom: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+}
+.modal .stats-table.stats-tokens-3col tr.stats-total td.stats-c {
+  font-weight: 600; border-top: 2px solid var(--border); border-bottom: none;
+}
+.modal .stats-note-row {
+  font-size: 10px !important; color: var(--text3) !important;
+  font-style: italic; font-weight: normal;
+  border-bottom: none !important; padding-top: 6px !important;
+}
+.modal sup { font-size: 9px; color: var(--text3); padding: 0 1px; }
+
 /* "+N" badge for model / branches overflow in the compact card strip. */
 .card .card-stats .stats-more {
   color: var(--text3); font-size: 10px;
@@ -417,6 +504,14 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
 .ov-legend-sw.seg-cwrite  { background: var(--accent); opacity: 0.45; }
 .ov-legend-sw.seg-input   { background: var(--accent); opacity: 0.75; }
 .ov-legend-sw.seg-output  { background: var(--accent); }
+.ov-model-legend { margin-top: 2px; }
+.ov-model-legend .ov-legend-item { color: var(--text); }
+.ov-legend-pos {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--bg2); color: var(--text2);
+  font-size: 9px; font-weight: 600;
+}
 
 /* Per-bar hover: whole group (segments + hit rect) brightens together.
    Fixes the old sibling-selector bug where wrong bars highlighted. */
@@ -477,4 +572,106 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
   font-size: 13px; color: var(--heading); font-weight: 600;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   margin-left: 8px;
+}
+
+/* Deleted-stats toggle and section — surface pruned tokens/tool uses. */
+.overview-deleted-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text2);
+  user-select: none;
+  cursor: pointer;
+  margin-right: 4px;
+}
+.overview-deleted-toggle input { margin: 0; }
+.stats-incl-deleted {
+  color: var(--text2);
+  font-style: italic;
+  font-size: 11px;
+}
+.stats-section-deleted > summary {
+  color: var(--text2);
+}
+.stats-section-deleted .stats-table {
+  opacity: 0.9;
+}
+
+/* Three-way lifecycle filter toggles (active / archived / deleted). */
+.filter-toggles {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg2);
+}
+.filter-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text2);
+  user-select: none;
+  cursor: pointer;
+}
+.filter-toggle input { margin: 0; }
+
+/* Archived convo visual markers. */
+.badge-archived {
+  background: var(--bg2);
+  color: var(--text2);
+  border: 1px solid var(--border);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-right: 4px;
+}
+.badge-muted {
+  opacity: 0.55;
+}
+.card-archived {
+  border-style: dashed;
+  opacity: 0.88;
+}
+.row-archived {
+  background: var(--bg2);
+}
+
+/* Archived content section mirrors deleted section but with a distinct tint. */
+.stats-section-archived > summary {
+  color: var(--text2);
+}
+.stats-section-archived .stats-table {
+  opacity: 0.9;
+}
+
+/* Header mode switcher (Active / Archived). Pivots the whole app's list
+   source; independent of the stat-inclusion toggles in toolbars. */
+.header-divider {
+  width: 1px;
+  height: 22px;
+  background: var(--border);
+  margin: 0 14px;
+  align-self: center;
+  opacity: 0.7;
+}
+.mode-select {
+  background: var(--bg2);
+  color: var(--heading);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 10px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  margin-right: 14px;
+}
+.mode-select:hover {
+  border-color: var(--accent);
 }

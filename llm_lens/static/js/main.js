@@ -1,6 +1,6 @@
 // App entry point. Wires up routing, theme, and the delegated click handler.
 
-import { state, setTheme } from "./state.js";
+import { state, setTheme, setFilter, setMode } from "./state.js";
 import { defineRoute, initRouter, navigate } from "./router.js";
 import { updateEditButton } from "./toolbar.js";
 
@@ -15,6 +15,12 @@ function applyTheme() {
   document.getElementById("theme-toggle").textContent = state.theme === "dark" ? "Light" : "Dark";
 }
 applyTheme();
+function applyMode() {
+  const sel = document.getElementById("mode-select");
+  if (sel) sel.value = state.mode;
+}
+applyMode();
+
 
 // --- Edit mode (messages view only) ---
 
@@ -63,6 +69,15 @@ const actions = {
   // Header buttons
   "toggle-theme":     () => { setTheme(state.theme === "dark" ? "light" : "dark"); applyTheme(); },
   "toggle-edit":      () => toggleEditMode(),
+  "set-mode":         (e)  => {
+    // Global Active/Archived switch. Invalidate project cache so the list
+    // re-fetches (counts per-mode depend on fresh data), then re-render.
+    setMode(e.target.value);
+    if (state.projectsCache) state.projectsCache = null;
+    if (state.view === "projects") Projects.show();
+    else if (state.view === "conversations") Conversations.refreshAndRender();
+    else if (state.view === "messages") navigate(`/p/${encodeURIComponent(state.folder)}`);
+  },
 
   // Projects view
   "sort-projects":    (_e, el) => Projects.sortBy(el.dataset.col),
@@ -72,7 +87,21 @@ const actions = {
   "overview-nav-next":()       => Projects.navOverview(+1),
   "set-overview-mode":(e)      => Projects.setOverviewMode(e.target.value),
   "set-overview-size":(e)      => Projects.setOverviewSize(e.target.value),
+  "set-overview-group":(e)     => Projects.setOverviewGroupBy(e.target.value),
   "open-overview-stats":()     => Projects.openOverviewStats(),
+  "toggle-filter":    (e, el)  => {
+    // One of three stat-inclusion toggles (active/archived/deleted). Refuse
+    // to uncheck the last enabled one — with zero sources selected the graph
+    // and stats are empty, so flip it back on immediately.
+    if (!e.target.checked) {
+      const on = ["active", "archived", "deleted"].filter((k) => state.filters[k]).length;
+      if (on <= 1) { e.target.checked = true; return; }
+    }
+    setFilter(el.dataset.filter, e.target.checked);
+    if (state.view === "projects") Projects.render();
+    else if (state.view === "conversations") Conversations.render();
+    else if (state.view === "messages") Messages.render();
+  },
 
   // Conversations view
   "sort-convos":      (_e, el) => Conversations.sortBy(el.dataset.col),
@@ -80,7 +109,11 @@ const actions = {
   "toggle-all-convos":(e)      => Conversations.toggleAll(e.target.checked),
   "delete-convo":     (_e, el) => Conversations.deleteConvo(el.dataset.id),
   "duplicate-convo":  (_e, el) => Conversations.duplicateConvo(el.dataset.id),
+  "archive-convo":    (_e, el) => Conversations.archiveConvo(el.dataset.id),
+  "unarchive-convo":  (_e, el) => Conversations.unarchiveConvo(el.dataset.id),
   "bulk-delete-convos":()      => Conversations.bulkDelete(),
+  "bulk-archive-convos":()     => Conversations.bulkArchive(),
+  "bulk-unarchive-convos":()   => Conversations.bulkUnarchive(),
   "load-more-convos": ()       => Conversations.loadMore(),
   "refresh-convos":   ()       => Conversations.refreshCache(),
   "open-project-stats":()      => Conversations.openProjectStats(),
@@ -89,8 +122,6 @@ const actions = {
   // Messages view
   "load-earlier-msgs":()       => Messages.loadEarlier(),
   "open-stats-modal": ()       => {
-    // Dispatch by view so the same header button works on both the project
-    // list (aggregated) and single-convo (detailed) pages.
     if (state.view === "conversations") Conversations.showStats();
     else Messages.showStats();
   },
@@ -103,6 +134,15 @@ const actions = {
   "save-selected":    ()       => Messages.saveSelected(),
   "delete-selected":  ()       => Messages.deleteSelected(),
   "clear-selection":  ()       => Messages.clearSelection(),
+  "set-stats-view":   (_e, el) => {
+    const modal = el.closest(".modal");
+    if (!modal) return;
+    const v = el.value;
+    modal.querySelectorAll(".stats-view").forEach((n) => {
+      if (n.classList.contains(`stats-view-${v}`)) n.removeAttribute("hidden");
+      else n.setAttribute("hidden", "");
+    });
+  },
   "toggle-thinking":  (_e, el) => {
     const t = document.getElementById(el.dataset.target);
     if (t) t.style.display = t.style.display === "none" ? "block" : "none";
@@ -116,11 +156,11 @@ const actions = {
   },
 };
 
-// <select> fires `change`, not `click` — delegate both so the actions map
-// stays the single source of truth.
+// <select> and radio/checkbox inputs fire `change`, not `click` — delegate
+// both so the actions map stays the single source of truth.
 document.body.addEventListener("change", (e) => {
   const el = e.target;
-  if (!el.matches || !el.matches("select[data-action]")) return;
+  if (!el.matches || !el.matches("select[data-action], input[data-action]")) return;
   const handler = actions[el.dataset.action];
   if (handler) handler(e, el);
 });

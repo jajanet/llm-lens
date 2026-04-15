@@ -15,12 +15,14 @@ export async function show(folder, convoId) {
   state.view = "messages";
   state.folder = folder;
   state.convoId = convoId;
+  state.convoName = null;
   state.msgSelected.clear();
   state.msgSearch = "";
   state.search = "";
 
   await resolvePath(folder);
   renderBreadcrumb();
+  hydrateConvoName(folder, convoId);
 
   app.innerHTML = '<div class="loading">Loading...</div>';
   state.msgData = await api.messages(folder, convoId, { limit: PAGE_MSGS });
@@ -29,17 +31,34 @@ export async function show(folder, convoId) {
   render();
 }
 
+async function hydrateConvoName(folder, convoId) {
+  try {
+    const names = await api.conversationNames(folder, [convoId]);
+    if (state.convoId !== convoId) return;  // navigated away
+    state.convoName = (names && names[convoId]) || null;
+    renderBreadcrumb();
+  } catch { /* leave fallback */ }
+}
+
 async function resolvePath(folder) {
   if (!state.projectsCache) state.projectsCache = await api.projects();
   const proj = state.projectsCache.find((p) => p.folder === folder);
   state.path = proj ? proj.path : folder;
 }
 
+function copyIconSvg() {
+  return '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="9" height="9" rx="1.5"></rect><path d="M3 10.5V3a1.5 1.5 0 0 1 1.5-1.5H11"></path></svg>';
+}
+
 function renderBreadcrumb() {
+  const display = state.convoName || (state.convoId ? state.convoId.slice(0, 8) : "Conversation");
+  const copyBtn = state.convoId
+    ? `<button class="copy-id-btn copy-id-btn-inline" data-action="copy-resume" data-id="${escAttr(state.convoId)}" title="Copy 'claude --resume ${escAttr(state.convoId)}'" aria-label="Copy resume command">${copyIconSvg()}</button>`
+    : "";
   bc.innerHTML = `
     <a data-action="nav-projects">Projects</a> /
     <a data-action="nav-folder" data-folder="${escAttr(state.folder)}">${esc(state.path)}</a> /
-    Conversation
+    <span class="bc-convo-name">${esc(display)}</span>${copyBtn}
   `;
 }
 
@@ -362,7 +381,7 @@ export async function showStats() {
     return;
   }
   const box = document.querySelector(".modal .modal-body");
-  if (box) box.innerHTML = renderStatsModalBody(s);
+  if (box) box.innerHTML = renderStatsModalBody(s, { filters: { ...state.filters } });
 }
 
 

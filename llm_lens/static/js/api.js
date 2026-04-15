@@ -13,6 +13,9 @@ export const api = {
   conversations: (folder, { offset = 0, limit = 30, sort = "recent", desc = true } = {}) =>
     json(`/api/projects/${folder}/conversations?offset=${offset}&limit=${limit}&sort=${sort}&desc=${desc ? 1 : 0}`),
 
+  archivedConversations: (folder) =>
+    json(`/api/projects/${folder}/archived`),
+
   messages: (folder, convoId, { offset, limit = 60 } = {}) => {
     const params = new URLSearchParams({ limit });
     if (offset != null) params.set("offset", offset);
@@ -27,6 +30,26 @@ export const api = {
 
   duplicateConversation: (folder, convoId) =>
     json(`/api/projects/${folder}/conversations/${convoId}/duplicate`, { method: "POST" }),
+
+  archiveConversation: (folder, convoId) =>
+    json(`/api/projects/${folder}/conversations/${convoId}/archive`, { method: "POST" }),
+
+  unarchiveConversation: (folder, convoId) =>
+    json(`/api/projects/${folder}/conversations/${convoId}/unarchive`, { method: "POST" }),
+
+  bulkArchive: (folder, ids) =>
+    json(`/api/projects/${folder}/conversations/bulk-archive`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }),
+
+  bulkUnarchive: (folder, ids) =>
+    json(`/api/projects/${folder}/conversations/bulk-unarchive`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }),
 
   bulkDeleteConversations: (folder, ids) =>
     json(`/api/projects/${folder}/conversations/bulk-delete`, {

@@ -11,6 +11,11 @@
 
 <header>
   <h1 data-action="nav-projects">llm lens</h1>
+  <div class="header-divider"></div>
+  <select id="mode-select" class="mode-select" data-action="set-mode">
+    <option value="active">Active</option>
+    <option value="archived">Archived</option>
+  </select>
   <div class="breadcrumb" id="breadcrumb"></div>
   <div class="header-controls">
     <button class="btn" id="refresh-toggle" data-action="refresh-convos" title="Re-scan files (drops cached titles and message counts for this project)" style="display:none">Refresh</button>

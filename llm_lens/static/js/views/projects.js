@@ -2,7 +2,7 @@
 
 import { state, invalidateProjectsCache, setViewMode } from "../state.js";
 import { api } from "../api.js";
-import { timeAgo, timeAbs, fmtSize, esc, escAttr, arrow, shortPath, renderStatsInline, renderTokenBars, fmtTokens } from "../utils.js";
+import { timeAgo, timeAbs, fmtSize, esc, escAttr, arrow, shortPath, renderStatsInline, renderTokenBars, fmtTokens, renderStatsModalBody } from "../utils.js";
 import { configureToolbar } from "../toolbar.js";
 import { showConfirmModal, showInfoModal } from "../modal.js";
 import { navigate } from "../router.js";
@@ -65,6 +65,11 @@ export function render() {
   renderToolbar();
 
   let items = [...(state.projectsCache || [])];
+  // Mode filter: active mode drops archive-only projects; archived mode drops
+  // active-only projects. A project with both kinds appears in either mode.
+  items = items.filter((p) => state.mode === "archived"
+    ? (p.archived_count || 0) > 0
+    : (p.conversation_count || 0) > 0);
   if (state.search) {
     const q = state.search.toLowerCase();
     items = items.filter((p) =>
@@ -77,7 +82,10 @@ export function render() {
   const overviewHtml = renderOverviewBar();
 
   if (!items.length) {
-    app.innerHTML = overviewHtml + '<div class="empty-state">No projects found</div>';
+    const empty = state.mode === "archived"
+      ? "No archived projects"
+      : "No projects found";
+    app.innerHTML = overviewHtml + `<div class="empty-state">${empty}</div>`;
     return;
   }
 
@@ -89,22 +97,27 @@ export function renderOverviewBar() {
   const ranges = [["all", "all time"], ["year", "year"], ["month", "month"], ["week", "week"], ["day", "day"]];
   const modes  = [["tokens", "data: tokens"], ["tools", "data: tool uses"]];
   const sizes  = [["compact", "view: compact"], ["expanded", "view: expanded"]];
+  const groups = [["none", "group: combined"], ["model", "group: by model"]];
 
   const opt = (v, label, cur) => `<option value="${v}"${v === cur ? " selected" : ""}>${label}</option>`;
   const rangeSel = ranges.map(([v, l]) => opt(v, l, state.overviewRange)).join("");
   const modeSel  = modes.map(([v, l]) => opt(v, l, state.overviewMode)).join("");
   const sizeSel  = sizes.map(([v, l]) => opt(v, l, state.overviewSize)).join("");
+  const groupSel = groups.map(([v, l]) => opt(v, l, state.overviewGroupBy)).join("");
 
   const statsInner = state.overview
-    ? renderStatsInline(state.overview.totals)
+    ? renderStatsInline(state.overview.totals, {
+        includeArchived: state.filters.archived,
+        includeDeleted:  state.filters.deleted,
+      })
     : '<span class="stats-dim is-loading">loading...</span>';
 
   const convoLine = state.overview
-    ? `<div class="overview-meta">${state.overview.convo_count} convos · ${esc(windowLabel())} · each bar = 1 ${esc(state.overview.bucket)}</div>`
+    ? `<div class="overview-meta">${state.overview.convo_count} convos${state.overview.archived_count ? ` · ${state.overview.archived_count} archived` : ""} · ${esc(windowLabel())} · each bar = 1 ${esc(state.overview.bucket)}</div>`
     : "";
 
   const graphInner = state.overview
-    ? renderTokenBars(state.overview.by_period, state.overviewRange, state.overview.bucket, state.overviewMode, state.overviewSize, state.overview.until)
+    ? renderTokenBars(state.overview.by_period, state.overviewRange, state.overview.bucket, state.overviewMode, state.overviewSize, state.overview.until, state.overviewGroupBy, state.filters)
     : '<div class="overview-graph"><div class="stats-dim is-loading">loading...</div></div>';
 
   const navBtns = state.overviewRange === "all" ? "" : `
@@ -112,15 +125,29 @@ export function renderOverviewBar() {
     <button class="btn btn-sm" data-action="overview-nav-next" title="Next ${esc(state.overviewRange)}" ${state.overviewOffset >= 0 ? "disabled" : ""}>&rsaquo;</button>
   `;
 
+  const f = state.filters;
+  const tog = (k, label, title) => `
+    <label class="filter-toggle" title="${title}">
+      <input type="checkbox" data-action="toggle-filter" data-filter="${k}" ${f[k] ? "checked" : ""}>
+      ${label}
+    </label>`;
+  const filterToggles = `<div class="filter-toggles">
+    ${tog("active",   "active",   "Include live conversations")}
+    ${tog("archived", "archived", "Include archived conversations + their stats")}
+    ${tog("deleted",  "deleted",  "Include stats from deleted conversations and messages")}
+  </div>`;
+
   return `
     <div class="overview-bar">
       <div class="overview-header">
         <span class="overview-title">Overview</span>
         <span class="overview-period">${esc(periodLabel())}</span>
         <span style="flex:1"></span>
+        ${filterToggles}
         ${navBtns}
         <select class="overview-range" data-action="set-overview-range">${rangeSel}</select>
         <select class="overview-range" data-action="set-overview-mode">${modeSel}</select>
+        <select class="overview-range" data-action="set-overview-group">${groupSel}</select>
         <select class="overview-range" data-action="set-overview-size">${sizeSel}</select>
       </div>
       <div class="overview-stats">${statsInner}</div>
@@ -161,8 +188,14 @@ function renderCards(items) {
   for (const p of items) {
     const sp = shortPath(p.path);
     const statsInner = p.statsHydrated
-      ? renderStatsInline(p.stats)
+      ? renderStatsInline(p.stats, {
+          includeArchived: state.filters.archived,
+          includeDeleted:  state.filters.deleted,
+        })
       : '<span class="stats-dim is-loading">loading...</span>';
+    const archBadge = p.archived_count
+      ? `<span class="badge${state.filters.archived ? "" : " badge-muted"}">${p.archived_count} archived</span>`
+      : "";
     h += `
       <div class="card" data-action="open-project" data-folder="${escAttr(p.folder)}" data-path="${escAttr(p.path)}">
         <div class="card-title">${esc(sp)}</div>
@@ -170,6 +203,7 @@ function renderCards(items) {
         <div class="card-stats">${statsInner}</div>
         <div class="card-footer">
           <span class="badge">${p.conversation_count} convos</span>
+          ${archBadge}
           <span class="badge">${fmtSize(p.total_size_kb)}</span>
           <span class="time-label" title="${escAttr(timeAbs(p.last_activity))}">${timeAgo(p.last_activity)}</span>
           <span style="flex:1"></span>
@@ -235,7 +269,10 @@ async function hydrateProjectStats(projects) {
     p.statsHydrated = true;
 
     const box = app.querySelector(`.card[data-folder="${CSS.escape(folder)}"] .card-stats`);
-    if (box) box.innerHTML = renderStatsInline(p.stats);
+    if (box) box.innerHTML = renderStatsInline(p.stats, {
+      includeArchived: state.filters.archived,
+      includeDeleted:  state.filters.deleted,
+    });
   }
 }
 
@@ -246,22 +283,30 @@ async function hydrateProjectStats(projects) {
 // Exported so conversations.js (scoped per-project overview) can reuse the
 // same hydrate-and-patch machinery. Reads state.overviewScope to pick the
 // right backend filter.
+let overviewReqId = 0;
+
 export async function hydrateOverview() {
+  // Bump a request counter so out-of-order responses (fast prev/next clicks)
+  // can't overwrite newer state with older window data.
+  const myReq = ++overviewReqId;
   let data;
   try {
     data = await api.overview(state.overviewRange, state.overviewOffset, state.overviewScope);
   } catch { return; }
+  if (myReq !== overviewReqId) return;
   state.overview = data;
 
   const bar = app.querySelector(".overview-bar");
   if (!bar) return;
   const stats = bar.querySelector(".overview-stats");
-  if (stats) stats.innerHTML = renderStatsInline(data.totals);
-  // Period label in the header — the single source users glance at.
+  if (stats) stats.innerHTML = renderStatsInline(data.totals, {
+    includeArchived: state.filters.archived,
+    includeDeleted:  state.filters.deleted,
+  });
   const periodEl = bar.querySelector(".overview-period");
   if (periodEl) periodEl.textContent = periodLabel();
   const oldMeta = bar.querySelector(".overview-meta");
-  const metaHtml = `<div class="overview-meta">${data.convo_count} convos · ${esc(windowLabel())} · each bar = 1 ${esc(data.bucket)}</div>`;
+  const metaHtml = `<div class="overview-meta">${data.convo_count} convos${data.archived_count ? ` · ${data.archived_count} archived` : ""} · ${esc(windowLabel())} · each bar = 1 ${esc(data.bucket)}</div>`;
   if (oldMeta) oldMeta.outerHTML = metaHtml;
   const header = bar.querySelector(".overview-header");
   if (header) {
@@ -357,6 +402,7 @@ function redrawOverviewGraph() {
   if (oldGraph) oldGraph.outerHTML = renderTokenBars(
     state.overview.by_period, state.overviewRange, state.overview.bucket,
     state.overviewMode, state.overviewSize, state.overview.until,
+    state.overviewGroupBy, state.filters,
   );
 }
 
@@ -406,6 +452,12 @@ export function setOverviewSize(sz) {
   redrawOverviewGraph();
 }
 
+export function setOverviewGroupBy(gb) {
+  if (gb === state.overviewGroupBy) return;
+  state.overviewGroupBy = gb;
+  redrawOverviewGraph();
+}
+
 
 // Open a structured stats modal for the current overview. Uses the already-
 // hydrated totals (if available); otherwise nudges the user that it's loading.
@@ -417,47 +469,12 @@ export function openOverviewStats() {
   const scopeLabel = state.overviewScope ? "Project stats" : "Overview stats";
   showInfoModal({
     title: `${scopeLabel} — ${state.overviewRange}`,
-    body: renderOverviewStatsTable(state.overview),
+    body: renderStatsModalBody(state.overview.totals, {
+      convoCount: state.overview.convo_count,
+      archivedCount: state.overview.archived_count,
+      filters: { ...state.filters },
+    }),
   });
 }
 
-function renderOverviewStatsTable(ov) {
-  const t = ov.totals || {};
-  const totalIn = (t.input_tokens || 0) + (t.cache_read_tokens || 0) + (t.cache_creation_tokens || 0);
-  const toolEntries = Object.entries(t.tool_uses || {}).sort((a, b) => b[1] - a[1]);
-  const toolTotal = toolEntries.reduce((n, [, c]) => n + c, 0);
 
-  const rows = [
-    ["Conversations", String(ov.convo_count || 0)],
-    ["Context tokens (cumulative)", fmtTokens(totalIn)],
-    ['<span class="stats-note">summed per turn — cache reads inflate this</span>', ""],
-    ["&nbsp;&nbsp;&nbsp;&nbsp;direct input", fmtTokens(t.input_tokens || 0)],
-    ["&nbsp;&nbsp;&nbsp;&nbsp;cache read", fmtTokens(t.cache_read_tokens || 0)],
-    ["&nbsp;&nbsp;&nbsp;&nbsp;cache write", fmtTokens(t.cache_creation_tokens || 0)],
-    ["Output tokens", fmtTokens(t.output_tokens || 0)],
-    ["Tool-use blocks (total)", String(toolTotal)],
-    ["Thinking blocks", String(t.thinking_count || 0)],
-    ["Branches touched", (t.branches && t.branches.length)
-      ? t.branches.map((b) => `<code>${esc(b)}</code>`).join(", ")
-      : '<span class="stats-dim">none</span>'],
-    ["Models used", (t.models && t.models.length)
-      ? t.models.map((m) => `<code>${esc(m.replace(/^claude-/, ""))}</code>`).join(", ")
-      : '<span class="stats-dim">none</span>'],
-  ];
-  const trs = rows.map(([k, v]) =>
-    `<tr><td class="stats-k">${k}</td><td class="stats-v">${v}</td></tr>`
-  ).join("");
-  let html = `<table class="stats-table">${trs}</table>`;
-
-  if (toolEntries.length) {
-    const toolRows = toolEntries.map(([name, c]) =>
-      `<tr><td class="stats-k"><code>${esc(name)}</code></td><td class="stats-v">${c}</td></tr>`
-    ).join("");
-    html += `
-      <h4 class="stats-subheading">Tool-use breakdown</h4>
-      <table class="stats-table">${toolRows}
-        <tr class="stats-total"><td class="stats-k">total</td><td class="stats-v">${toolTotal}</td></tr>
-      </table>`;
-  }
-  return html;
-}
