@@ -1,5 +1,25 @@
 // Shared application state.
 
+// Pure filter-init read from a storage-shaped object (getItem/setItem). Kept
+// separate from `state` so tests can pass a mock storage without a browser.
+// Invariant: at least one of active/archived/deleted must be on. The toggle
+// handler guards runtime unchecks; this guards load-time so stale storage
+// from before the guard can't leave everything off (empty graphs/stats with
+// no recovery path).
+export function computeInitialFilters(storage) {
+  const f = {
+    active:   storage.getItem("filter_active") !== "0",
+    archived: storage.getItem("filter_archived") === "1",
+    deleted: (storage.getItem("filter_deleted") === "1")
+          || (storage.getItem("showDeleted") === "1"),
+  };
+  if (!f.active && !f.archived && !f.deleted) {
+    f.active = true;
+    storage.setItem("filter_active", "1");
+  }
+  return f;
+}
+
 export const state = {
   view: "projects",
   folder: null,
@@ -38,23 +58,7 @@ export const state = {
   // flipped on or off independently. They appear both in toolbars (inline
   // stats strip) and inside the stats modal so you can dial numbers without
   // closing the modal.
-  filters: (() => {
-    const f = {
-      active:   localStorage.getItem("filter_active") !== "0",
-      archived: localStorage.getItem("filter_archived") === "1",
-      deleted: (localStorage.getItem("filter_deleted") === "1")
-            || (localStorage.getItem("showDeleted") === "1"),
-    };
-    // Invariant: at least one source must be on. The toggle-filter handler
-    // guards against unchecking the last-on, but doesn't fire on load — so
-    // stale localStorage from before the guard could leave everything off
-    // and render empty graphs/stats with no recovery path. Force active on.
-    if (!f.active && !f.archived && !f.deleted) {
-      f.active = true;
-      localStorage.setItem("filter_active", "1");
-    }
-    return f;
-  })(),
+  filters: computeInitialFilters(localStorage),
 
   overviewRange: "day",
   overviewOffset: 0,

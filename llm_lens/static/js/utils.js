@@ -201,7 +201,7 @@ export function renderStatsInline(s, opts) {
 // single flat bucket according to the filter toggles. archived/deleted deltas
 // don't carry per_model breakdowns, so model-grouped bars only reflect the
 // "active" source — drop per_model when active is off to avoid misleading bars.
-function applyBucketFilters(byPeriod, f) {
+export function applyBucketFilters(byPeriod, f) {
   const TOK = ["input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"];
   const out = {};
   for (const [k, b] of Object.entries(byPeriod || {})) {

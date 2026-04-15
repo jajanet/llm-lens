@@ -675,3 +675,40 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
 .mode-select:hover {
   border-color: var(--accent);
 }
+
+#site-footer {
+  background: var(--bg2);
+  border-top: 1px solid var(--border);
+  padding: 8px 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text2);
+  flex-shrink: 0;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+#site-footer a {
+  color: var(--text2);
+  text-decoration: none;
+}
+#site-footer a:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.footer-left, .footer-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.footer-sep {
+  color: var(--text3);
+}
+.footer-heart {
+  color: var(--red);
+}
+.footer-claude {
+  display: inline-flex;
+  align-items: center;
+}
