@@ -282,21 +282,88 @@ def _fold_delta_into(target: dict, delta: dict):
         target["tool_uses"][name] = target["tool_uses"].get(name, 0) + count
 
 
+def _duplicate_sidecar_path(jsonl_path: Path) -> Path:
+    return jsonl_path.with_suffix(".dup.json")
+
+
+def _read_duplicate_meta(jsonl_path: Path):
+    sidecar = _duplicate_sidecar_path(jsonl_path)
+    if not sidecar.exists():
+        return None
+    try:
+        return json.loads(sidecar.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _duplicate_parent_counted(dup_path: Path, parent_id) -> bool:
+    if not parent_id:
+        return False
+    folder_name = dup_path.parent.name
+    if (CLAUDE_PROJECTS_DIR / folder_name / f"{parent_id}.jsonl").exists():
+        return True
+    if (_archive_folder(folder_name) / f"{parent_id}.jsonl").exists():
+        return True
+    return False
+
+
+def _subtract_shared_prefix(stats: dict, sp: dict) -> dict:
+    out = {
+        **stats,
+        "tool_uses": {**(stats.get("tool_uses") or {})},
+        "per_model": {k: {**v, "tool_uses": {**(v.get("tool_uses") or {})}}
+                      for k, v in (stats.get("per_model") or {}).items()},
+    }
+    for k in ("input_tokens", "output_tokens", "cache_read_tokens",
+              "cache_creation_tokens", "thinking_count"):
+        out[k] = max(0, (out.get(k) or 0) - (sp.get(k) or 0))
+    for name, cnt in (sp.get("tool_uses") or {}).items():
+        nv = out["tool_uses"].get(name, 0) - cnt
+        if nv > 0:
+            out["tool_uses"][name] = nv
+        else:
+            out["tool_uses"].pop(name, None)
+    for mkey, mstats in (sp.get("per_model") or {}).items():
+        pm = out["per_model"].get(mkey)
+        if not pm:
+            continue
+        for field in ("input_tokens", "output_tokens",
+                      "cache_read_tokens", "cache_creation_tokens"):
+            pm[field] = max(0, (pm.get(field) or 0) - (mstats.get(field) or 0))
+        for name, cnt in (mstats.get("tool_uses") or {}).items():
+            nv = pm["tool_uses"].get(name, 0) - cnt
+            if nv > 0:
+                pm["tool_uses"][name] = nv
+            else:
+                pm["tool_uses"].pop(name, None)
+    return out
+
+
 def _stats(filepath, stat) -> dict:
     cached = peek_cache.get(filepath, stat)
     if cached and all(k in cached for k in _STATS_KEYS):
         out = {k: cached[k] for k in _STATS_KEYS}
         if cached.get("deleted_delta"):
             out["deleted_delta"] = cached["deleted_delta"]
-        return out
-    stats = _stats_cached(str(filepath), stat.st_mtime, stat.st_size)
-    peek_cache.set(filepath, stat, **stats)
-    # Re-read so any preserved deleted_delta from a prior tombstone is picked
-    # up (set() carries deleted_delta across mtime/size bumps).
-    cached = peek_cache.get(filepath, stat) or {}
-    if cached.get("deleted_delta"):
-        stats = {**stats, "deleted_delta": cached["deleted_delta"]}
-    return stats
+    else:
+        stats = _stats_cached(str(filepath), stat.st_mtime, stat.st_size)
+        peek_cache.set(filepath, stat, **stats)
+        # Re-read so any preserved deleted_delta from a prior tombstone is picked
+        # up (set() carries deleted_delta across mtime/size bumps).
+        cached = peek_cache.get(filepath, stat) or {}
+        out = {**stats}
+        if cached.get("deleted_delta"):
+            out["deleted_delta"] = cached["deleted_delta"]
+    # Duplicate subtraction lives outside the LRU/peek caches so that deleting
+    # or archiving the parent flips the subtraction on/off without needing to
+    # invalidate the dup's cached stats.
+    meta = _read_duplicate_meta(filepath)
+    if meta:
+        out["duplicate_of"] = meta.get("duplicate_of")
+        if _duplicate_parent_counted(filepath, meta.get("duplicate_of")):
+            out = _subtract_shared_prefix(out, meta.get("shared_prefix_stats") or {})
+            out["duplicate_of"] = meta.get("duplicate_of")
+    return out
 
 
 @lru_cache(maxsize=128)
@@ -1047,6 +1114,9 @@ def api_delete_conversation(folder, convo_id):
     filepath.unlink()
     if subdir.exists():
         shutil.rmtree(subdir)
+    sidecar = _duplicate_sidecar_path(filepath)
+    if sidecar.exists():
+        sidecar.unlink()
     peek_cache.mark_deleted(filepath, final_stats)
     _invalidate_cache_for(filepath)
     return jsonify({"ok": True})
@@ -1059,10 +1129,65 @@ def api_duplicate_conversation(folder, convo_id):
         return jsonify({"error": "Not found"}), 404
     new_id = str(uuid_mod.uuid4())
     dst = CLAUDE_PROJECTS_DIR / folder / f"{new_id}.jsonl"
-    shutil.copy2(src, dst)
+
+    # Capture parent stats before the copy — these are the shared-prefix stats
+    # at fork time. Stored in a sidecar and subtracted by `_stats` so totals
+    # aren't double-counted while parent still exists.
+    try:
+        parent_stats = _stats(src, src.stat())
+    except OSError:
+        parent_stats = {}
+
+    # Stream-rewrite sessionId / uuid / parentUuid so Claude Code's `/resume`
+    # keys don't collide with the parent. The old→new uuid map keeps the
+    # parent-chain intact within the duplicate; parentUuids pointing outside
+    # the file collapse to None (mirrors `remap_parent` in api_extract_messages).
+    uuid_map: dict = {}
+    def _remap(old):
+        if old is None:
+            return None
+        nu = uuid_map.get(old)
+        if nu is None:
+            nu = str(uuid_mod.uuid4())
+            uuid_map[old] = nu
+        return nu
+
+    with open(src, "r") as fh_in, open(dst, "w") as fh_out:
+        for line in fh_in:
+            if not line.strip():
+                fh_out.write(line)
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                fh_out.write(line)
+                continue
+            if "sessionId" in entry:
+                entry["sessionId"] = new_id
+            if "uuid" in entry:
+                entry["uuid"] = _remap(entry["uuid"])
+            if entry.get("parentUuid") is not None:
+                entry["parentUuid"] = uuid_map.get(entry["parentUuid"])
+            fh_out.write(json.dumps(entry) + "\n")
+
+    # Subagent subdir copied as-is; those nested sessions still carry the
+    # parent's sessionId. Fixing that is out of scope for this change.
     src_sub = CLAUDE_PROJECTS_DIR / folder / convo_id
     if src_sub.exists():
         shutil.copytree(src_sub, CLAUDE_PROJECTS_DIR / folder / new_id)
+
+    sidecar = _duplicate_sidecar_path(dst)
+    sidecar.write_text(json.dumps({
+        "duplicate_of": convo_id,
+        "shared_prefix_stats": {
+            k: parent_stats.get(k) for k in (
+                "input_tokens", "output_tokens", "cache_read_tokens",
+                "cache_creation_tokens", "thinking_count", "tool_uses",
+                "per_model",
+            )
+        },
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }))
     _invalidate_cache_for(dst)
     return jsonify({"ok": True, "new_id": new_id})
 
@@ -1087,6 +1212,9 @@ def api_archive_conversation(folder, convo_id):
     _move_preserving_mtime(live_path, dest)
     if live_sub.exists():
         _move_preserving_mtime(live_sub, dest_sub)
+    live_sidecar = _duplicate_sidecar_path(live_path)
+    if live_sidecar.exists():
+        _move_preserving_mtime(live_sidecar, _duplicate_sidecar_path(dest))
     # Drop cached active-state entry for the live path; archived path will
     # populate its own entry on first stats read.
     peek_cache.invalidate(live_path)
@@ -1114,6 +1242,9 @@ def api_unarchive_conversation(folder, convo_id):
     _move_preserving_mtime(src, dest)
     if src_sub.exists():
         _move_preserving_mtime(src_sub, dest_sub)
+    src_sidecar = _duplicate_sidecar_path(src)
+    if src_sidecar.exists():
+        _move_preserving_mtime(src_sidecar, _duplicate_sidecar_path(dest))
     peek_cache.invalidate(src)
     _invalidate_cache_for(dest)
     return jsonify({"ok": True})
@@ -1297,6 +1428,317 @@ def api_delete_message(folder, convo_id, msg_uuid):
             f.write(json.dumps(e) + "\n")
     _invalidate_cache_for(filepath)
     return jsonify({"ok": True})
+
+
+_SCRUB_PLACEHOLDER = "."
+
+
+def _is_prose_only(message: dict) -> bool:
+    """Prose-only = `message.content` is a string or a list containing only
+    text blocks. Any tool_use, tool_result, thinking, image, or other
+    structured block disqualifies — their shape carries meaning that scrub
+    would break.
+    """
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        if not content:
+            return False
+        return all(
+            isinstance(b, dict) and b.get("type") == "text"
+            for b in content
+        )
+    return False
+
+
+def _scrub_content(message: dict):
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"] = _SCRUB_PLACEHOLDER
+        return
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                block["text"] = _SCRUB_PLACEHOLDER
+
+
+_WS_RUN_RE = re.compile(r"[ \t]+")
+_NL_RUN_RE = re.compile(r"\n{3,}")
+
+
+def _normalize_ws(text: str) -> str:
+    # Collapse runs of spaces/tabs to a single space and 3+ consecutive
+    # newlines to a double newline — preserves paragraph breaks, removes
+    # accidental stutter from editing. Trim trailing whitespace on each line.
+    lines = [_WS_RUN_RE.sub(" ", line).rstrip() for line in text.split("\n")]
+    return _NL_RUN_RE.sub("\n\n", "\n".join(lines))
+
+
+def _normalize_whitespace_content(message: dict):
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"] = _normalize_ws(content)
+        return
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                block["text"] = _normalize_ws(block.get("text") or "")
+
+
+# Default word/phrase lists. Conservative starting points — users curate
+# their own via the /api/word-lists endpoint. Stored as plain strings;
+# matched case-insensitively with word boundaries (swears) or as exact
+# phrases (filler).
+_DEFAULT_SWEARS = [
+    # `*` = stem match (catches plurals/conjugations: fuck/fucks/fucker/...).
+    # Bare words match exactly to protect short stems from false positives
+    # (e.g. plain "ass" instead of "ass*" so we don't catch "assess").
+    "fuck*", "shit*", "damn*", "bitch*", "crap*", "piss*", "bullshit*",
+    "asshole", "ass", "dick", "cunt",
+]
+
+# Sycophancy + AI-tic phrases that add tokens without information. These
+# are the "drift" patterns — agent over-apologizing, hyping the user,
+# meta-narrating its own thinking. Removing them shortens context without
+# losing meaning.
+_DEFAULT_FILLER = [
+    "You're absolutely right!",
+    "You're absolutely right.",
+    "You are absolutely right.",
+    "Great question!",
+    "Great question.",
+    "That's a great question!",
+    "Excellent question!",
+    "Certainly!",
+    "Of course!",
+    "Absolutely!",
+    "I'd be happy to help!",
+    "I'm happy to help.",
+    "I hope this helps!",
+    "I hope that helps.",
+    "Feel free to ask if you have more questions.",
+    "Let me know if you have any questions.",
+    "I apologize for the confusion.",
+    "I apologize for any confusion.",
+    "Sorry for the confusion.",
+    "My apologies for the confusion.",
+    "Let me think about this step by step.",
+    "Let me think step by step.",
+    "Let's think step by step.",
+    "Let me break this down.",
+    "Let me explain.",
+    "To summarize:",
+    "In summary,",
+    "In conclusion,",
+]
+
+
+def _word_lists_path() -> Path:
+    return Path.home() / ".cache" / "llm-lens" / "word_lists.json"
+
+
+def _load_word_lists() -> dict:
+    """Return the effective lists (user-saved, falling back to defaults per
+    key). The user file fully replaces the defaults for whichever keys it
+    contains — that way a user can prune the default list, not just
+    augment it."""
+    path = _word_lists_path()
+    user = {}
+    if path.exists():
+        try:
+            user = json.loads(path.read_text()) or {}
+        except (OSError, json.JSONDecodeError):
+            user = {}
+    return {
+        "swears": user.get("swears") if isinstance(user.get("swears"), list) else list(_DEFAULT_SWEARS),
+        "filler": user.get("filler") if isinstance(user.get("filler"), list) else list(_DEFAULT_FILLER),
+    }
+
+
+def _save_word_lists(data: dict) -> dict:
+    path = _word_lists_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cleaned = {
+        "swears": [s for s in (data.get("swears") or []) if isinstance(s, str) and s.strip()],
+        "filler": [s for s in (data.get("filler") or []) if isinstance(s, str) and s.strip()],
+    }
+    path.write_text(json.dumps(cleaned, indent=2))
+    return cleaned
+
+
+_SAFE_STEM_SUFFIXES = ["", "s", "es", "ed", "er", "ers", "ing", "ings", "y", "ery", "ies"]
+
+
+def _swear_regex_parts(words: list) -> list:
+    """Translate user entries into regex fragments.
+
+    A trailing `*` marks a stem — the regex matches the stem followed by
+    one of a closed list of safe suffixes (`s`, `es`, `ed`, `er`, `ers`,
+    `ing`, `y`, etc.), bounded by word boundaries. So `fuck*` catches
+    fuck/fucks/fucker/fucking/etc., and `ass*` catches ass/asses/assing
+    *without* matching `assist`/`assess`/`assistant` — the suffix `ist` /
+    `ess` / `istant` aren't in the safe list.
+
+    Plain (no `*`) words match exactly with word boundaries.
+    """
+    parts = []
+    for w in words or []:
+        if not isinstance(w, str) or not w.strip():
+            continue
+        if w.endswith("*") and len(w) > 1:
+            stem = re.escape(w[:-1])
+            suffix_alt = "|".join(re.escape(s) for s in _SAFE_STEM_SUFFIXES)
+            parts.append(f"{stem}(?:{suffix_alt})")
+        else:
+            parts.append(re.escape(w))
+    return parts
+
+
+def _strip_swears(text: str, words: list) -> str:
+    parts = _swear_regex_parts(words)
+    if not text or not parts:
+        return text
+    pattern = r"\b(?:" + "|".join(parts) + r")\b"
+    out = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\s+([,.!?;:])", r"\1", out)
+    return out
+
+
+def _strip_filler(text: str, phrases: list) -> str:
+    if not text or not phrases:
+        return text
+    # Sort longest-first so "I apologize for any confusion." matches before
+    # a shorter substring would.
+    pattern = "|".join(re.escape(p) for p in sorted(phrases, key=len, reverse=True))
+    out = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    out = re.sub(r"\s+([,.!?;:])", r"\1", out)
+    return out.strip()
+
+
+def _apply_text_transform(message: dict, fn):
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"] = fn(content)
+        return
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                block["text"] = fn(block.get("text") or "")
+
+
+def _remove_swears_content(message: dict):
+    words = _load_word_lists()["swears"]
+    _apply_text_transform(message, lambda t: _strip_swears(t, words))
+
+
+def _remove_filler_content(message: dict):
+    phrases = _load_word_lists()["filler"]
+    _apply_text_transform(message, lambda t: _strip_filler(t, phrases))
+
+
+_TRANSFORMS = {
+    "scrub": _scrub_content,
+    "normalize_whitespace": _normalize_whitespace_content,
+    "remove_swears": _remove_swears_content,
+    "remove_filler": _remove_filler_content,
+}
+
+
+@app.route(
+    "/api/projects/<folder>/conversations/<convo_id>/messages/<msg_uuid>/scrub",
+    methods=["POST"],
+)
+def api_scrub_message(folder, convo_id, msg_uuid):
+    """Apply a text transform to a prose-only message in place.
+
+    `kind` (body JSON) selects the transform:
+      - "scrub" (default): replace text with "."
+      - "normalize_whitespace": collapse runs of spaces/tabs; 3+ newlines → 2
+
+    Both preserve `usage`, `uuid`, `parentUuid`, `sessionId`, and any
+    non-text structural blocks. Stats unchanged because `usage` is left
+    alone — it's a historical billing record, not a recount of bytes.
+    """
+    payload = request.get_json(silent=True) or {}
+    kind = payload.get("kind") or "scrub"
+    transform = _TRANSFORMS.get(kind)
+    if transform is None:
+        return jsonify({
+            "error": f"Unknown transform kind '{kind}'. "
+                     f"Supported: {sorted(_TRANSFORMS)}"
+        }), 400
+
+    filepath = CLAUDE_PROJECTS_DIR / folder / f"{convo_id}.jsonl"
+    if not filepath.exists():
+        return jsonify({"error": "Not found"}), 404
+
+    with open(filepath, "r") as f:
+        raw_lines = f.readlines()
+
+    entries = []
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            entries.append(json.loads(stripped))
+        except json.JSONDecodeError:
+            continue
+
+    target = next((e for e in entries if e.get("uuid") == msg_uuid), None)
+    if not target:
+        return jsonify({"error": "Message not found"}), 404
+
+    message = target.get("message") or {}
+    if not _is_prose_only(message):
+        return jsonify({
+            "error": "Transform only applies to prose-only messages (text "
+                     "blocks only — no tool_use, tool_result, thinking, or "
+                     "images)."
+        }), 400
+
+    transform(message)
+
+    with open(filepath, "w") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+    _invalidate_cache_for(filepath)
+    return jsonify({"ok": True, "kind": kind})
+
+
+@app.route("/api/word-lists", methods=["GET"])
+def api_get_word_lists():
+    """Return the effective swears + filler lists. Defaults shipped in
+    code are used for any key the user hasn't customized."""
+    return jsonify(_load_word_lists())
+
+
+@app.route("/api/word-lists", methods=["POST"])
+def api_save_word_lists():
+    """Persist user-curated lists. Body shape:
+        {"swears": [...], "filler": [...]}
+    Each list fully replaces the default for that key — pass an empty
+    list to disable a category entirely.
+    """
+    payload = request.get_json(silent=True) or {}
+    saved = _save_word_lists(payload)
+    return jsonify(saved)
+
+
+@app.route("/api/word-lists/defaults", methods=["GET"])
+def api_get_word_list_defaults():
+    """Surface the shipped defaults so the curation UI can offer a 'reset'
+    or show them as faded suggestions."""
+    return jsonify({
+        "swears": list(_DEFAULT_SWEARS),
+        "filler": list(_DEFAULT_FILLER),
+    })
 
 
 @app.route("/api/projects/<folder>/conversations/<convo_id>/extract", methods=["POST"])

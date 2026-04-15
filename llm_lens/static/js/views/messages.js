@@ -69,8 +69,9 @@ function renderToolbar() {
     extra += `<button class="btn" data-action="load-earlier-msgs">Earlier (${state.msgOffset})</button> `;
   }
   if (side.length > 0) {
-    extra += `<button class="btn ${state.showSide ? "active" : ""}" data-action="toggle-side">Side (${side.length})</button>`;
+    extra += `<button class="btn ${state.showSide ? "active" : ""}" data-action="toggle-side">Side (${side.length})</button> `;
   }
+  extra += `<button class="btn ${state.showWhitespace ? "active" : ""}" data-action="toggle-whitespace" title="Show invisible characters: spaces as · and tabs as →">Whitespace</button>`;
   configureToolbar({
     placeholder: "Search messages...",
     searchValue: state.msgSearch,
@@ -88,6 +89,13 @@ export function render() {
   const filtered = q ? main.filter((m) => (m.content || "").toLowerCase().includes(q)) : main;
 
   let h = '<div class="convo-flex"><div class="chat-wrap">';
+  if (state.editMode && filtered.length > 0) {
+    const selectable = filtered.filter((m) => !!m.uuid);
+    const allSelected = selectable.length > 0 &&
+      selectable.every((m) => state.msgSelected.has(m.uuid));
+    const label = allSelected ? "Deselect all" : `Select all (${selectable.length})`;
+    h += `<div class="chat-select-all"><button class="btn btn-sm" data-action="toggle-all-msgs">${label}</button></div>`;
+  }
   h += renderChatMessages(filtered, q);
   h += "</div>";
 
@@ -108,6 +116,10 @@ export function render() {
         <span>${state.msgSelected.size} selected</span>
         <button class="btn" data-action="copy-selected">Copy</button>
         <button class="btn" data-action="save-selected" title="Non-destructive: creates a new conversation, leaves this one intact. Preferred for curation.">Save to new convo</button>
+        <span class="split-btn">
+          <button class="btn" data-action="bulk-transform" data-kind="scrub" title="Scrub text on selected prose-only messages. Non-prose messages are skipped.">Scrub</button>
+          <button class="btn split-arrow" data-action="open-bulk-transform-menu" title="More text transforms">▾</button>
+        </span>
         <button class="btn-danger" style="border-color:rgba(255,255,255,0.4);color:#fff" data-action="delete-selected" title="Rewrites original file in place. May break /resume in edge cases — duplicate the conversation first if you care about it.">Delete</button>
         <span style="flex:1"></span>
         <button class="btn" data-action="clear-selection">Clear</button>
@@ -155,6 +167,13 @@ function processContent(raw) {
   if (!hasText && !thinkingBlocks.length && !hasTools) return { html: "", hasText: false, toolNames: [] };
 
   c = esc(c);
+  // Whitespace markers go in AFTER esc() (so we're working with literal chars,
+  // not escape sequences) but BEFORE placeholder substitution (so we don't
+  // touch the HTML inside __THINK_ / __TOOL_ replacements).
+  if (state.showWhitespace) {
+    c = c.replace(/ /g, '<span class="ws-dot">·</span>')
+         .replace(/\t/g, '<span class="ws-tab">→</span>');
+  }
   thinkingBlocks.forEach((html, i) => { c = c.replace(`__THINK_${i}__`, html); });
   toolBadges.forEach((html, i) => { c = c.replace(`__TOOL_${i}__`, html); });
   c = c.replace(/\n/g, "<br>");
@@ -223,15 +242,23 @@ function renderChatMessages(msgs, query) {
 const expandedGroups = new Set();
 
 function renderSingleMsg(p, compact) {
-  const { m, html: c } = p;
+  const { m, html: c, hasText, toolNames } = p;
   const role = m.role === "user" ? "user" : "assistant";
   const ck = state.msgSelected.has(m.uuid) ? "checked" : "";
   const checkHtml = m.uuid
     ? `<input type="checkbox" class="chat-check" ${ck} data-action="toggle-msg-sel" data-uuid="${escAttr(m.uuid)}">`
     : "";
+  const proseOnly = m.uuid && hasText && !(toolNames && toolNames.length);
+  const transformBtn = proseOnly
+    ? `<span class="split-btn">
+        <button class="btn btn-sm" data-action="transform-msg" data-uuid="${escAttr(m.uuid)}" data-kind="scrub" title="Scrub: replace text with '.'. Preserves usage/stats and resume chain.">Scrub</button>
+        <button class="btn btn-sm split-arrow" data-action="open-transform-menu" data-uuid="${escAttr(m.uuid)}" title="More text transforms">▾</button>
+      </span>`
+    : "";
   const actionsHtml = m.uuid
     ? `<span class="msg-actions-row">
         <button class="btn btn-sm" data-action="copy-msg" data-uuid="${escAttr(m.uuid)}" title="Copy">Copy</button>
+        ${transformBtn}
         <button class="btn-danger btn-sm btn-del-msg" data-action="delete-msg" data-uuid="${escAttr(m.uuid)}" title="Delete this message (rewrites file — may break /resume). Prefer Edit mode → Save to new convo for curation.">x</button>
       </span>`
     : "";
@@ -278,10 +305,64 @@ export function toggleSide() {
   render();
 }
 
+
+export function toggleWhitespace() {
+  state.showWhitespace = !state.showWhitespace;
+  render();
+}
+
 export function toggleMsgSel(uuid) {
   if (state.msgSelected.has(uuid)) state.msgSelected.delete(uuid);
   else state.msgSelected.add(uuid);
   render();
+}
+
+
+export function toggleAllMsgs() {
+  const main = state.msgData?.main || [];
+  const q = state.msgSearch.toLowerCase();
+  const filtered = q ? main.filter((m) => (m.content || "").toLowerCase().includes(q)) : main;
+  const ids = filtered.filter((m) => !!m.uuid).map((m) => m.uuid);
+  const allSelected = ids.length > 0 && ids.every((id) => state.msgSelected.has(id));
+  if (allSelected) {
+    for (const id of ids) state.msgSelected.delete(id);
+  } else {
+    for (const id of ids) state.msgSelected.add(id);
+  }
+  render();
+}
+
+export function openBulkTransformMenu(anchorEl) {
+  const existing = document.querySelector(".transform-menu");
+  if (existing) {
+    const wasBulk = existing.dataset.bulk === "1";
+    existing.remove();
+    if (wasBulk) return;
+  }
+  const menu = document.createElement("div");
+  menu.className = "transform-menu";
+  menu.dataset.bulk = "1";
+  const items = Object.entries(TRANSFORM_LABELS)
+    .map(([kind, label]) =>
+      `<button class="btn btn-sm transform-menu-item" data-action="bulk-transform" data-kind="${kind}">${label}</button>`
+    ).join("");
+  menu.innerHTML = items +
+    `<div class="transform-menu-sep"></div>` +
+    `<button class="btn btn-sm transform-menu-item" data-action="open-word-lists">Curate word lists…</button>`;
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.position = "absolute";
+  menu.style.top = `${rect.bottom + window.scrollY + 2}px`;
+  menu.style.left = `${rect.left + window.scrollX}px`;
+  document.body.appendChild(menu);
+  setTimeout(() => {
+    const handler = (ev) => {
+      if (!menu.contains(ev.target)) {
+        menu.remove();
+        document.removeEventListener("click", handler, true);
+      }
+    };
+    document.addEventListener("click", handler, true);
+  }, 0);
 }
 
 export function clearSelection() {
@@ -306,14 +387,191 @@ export function deleteMsg(uuid) {
     body: `Rewrites the original conversation file in place. This may break
       <code>/resume</code> for this conversation — Claude Code's replay
       semantics aren't publicly documented.
-      <br><br><strong>Prefer Edit mode → "Save to new convo"</strong> to curate
-      non-destructively, or duplicate this conversation first if you care
-      about preserving it.`,
+      <br><br><strong>Prefer Scrub</strong> if you only want to redact the
+      text — it leaves <code>usage</code> and the chain intact, so it's
+      strictly less invasive than delete.
+      <br>Or use Edit mode → "Save to new convo" to curate non-destructively.`,
     onConfirm: async () => {
       await api.deleteMessage(state.folder, state.convoId, uuid);
       show(state.folder, state.convoId);
     },
   });
+}
+
+
+export const TRANSFORM_LABELS = {
+  scrub: "Scrub (replace text with \".\")",
+  normalize_whitespace: "Normalize whitespace",
+  remove_swears: "Remove swears",
+  remove_filler: "Remove filler / drift phrases",
+};
+
+const TRANSFORM_CONFIRM = {
+  scrub: `Replaces this message's text content with "." in place. Leaves
+    <code>usage</code>, <code>uuid</code>, and <code>parentUuid</code>
+    alone, so token stats and the resume chain are preserved. Only works
+    on prose-only messages. Like other destructive edits, this may still
+    affect <code>/resume</code> in undocumented ways.`,
+  normalize_whitespace: `Collapses runs of spaces/tabs into a single space
+    and 3+ consecutive newlines into a double newline. Leaves
+    <code>usage</code> and chain alone. Prose-only messages.`,
+  remove_swears: `Strips swear words listed in your word list from the
+    message text. Matches are word-bounded — bare "ass" won't blow up
+    "assistant". Stems with a trailing <code>*</code> (e.g.
+    <code>fuck*</code>) catch a closed list of conjugations
+    (fuck/fucks/fucker/fucking/...). Use <em>Curate word lists</em> to
+    edit. Leaves <code>usage</code> and chain alone.`,
+  remove_filler: `Removes sycophancy / drift phrases (e.g. "You're absolutely
+    right!", "Let me think step by step.") from the message text. Phrases
+    are matched exactly, case-insensitive. Use <em>Curate word lists</em>
+    to edit. Leaves <code>usage</code> and chain alone.`,
+};
+
+export async function transformMsg(uuid, kind = "scrub") {
+  const body = TRANSFORM_CONFIRM[kind];
+  if (!body) {
+    alert(`Unknown transform: ${kind}`);
+    return;
+  }
+  showConfirmModal({
+    title: `${TRANSFORM_LABELS[kind]}?`,
+    body,
+    onConfirm: async () => {
+      try {
+        await api.transformMessage(state.folder, state.convoId, uuid, kind);
+      } catch (e) {
+        alert(`Transform failed: ${e.message}`);
+        return;
+      }
+      show(state.folder, state.convoId);
+    },
+  });
+}
+
+export function openTransformMenu(uuid, anchorEl) {
+  const existing = document.querySelector(".transform-menu");
+  if (existing) {
+    const forSame = existing.dataset.uuid === uuid;
+    existing.remove();
+    if (forSame) return;
+  }
+  const menu = document.createElement("div");
+  menu.className = "transform-menu";
+  menu.dataset.uuid = uuid;
+  const items = Object.entries(TRANSFORM_LABELS)
+    .map(([kind, label]) =>
+      `<button class="btn btn-sm transform-menu-item" data-action="transform-msg" data-uuid="${uuid}" data-kind="${kind}">${label}</button>`
+    ).join("");
+  menu.innerHTML = items +
+    `<div class="transform-menu-sep"></div>` +
+    `<button class="btn btn-sm transform-menu-item" data-action="open-word-lists">Curate word lists…</button>`;
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.position = "absolute";
+  menu.style.top = `${rect.bottom + window.scrollY + 2}px`;
+  menu.style.left = `${rect.left + window.scrollX}px`;
+  document.body.appendChild(menu);
+  setTimeout(() => {
+    const handler = (ev) => {
+      if (!menu.contains(ev.target)) {
+        menu.remove();
+        document.removeEventListener("click", handler, true);
+      }
+    };
+    document.addEventListener("click", handler, true);
+  }, 0);
+}
+
+
+export async function openWordListsModal() {
+  let current, defaults;
+  try {
+    [current, defaults] = await Promise.all([
+      api.getWordLists(),
+      api.getWordListDefaults(),
+    ]);
+  } catch (e) {
+    alert(`Couldn't load word lists: ${e.message}`);
+    return;
+  }
+
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `
+    <div class="modal modal-wide">
+      <h3>Curate word lists</h3>
+      <p style="font-size:13px; color:var(--text2)">
+        Edit the lists used by <em>Remove swears</em> and <em>Remove filler</em>.
+        One entry per line. For swears, append <code>*</code> to a stem to
+        catch conjugations safely (e.g. <code>fuck*</code> matches
+        fuck/fucks/fucker/fucking). Bare words match exactly with word
+        boundaries — <code>ass</code> won't blow up <code>assistant</code>.
+        Phrases are matched as exact substrings, case-insensitive.
+      </p>
+      <div class="word-lists-grid">
+        <div>
+          <label><strong>Swear words</strong> <span style="color:var(--text3); font-weight:normal">(${current.swears.length} entries)</span></label>
+          <textarea id="wl-swears" rows="14" spellcheck="false">${current.swears.join("\n")}</textarea>
+          <button class="btn btn-sm" data-reset="swears">Reset to defaults (${defaults.swears.length})</button>
+        </div>
+        <div>
+          <label><strong>Filler / drift phrases</strong> <span style="color:var(--text3); font-weight:normal">(${current.filler.length} entries)</span></label>
+          <textarea id="wl-filler" rows="14" spellcheck="false">${current.filler.join("\n")}</textarea>
+          <button class="btn btn-sm" data-reset="filler">Reset to defaults (${defaults.filler.length})</button>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-cancel" data-modal-cancel>Cancel</button>
+        <button class="btn-confirm-delete" data-modal-save>Save</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const swearsTa = overlay.querySelector("#wl-swears");
+  const fillerTa = overlay.querySelector("#wl-filler");
+  const close = () => overlay.remove();
+
+  overlay.addEventListener("click", async (e) => {
+    if (e.target === overlay || e.target.matches("[data-modal-cancel]")) {
+      close();
+    } else if (e.target.matches("[data-reset]")) {
+      const which = e.target.dataset.reset;
+      if (which === "swears") swearsTa.value = defaults.swears.join("\n");
+      else if (which === "filler") fillerTa.value = defaults.filler.join("\n");
+    } else if (e.target.matches("[data-modal-save]")) {
+      const payload = {
+        swears: swearsTa.value.split("\n").map((s) => s.trim()).filter(Boolean),
+        filler: fillerTa.value.split("\n").map((s) => s.trim()).filter(Boolean),
+      };
+      try {
+        await api.saveWordLists(payload);
+      } catch (err) {
+        alert(`Save failed: ${err.message}`);
+        return;
+      }
+      close();
+    }
+  });
+}
+
+export async function bulkTransform(kind = "scrub") {
+  const ids = Array.from(state.msgSelected);
+  if (!ids.length) return;
+  const label = TRANSFORM_LABELS[kind] || kind;
+  if (!confirm(`${label} for ${ids.length} selected message(s)? Non-prose messages will be skipped.`)) return;
+  let ok = 0, skipped = 0, errored = 0;
+  for (const id of ids) {
+    try {
+      await api.transformMessage(state.folder, state.convoId, id, kind);
+      ok++;
+    } catch (e) {
+      if ((e.message || "").startsWith("400")) skipped++;
+      else errored++;
+    }
+  }
+  state.msgSelected.clear();
+  if (errored) alert(`Applied to ${ok}. Skipped ${skipped} (non-prose). ${errored} failed — check server logs.`);
+  else if (skipped) alert(`Applied to ${ok}. Skipped ${skipped} (non-prose).`);
+  show(state.folder, state.convoId);
 }
 
 export async function copySelected() {
@@ -352,9 +610,9 @@ export function deleteSelected() {
     body: `Rewrites the original conversation file in place. Cannot be undone,
       and may break <code>/resume</code> for this conversation — Claude Code's
       replay semantics aren't publicly documented.
-      <br><br><strong>Prefer "Save to new convo"</strong> (non-destructive,
-      creates a copy), or duplicate this conversation first if you care about
-      preserving it.`,
+      <br><br><strong>Prefer Scrub</strong> on these messages if you only
+      want to redact text — it preserves <code>usage</code> and the chain.
+      <br>Or use "Save to new convo" (non-destructive, creates a copy).`,
     onConfirm: async () => {
       for (const u of uuids) {
         await api.deleteMessage(state.folder, state.convoId, u);

@@ -127,9 +127,19 @@ const actions = {
   },
   "toggle-tool-group":(_e, el) => Messages.toggleToolGroup(el.dataset.groupId),
   "toggle-side":      ()       => Messages.toggleSide(),
+
+  "toggle-whitespace": ()      => Messages.toggleWhitespace(),
   "toggle-msg-sel":   (_e, el) => Messages.toggleMsgSel(el.dataset.uuid),
   "copy-msg":         (_e, el) => Messages.copyMsg(el.dataset.uuid),
   "delete-msg":       (_e, el) => Messages.deleteMsg(el.dataset.uuid),
+
+  "transform-msg":    (_e, el) => Messages.transformMsg(el.dataset.uuid, el.dataset.kind || "scrub"),
+  "open-transform-menu": (_e, el) => Messages.openTransformMenu(el.dataset.uuid, el),
+  "bulk-transform":   (_e, el) => Messages.bulkTransform(el.dataset.kind || "scrub"),
+  "open-bulk-transform-menu": (_e, el) => Messages.openBulkTransformMenu(el),
+  "toggle-all-msgs":  (_e, el) => Messages.toggleAllMsgs(),
+
+  "open-word-lists":  ()       => Messages.openWordListsModal(),
   "copy-selected":    ()       => Messages.copySelected(),
   "save-selected":    ()       => Messages.saveSelected(),
   "delete-selected":  ()       => Messages.deleteSelected(),

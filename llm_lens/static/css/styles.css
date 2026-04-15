@@ -198,6 +198,49 @@ body.edit-mode .chat-bubble .msg-actions-row .btn-del-msg { display: inline-flex
 }
 .sel-bar .btn { background: rgba(255,255,255,0.2); border-color: rgba(255,255,255,0.3); color: #fff; }
 
+.split-btn { display: inline-flex; align-items: stretch; }
+.split-btn > .btn { border-radius: 4px 0 0 4px; border-right: 0; }
+.split-btn > .btn.split-arrow {
+  border-radius: 0 4px 4px 0; padding-left: 4px; padding-right: 4px;
+  border-left: 1px solid rgba(0,0,0,0.15); min-width: 18px;
+}
+.sel-bar .split-btn > .btn.split-arrow { border-left-color: rgba(255,255,255,0.3); }
+
+.transform-menu {
+  background: var(--bg1); border: 1px solid var(--border);
+  border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  padding: 4px; z-index: 1000; display: flex; flex-direction: column;
+  min-width: 220px;
+}
+.transform-menu .transform-menu-item {
+  text-align: left; justify-content: flex-start; background: transparent;
+  border: 0; border-radius: 4px; width: 100%;
+}
+.transform-menu .transform-menu-item:hover { background: var(--bg2); }
+
+.chat-select-all { padding: 4px 0 8px; }
+
+.transform-menu-sep {
+  height: 1px; background: var(--border); margin: 4px 0;
+}
+
+.modal.modal-wide { max-width: 880px; width: 90vw; }
+.word-lists-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 12px 0;
+}
+.word-lists-grid label { display: block; margin-bottom: 4px; font-size: 13px; }
+.word-lists-grid textarea {
+  width: 100%; box-sizing: border-box;
+  font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px;
+  padding: 6px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg2); color: var(--text);
+  resize: vertical;
+}
+.word-lists-grid > div > .btn { margin-top: 6px; }
+
+.ws-dot, .ws-tab { color: var(--text3); opacity: 0.45; }
+.ws-tab { letter-spacing: 0.2em; }
+
 .empty-state { text-align: center; padding: 60px 20px; color: var(--text3); font-size: 14px; }
 .loading { text-align: center; padding: 40px; color: var(--text2); }
 .load-more-bar { text-align: center; padding: 12px; max-width: 960px; margin: 0 auto; }

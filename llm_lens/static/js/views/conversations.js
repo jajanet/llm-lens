@@ -354,13 +354,42 @@ export async function showStats() {
 }
 
 export async function copyResume(id) {
-  const cmd = `claude --resume ${id}`;
+  // Sync state read — never await before the copy attempt, browsers gate
+  // clipboard writes on the live user-activation token from the click and
+  // an intermediate await discards it.
+  const path = state.path || null;
+  // Wrap with `cd` so the command works from any cwd. Claude Code's /resume
+  // only finds the convo when the shell's cwd maps to the project folder
+  // it lives in.
+  const cmd = path
+    ? `cd "${path}" && claude --resume ${id}`
+    : `claude --resume ${id}`;
+
+  // Try modern clipboard API first; fall back to the legacy textarea +
+  // execCommand path, which works in non-secure contexts (raw IPs, file://,
+  // http on a non-localhost host) where `navigator.clipboard` is unavailable
+  // or rejected by the browser.
+  let ok = false;
   try {
-    await navigator.clipboard.writeText(cmd);
-    toast(`Copied: ${cmd}`);
-  } catch {
-    toast("Copy failed");
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(cmd);
+      ok = true;
+    }
+  } catch { /* fall through */ }
+  if (!ok) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = cmd;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      document.body.appendChild(ta);
+      ta.select();
+      ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+    } catch { /* still failed */ }
   }
+  toast(ok ? `Copied: ${cmd}` : "Copy failed");
 }
 
 export async function loadMore() {
@@ -462,7 +491,10 @@ export function bulkDelete() {
     title: `Delete ${ids.length} conversations?`,
     body: `Permanently deletes ${ids.length} <code>.jsonl</code> files from
       <code>~/.claude/projects/</code>. <strong>Cannot be undone</strong>, and
-      you won't be able to <code>/resume</code> any of them after.`,
+      you won't be able to <code>/resume</code> any of them after.
+      <br><br><strong>Prefer Archive</strong> to remove them from
+      Claude Code's <code>/resume</code> list reversibly — content stays on
+      disk and can be restored from the Archived filter.`,
     onConfirm: async () => {
       await api.bulkDeleteConversations(state.folder, ids);
       state.selected.clear();

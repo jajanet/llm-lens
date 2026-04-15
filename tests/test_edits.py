@@ -428,8 +428,26 @@ def test_duplicate_copies_full_chain_intact(client, tmp_path):
     orig = read_jsonl(path)
     dup = read_jsonl(tmp_path / "proj" / f"{new_id}.jsonl")
 
-    assert [e["uuid"] for e in orig] == [e["uuid"] for e in dup]
-    assert [e["parentUuid"] for e in orig] == [e["parentUuid"] for e in dup]
+    # Dup must get fresh uuids — same IDs would collide with parent under
+    # Claude Code's `/resume` sessionId/message lookup.
+    orig_uuids = [e["uuid"] for e in orig]
+    dup_uuids = [e["uuid"] for e in dup]
+    assert orig_uuids != dup_uuids
+    assert set(orig_uuids).isdisjoint(set(dup_uuids))
+
+    # Parent chain inside the dup is internally consistent: each parentUuid
+    # either is None or points at a uuid earlier in the same file.
+    seen: set = set()
+    for e in dup:
+        pu = e.get("parentUuid")
+        if pu is not None:
+            assert pu in seen
+        seen.add(e["uuid"])
+
+    # Shape of the chain preserved: same count of null parents, etc.
+    assert [p is None for p in (e["parentUuid"] for e in orig)] == \
+           [p is None for p in (e["parentUuid"] for e in dup)]
+
     assert_resume_safe(dup)
     assert_resume_safe(orig)
 

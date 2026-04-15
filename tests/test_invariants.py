@@ -25,6 +25,12 @@ import llm_lens
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_lens, "CLAUDE_PROJECTS_DIR", tmp_path)
+    # Isolate the user-curated word lists per test so writes don't leak into
+    # the real ~/.cache/llm-lens/word_lists.json or across tests.
+    monkeypatch.setattr(
+        llm_lens, "_word_lists_path",
+        lambda: tmp_path / "word_lists.json",
+    )
     llm_lens._peek_jsonl_cached.cache_clear()
     llm_lens._parse_messages_cached.cache_clear()
     llm_lens.app.config["TESTING"] = True
@@ -490,12 +496,22 @@ def test_cache_invalidated_after_duplicate(client, tmp_path):
         f"/api/projects/proj/conversations/{new_id}?limit=100"
     ).get_json()
     assert dup["total"] == 2
-    assert [m["uuid"] for m in dup["main"]] == ["a", "b"]
+    dup_uuids = [m["uuid"] for m in dup["main"]]
+    # IDs must be rewritten so Claude Code /resume doesn't collide with parent.
+    assert dup_uuids != ["a", "b"]
+    assert len(set(dup_uuids)) == 2
 
-    # source must still exist with the same content — it's a copy, not a move
+    # source must still exist with its original IDs — it's a copy, not a move
     original = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
     assert original["total"] == 2
     assert [m["uuid"] for m in original["main"]] == ["a", "b"]
+
+    # Sidecar exists and points at parent.
+    import json as _json
+    sidecar = tmp_path / "proj" / f"{new_id}.dup.json"
+    assert sidecar.exists()
+    meta = _json.loads(sidecar.read_text())
+    assert meta["duplicate_of"] == "c"
 
     # double-GET on the duplicate — catches stale re-caching where GET₁
     # reads fresh data on cache miss but re-populates a stale entry.
@@ -503,7 +519,338 @@ def test_cache_invalidated_after_duplicate(client, tmp_path):
         f"/api/projects/proj/conversations/{new_id}?limit=100"
     ).get_json()
     assert dup2["total"] == 2
-    assert [m["uuid"] for m in dup2["main"]] == ["a", "b"]
+    assert [m["uuid"] for m in dup2["main"]] == dup_uuids
+
+
+def _assistant(uuid, parent, text, in_t, out_t):
+    return {
+        "uuid": uuid,
+        "parentUuid": parent,
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [{"type": "text", "text": text}],
+            "usage": {"input_tokens": in_t, "output_tokens": out_t,
+                      "cache_read_input_tokens": 0,
+                      "cache_creation_input_tokens": 0},
+        },
+    }
+
+
+def test_duplicate_subtracts_shared_prefix_while_parent_exists(client, tmp_path):
+    path = tmp_path / "proj" / "p.jsonl"
+    write_jsonl(path, [
+        msg("u1", None, "hi"),
+        _assistant("a1", "u1", "reply-one", 10, 5),
+        _assistant("a2", "a1", "reply-two", 20, 7),
+    ])
+
+    parent = client.get("/api/projects/proj/conversations/p/stats").get_json()
+    assert parent["input_tokens"] == 30
+    assert parent["output_tokens"] == 12
+
+    resp = client.post("/api/projects/proj/conversations/p/duplicate")
+    new_id = resp.get_json()["new_id"]
+
+    # Parent still exists -> shared prefix subtracted from dup's stats so
+    # project-level totals don't double-count.
+    dup = client.get(
+        f"/api/projects/proj/conversations/{new_id}/stats"
+    ).get_json()
+    assert dup["input_tokens"] == 0
+    assert dup["output_tokens"] == 0
+    assert dup["duplicate_of"] == "p"
+
+    # Delete parent -> no parent in aggregate anymore, dup must show full stats.
+    client.delete("/api/projects/proj/conversations/p")
+    dup_after = client.get(
+        f"/api/projects/proj/conversations/{new_id}/stats"
+    ).get_json()
+    assert dup_after["input_tokens"] == 30
+    assert dup_after["output_tokens"] == 12
+
+
+def test_scrub_redacts_text_preserves_usage_and_chain(client, tmp_path):
+    path = tmp_path / "proj" / "s.jsonl"
+    write_jsonl(path, [
+        msg("u1", None, "what is 2+2"),
+        _assistant("a1", "u1", "The answer is four.", 100, 20),
+        msg("u2", "a1", "thanks"),
+    ])
+
+    pre = client.get("/api/projects/proj/conversations/s/stats").get_json()
+
+    resp = client.post("/api/projects/proj/conversations/s/messages/a1/scrub")
+    assert resp.status_code == 200
+
+    # Stats (including usage-derived tokens) unchanged — `usage` left alone.
+    post = client.get("/api/projects/proj/conversations/s/stats").get_json()
+    assert post["input_tokens"] == pre["input_tokens"]
+    assert post["output_tokens"] == pre["output_tokens"]
+
+    # On-disk: uuid/parentUuid unchanged, text content replaced with ".".
+    with open(path) as f:
+        lines = [json.loads(line) for line in f if line.strip()]
+    scrubbed = next(e for e in lines if e["uuid"] == "a1")
+    assert scrubbed["parentUuid"] == "u1"
+    assert scrubbed["message"]["usage"]["input_tokens"] == 100
+    assert scrubbed["message"]["usage"]["output_tokens"] == 20
+    assert scrubbed["message"]["content"] == [{"type": "text", "text": "."}]
+    # Neighbours untouched — scrub is local.
+    assert next(e for e in lines if e["uuid"] == "u1")["message"]["content"] \
+        == [{"type": "text", "text": "what is 2+2"}]
+
+
+def test_scrub_rejects_non_prose_messages(client, tmp_path):
+    """Messages containing tool_use / tool_result / thinking blocks can't be
+    scrubbed — those blocks carry structural meaning (tool linkage, thinking
+    signatures) that a blanket text replace would break."""
+    path = tmp_path / "proj" / "s.jsonl"
+    tool_msg = {
+        "uuid": "t1",
+        "parentUuid": None,
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "I'll look that up."},
+                {"type": "tool_use", "id": "tu1", "name": "lookup", "input": {}},
+            ],
+        },
+    }
+    write_jsonl(path, [tool_msg])
+
+    resp = client.post("/api/projects/proj/conversations/s/messages/t1/scrub")
+    assert resp.status_code == 400
+    assert "prose-only" in resp.get_json()["error"]
+
+    # File unchanged.
+    with open(path) as f:
+        line = json.loads(f.readline())
+    assert line["message"]["content"][1]["type"] == "tool_use"
+
+
+def test_scrub_returns_404_for_missing_message(client, tmp_path):
+    path = tmp_path / "proj" / "s.jsonl"
+    write_jsonl(path, [msg("u1", None, "hi")])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/does-not-exist/scrub"
+    )
+    assert resp.status_code == 404
+
+
+def test_normalize_whitespace_collapses_runs_and_blank_lines(client, tmp_path):
+    path = tmp_path / "proj" / "w.jsonl"
+    write_jsonl(path, [
+        msg("u1", None, "hello    world\n\n\n\nnext   paragraph   "),
+    ])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/w/messages/u1/scrub",
+        json={"kind": "normalize_whitespace"},
+    )
+    assert resp.status_code == 200
+
+    with open(path) as f:
+        entry = json.loads(f.readline())
+    text = entry["message"]["content"][0]["text"]
+    assert text == "hello world\n\nnext paragraph"
+
+
+def test_transform_rejects_unknown_kind(client, tmp_path):
+    path = tmp_path / "proj" / "w.jsonl"
+    write_jsonl(path, [msg("u1", None, "hi")])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/w/messages/u1/scrub",
+        json={"kind": "bogus"},
+    )
+    assert resp.status_code == 400
+    assert "Unknown transform kind" in resp.get_json()["error"]
+
+
+def test_remove_swears_handles_stem_variations(client, tmp_path):
+    """`fuck*` should match fuck/fucks/fucker/fucking/etc. via the closed
+    safe-suffix list — but plain `ass` must not blow up on `assistant`."""
+    path = tmp_path / "proj" / "sw.jsonl"
+    write_jsonl(path, [
+        msg("u1", None,
+            "fuck this fucking fucker, fucks and fucked. ass alone here. "
+            "but the assistant is fine and assess is fine."),
+    ])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/sw/messages/u1/scrub",
+        json={"kind": "remove_swears"},
+    )
+    assert resp.status_code == 200
+
+    with open(path) as f:
+        text = json.loads(f.readline())["message"]["content"][0]["text"]
+    # All fuck variants gone
+    assert "fuck" not in text.lower()
+    # Plain `ass` removed (it's in the default list)
+    assert " ass " not in f" {text} "
+    # `assistant` and `assess` survive — false positives would mean the
+    # regex was too greedy.
+    assert "assistant" in text
+    assert "assess" in text
+
+
+def test_remove_filler_drops_ai_sycophancy_phrases(client, tmp_path):
+    path = tmp_path / "proj" / "fl.jsonl"
+    write_jsonl(path, [
+        msg("u1", None,
+            "You're absolutely right! Here is the answer. "
+            "Let me think step by step. The result is 4."),
+    ])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/fl/messages/u1/scrub",
+        json={"kind": "remove_filler"},
+    )
+    assert resp.status_code == 200
+
+    with open(path) as f:
+        text = json.loads(f.readline())["message"]["content"][0]["text"]
+    assert "absolutely right" not in text.lower()
+    assert "step by step" not in text.lower()
+    assert "Here is the answer." in text
+    assert "The result is 4." in text
+
+
+def test_word_lists_get_returns_defaults(client, tmp_path, monkeypatch):
+    # Force user-lists file to not exist by pointing HOME at a fresh tmp dir.
+    monkeypatch.setattr(
+        "llm_lens._word_lists_path",
+        lambda: tmp_path / "no_such_dir" / "word_lists.json",
+    )
+    resp = client.get("/api/word-lists").get_json()
+    assert "fuck*" in resp["swears"]
+    assert any("absolutely right" in p.lower() for p in resp["filler"])
+
+
+def test_word_lists_post_persists_user_overrides(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_lens._word_lists_path",
+        lambda: tmp_path / "wl.json",
+    )
+    saved = client.post(
+        "/api/word-lists",
+        json={"swears": ["heck"], "filler": ["my custom phrase"]},
+    ).get_json()
+    assert saved["swears"] == ["heck"]
+    assert saved["filler"] == ["my custom phrase"]
+    # Reload via GET — confirms persistence and that defaults are NOT
+    # re-merged on top of a user-provided list (user controls the full set).
+    again = client.get("/api/word-lists").get_json()
+    assert again["swears"] == ["heck"]
+    assert "fuck*" not in again["swears"]
+
+
+def test_swears_match_case_insensitive(client, tmp_path):
+    path = tmp_path / "proj" / "ci.jsonl"
+    write_jsonl(path, [msg("u1", None, "FUCK this and Fucker")])
+
+    client.post(
+        "/api/projects/proj/conversations/ci/messages/u1/scrub",
+        json={"kind": "remove_swears"},
+    )
+    with open(path) as f:
+        text = json.loads(f.readline())["message"]["content"][0]["text"]
+    assert "fuck" not in text.lower()
+
+
+def test_swears_empty_list_is_noop(client, tmp_path, monkeypatch):
+    """Empty user-saved swears list must mean 'don't strip anything' — not
+    'fall back to defaults'. User opt-out has to be possible."""
+    monkeypatch.setattr("llm_lens._word_lists_path", lambda: tmp_path / "wl.json")
+    client.post("/api/word-lists", json={"swears": [], "filler": []})
+
+    path = tmp_path / "proj" / "ne.jsonl"
+    write_jsonl(path, [msg("u1", None, "fuck this shit")])
+
+    client.post(
+        "/api/projects/proj/conversations/ne/messages/u1/scrub",
+        json={"kind": "remove_swears"},
+    )
+    with open(path) as f:
+        text = json.loads(f.readline())["message"]["content"][0]["text"]
+    assert text == "fuck this shit"
+
+
+def test_swear_stem_doesnt_match_inside_other_words(client, tmp_path):
+    """Regression: `ass*` would match `assistant` if we used `\\w*` instead
+    of the closed safe-suffix list. This test guards that fix."""
+    path = tmp_path / "proj" / "fp.jsonl"
+    write_jsonl(path, [msg("u1", None,
+        "the assistant assessed the assignment in the assembly")])
+
+    # Use a custom list with `ass*` to force stem matching of a short stem.
+    client.post(
+        "/api/word-lists",
+        json={"swears": ["ass*"], "filler": []},
+    )
+    client.post(
+        "/api/projects/proj/conversations/fp/messages/u1/scrub",
+        json={"kind": "remove_swears"},
+    )
+    with open(path) as f:
+        text = json.loads(f.readline())["message"]["content"][0]["text"]
+    # All four longer words must survive
+    for w in ("assistant", "assessed", "assignment", "assembly"):
+        assert w in text, f"stem matcher false-positive on '{w}': {text!r}"
+
+
+def test_filler_handles_multi_block_content(client, tmp_path):
+    """List-shaped content (multiple text blocks) must have each block
+    transformed independently, not collapsed into one."""
+    path = tmp_path / "proj" / "mb.jsonl"
+    multi = {
+        "uuid": "m1",
+        "parentUuid": None,
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Certainly! First part."},
+                {"type": "text", "text": "Of course! Second part."},
+            ],
+        },
+    }
+    write_jsonl(path, [multi])
+
+    client.post(
+        "/api/projects/proj/conversations/mb/messages/m1/scrub",
+        json={"kind": "remove_filler"},
+    )
+    with open(path) as f:
+        blocks = json.loads(f.readline())["message"]["content"]
+    assert len(blocks) == 2
+    assert "Certainly" not in blocks[0]["text"]
+    assert "Of course" not in blocks[1]["text"]
+    assert "First part" in blocks[0]["text"]
+    assert "Second part" in blocks[1]["text"]
+
+
+def test_swear_strip_tidies_punctuation_and_double_spaces(client, tmp_path):
+    """After removal, leading space before `,` / `.` should collapse so the
+    sentence still reads cleanly — not 'this  , then'."""
+    path = tmp_path / "proj" / "tidy.jsonl"
+    write_jsonl(path, [msg("u1", None, "this fucking , then shit . done")])
+
+    client.post(
+        "/api/projects/proj/conversations/tidy/messages/u1/scrub",
+        json={"kind": "remove_swears"},
+    )
+    with open(path) as f:
+        text = json.loads(f.readline())["message"]["content"][0]["text"]
+    # No "  " (double space) and no " ," / " ." left behind
+    assert "  " not in text
+    assert " ," not in text
+    assert " ." not in text
 
 
 def test_cache_invalidated_after_delete_conversation(client, tmp_path):

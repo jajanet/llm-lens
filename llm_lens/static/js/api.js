@@ -94,6 +94,27 @@ export const api = {
   deleteMessage: (folder, convoId, msgUuid) =>
     json(`/api/projects/${folder}/conversations/${convoId}/messages/${msgUuid}`, { method: "DELETE" }),
 
+  transformMessage: (folder, convoId, msgUuid, kind = "scrub") =>
+    json(`/api/projects/${folder}/conversations/${convoId}/messages/${msgUuid}/scrub`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind }),
+    }),
+
+
+  getWordLists: () =>
+    json("/api/word-lists"),
+
+  getWordListDefaults: () =>
+    json("/api/word-lists/defaults"),
+
+  saveWordLists: (data) =>
+    json("/api/word-lists", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+
   extractMessages: (folder, convoId, uuids) =>
     json(`/api/projects/${folder}/conversations/${convoId}/extract`, {
       method: "POST",

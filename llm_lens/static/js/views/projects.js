@@ -238,7 +238,9 @@ export function deleteProject(folder, name) {
     body: `Permanently deletes <strong>${esc(name)}</strong> and every
       conversation inside it from <code>~/.claude/projects/</code>.
       <strong>Cannot be undone</strong>, and none of these conversations will
-      be resumable after.`,
+      be resumable after.
+      <br><br>There's no project-level archive — if any conversations matter,
+      open the project and <strong>Archive</strong> them individually first.`,
     onConfirm: async () => {
       await api.deleteProject(folder);
       invalidateProjectsCache();

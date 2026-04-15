@@ -44,6 +44,7 @@ export const state = {
 
   editMode: false,
   showSide: false,
+  showWhitespace: false,
 
   convoOffset: 0,
   convoTotal: 0,
