@@ -6,6 +6,21 @@ import { esc, escAttr, highlightText } from "../utils.js";
 import { configureToolbar } from "../toolbar.js";
 import { showConfirmModal } from "../modal.js";
 import { navigate } from "../router.js";
+import { marked } from "../lib/marked.esm.min.js";
+
+// Configure marked: GFM on, no soft-break on single newlines.
+// Override link renderer so all links open in a new tab safely.
+marked.use({
+  gfm: true,
+  breaks: true,
+  renderer: {
+    link({ href, title, tokens }) {
+      const text = this.parser.parseInline(tokens);
+      const titleAttr = title ? ` title="${title}"` : "";
+      return `<a href="${href || ""}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`;
+    },
+  },
+});
 
 const app = document.getElementById("app");
 const bc = document.getElementById("breadcrumb");
@@ -130,10 +145,9 @@ function processContent(raw) {
   const visible = c.replace(/__THINK_\d+__/g, "").replace(/__TOOL_\d+__/g, "").trim();
   if (!visible && !thinkingBlocks.length && !toolBadges.length) return "";
 
-  c = esc(c);
+  c = marked.parse(c);
   thinkingBlocks.forEach((html, i) => { c = c.replace(`__THINK_${i}__`, html); });
   toolBadges.forEach((html, i) => { c = c.replace(`__TOOL_${i}__`, html); });
-  c = c.replace(/\n/g, "<br>");
   return c;
 }
 
