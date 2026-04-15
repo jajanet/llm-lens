@@ -1470,11 +1470,37 @@ _NL_RUN_RE = re.compile(r"\n{3,}")
 
 
 def _normalize_ws(text: str) -> str:
-    # Collapse runs of spaces/tabs to a single space and 3+ consecutive
-    # newlines to a double newline — preserves paragraph breaks, removes
-    # accidental stutter from editing. Trim trailing whitespace on each line.
-    lines = [_WS_RUN_RE.sub(" ", line).rstrip() for line in text.split("\n")]
-    return _NL_RUN_RE.sub("\n\n", "\n".join(lines))
+    """Collapse cosmetic whitespace without touching code-shaped content.
+
+    Rules, applied per line:
+      - Inside a triple-backtick fenced code block: leave the line alone.
+      - Lines that start with a space or tab: leave leading whitespace
+        intact (preserves Python/YAML/Makefile indentation, list/quote
+        continuations, indent-style code blocks). Only rstrip trailing
+        whitespace.
+      - All other (prose) lines: collapse runs of inline spaces/tabs to a
+        single space, then rstrip.
+    Then: collapse 3+ consecutive newlines to 2 to tighten paragraph gaps.
+
+    Inline code spans (`` `like this` ``) inside prose lines are not
+    detected — internal multi-space inside a backtick span will still be
+    collapsed. Acceptable v1 trade-off; documented limitation.
+    """
+    out = []
+    in_fence = False
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        if line and line[0] in " \t":
+            out.append(line.rstrip())
+            continue
+        out.append(_WS_RUN_RE.sub(" ", line).rstrip())
+    return _NL_RUN_RE.sub("\n\n", "\n".join(out))
 
 
 def _normalize_whitespace_content(message: dict):

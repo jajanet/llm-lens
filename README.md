@@ -3,229 +3,192 @@
 ![demo](https://raw.githubusercontent.com/jajanet/llm-lens/main/stats-demo.gif)
 ![demo](https://raw.githubusercontent.com/jajanet/llm-lens/main/demo.gif)
 
-A local, offline web management tool for browsing and pruning the conversation history your LLM CLI has already written to disk. Currently supports [Claude Code](https://claude.ai/code), which saves every session as a `.jsonl` file under `~/.claude/projects/`.
+A local, offline web UI for auditing, pruning, and cleaning the conversation history your LLM CLI has written to disk. Currently supports [Claude Code](https://claude.ai/code); the architecture accommodates other providers (Codex, Gemini) but only Claude is implemented today.
 
-**No API key. No auth. No agent.** This tool never talks to Anthropic's API, never invokes the `claude` CLI, and can't send new messages — it only reads and rewrites the JSONL files on your machine. Everything is local filesystem I/O.
+**Local only.** No API key. No auth. No outbound network. Never invokes `claude`. Reads and rewrites `~/.claude/projects/*.jsonl` on your machine, nothing else.
 
-The architecture is designed to accommodate other provider backends (OpenAI Codex CLI, Gemini CLI, etc.) — see [Extending to other providers](#extending-to-other-providers) — but today only Claude Code is implemented.
+Three things, in order of why they actually matter:
 
-## Why this exists
+### 1. Know what you're spending
 
-Claude Code accumulates session history fast. After a few weeks of active use you can have hundreds of conversations spread across dozens of projects, with no built-in way to properly audit or prune them. This tool is a light browser-based UI for that directory.
+Token counts and USD costs come from the actual `message.usage` fields Anthropic returned for each turn — not estimates. Per-model breakdowns, per-project rollups, per-day/week/month buckets. The overview chart shows where your money went and which sessions were expensive. Pricing table in `utils.js` (captured from `claude.com/pricing` on 2026-04-14; update when rates change).
 
-A few read-only viewers already cover the browsing side. Others only show stats. This tool lets you see your conversations and project, the associated costs, AND gives you the tools to steer future behavior — delete individual messages, extract a subset of messages into a new conversation, duplicate or bulk-delete conversations.
+### 2. Make future `/resume` cheaper
 
-These edits are still **best-effort**: Claude Code's `/resume` replay semantics aren't publicly documented, so a destructive edit can in some cases break resume of that conversation. See [Editing conversations: prefer non-destructive actions](#editing-conversations-prefer-non-destructive-actions) for the warning, and Github issues for more info.
+This is the lever that's easy to miss. Anything you remove from a conversation shrinks what Claude Code sends as context the next time you `/resume` it. Less context sent → fewer input tokens billed per turn going forward. The editing tools aren't just cleanup; they're direct downstream cost reduction:
 
-## What it does
+- **Scrub** — redact a message's text to `.`. Original `usage` is preserved (historical accuracy), but on resume the scrubbed content is what gets sent.
+- **Normalize whitespace** — collapse runs of spaces/tabs and 3+ newlines.
+- **Strip agent-priming language.** Two curated lists for the two flavors, both stored at `~/.cache/llm-lens/word_lists.json` and editable in-app:
+  - **Swears** — emotionally charged words that prime an agent toward worse output. Word-bounded, with a `*` stem syntax for safe conjugation matching (`fuck*` catches fuck/fucks/fucker/fucking; `ass` stays exact so `assistant` survives).
+  - **Filler / drift phrases** — sycophancy and meta-commentary that nudge the agent off task: "You're absolutely right!", "Let me think step by step.", "I apologize for the confusion.", etc. Same mechanism, different register.
+- **Extract** a pruned subset into a new conversation, leaving the original untouched.
 
-Three-level navigation mirroring Claude Code's own storage layout:
+### 3. Stay honest about history
 
-- **Projects** — one entry per folder in `~/.claude/projects/`, showing conversation count, total size, and a preview of the most recent message. Sortable by name, activity, size, or conversation count. List or card layout.
-- **Conversations** — all `.jsonl` sessions within a project, paginated and sortable. Each shows a preview of the first user message, file size, last-modified time, and token/cost stats (card layout).
-- **Messages** — chat-style view of a single conversation. Renders tool calls and tool results as inline badges. Thinking blocks are collapsed by default and expandable. Paginated so large conversations load quickly.
-- **Overview bar** — a chart at the top of the Projects and Conversations views showing activity over a configurable time range (day / week / month buckets). Modes: message count, token usage, or estimated cost. Includes aggregate token totals and USD cost estimates for the selected window.
+Deletes don't vanish from your accounting. Per-conversation `deleted_delta` tombstones are stored in the sidecar cache so project- and overview-level rollups still reflect what you actually spent. Duplicating a conversation writes a sidecar recording the shared-prefix stats so the copy doesn't double-count against the parent while both exist.
 
-**Things you can do:**
+## Workflows
 
-| Action | Where |
+### Audit a month
+
+Open the Overview chart at the top of Projects or Conversations. Range → Month, Mode → Tokens or Cost. Click into the heavy days. Drill from Projects → Conversations → Messages. Archive stuff you're done with; delete stuff you'll never need; leave the rest.
+
+### Prune a runaway conversation
+
+1. Duplicate it (the copy gets a fresh `sessionId` and rewritten message UUIDs so `/resume` doesn't collide with the parent).
+2. Open the duplicate in Edit mode. Select the noise. Bulk-scrub, bulk-delete, or extract the signal to a new convo.
+3. Keep the original around as a fallback. There's no in-tool way to confirm the edited copy will `/resume` cleanly — that's a separate `claude --resume <id>` from the terminal, and undocumented invariants mean a pass today doesn't guarantee a pass tomorrow.
+
+### Redact before sharing a transcript
+
+Select the messages to redact. Scrub. The chain, UUIDs, and token counts stay intact — only the visible text becomes `.`. Safe to paste the file into a bug report or share the session ID.
+
+### Cut agent-priming language across a session
+
+Open the Messages view. Edit mode → Select all → split-button `▾` → **Remove swears** or **Remove filler / drift phrases**. Both are doing the same job — stripping language that degrades the next turn's output, whether by emotional priming (swears) or sycophancy-induced drift (filler). Curate either list via **Curate word lists…** (stored at `~/.cache/llm-lens/word_lists.json`).
+
+## Safety model
+
+This tool is **non-destructive by default**. Every editing action has a preserving alternative:
+
+| You want to | Non-destructive option |
 |---|---|
-| Filter/search | All three levels, client-side |
-| Sort by column | Projects + Conversations views |
-| Toggle list / card layout | Projects + Conversations views |
-| Toggle active / archived view | Projects + Conversations views |
-| Delete a project | Projects view |
-| Delete a conversation | Conversations view |
-| Archive a conversation | Conversations view |
-| Unarchive a conversation | Conversations view (Archived mode) |
-| Duplicate a conversation | Conversations view |
-| Bulk-delete conversations | Conversations view (checkbox select) |
-| Bulk-archive conversations | Conversations view (checkbox select) |
-| Bulk-unarchive conversations | Conversations view (Archived mode, checkbox select) |
-| View token counts and estimated cost | Conversations view (card layout, stats inline) |
-| Copy a message to clipboard | Messages view |
-| Delete a single message | Messages view |
-| Select messages and copy them | Messages view (Edit mode) |
-| Extract selected messages to a new conversation | Messages view (Edit mode) |
-| Bulk-delete selected messages | Messages view (Edit mode) |
-| View sidechain (sub-agent) messages | Messages view |
-| Dark / light theme | Header toggle, persisted in `localStorage` |
+| Hide a conversation | **Archive** (moves to `~/.cache/llm-lens/archive/`, reversible) |
+| Remove messages | **Extract to new convo** (leaves original intact) |
+| Edit a message | **Scrub** text, keeping usage and chain |
+| Try a risky edit | **Duplicate first**, edit the copy |
 
-**What it doesn't do:** it has no write path back to Claude Code. Deleting or editing sessions here does not affect any running Claude Code process — it only modifies the files on disk.
+Destructive actions (delete-convo, delete-message, in-place normalize/scrub) rewrite files on disk. Claude Code's `/resume` replay semantics aren't publicly documented, so any in-place edit is best-effort — the tool re-links `parentUuid` chains and strips orphan `tool_use`/`tool_result` blocks to stay resume-safe, but we can't guarantee it against invariants we can't see. If resume-ability of a specific conversation matters to you, duplicate before editing.
 
-### Editing conversations: prefer non-destructive actions
+Deleting a whole conversation or project is low-risk — that's just file removal, no chain-surgery.
 
-Claude Code's `/resume` replay semantics aren't publicly documented, so any destructive edit to a conversation `.jsonl` is best-effort. If you care about being able to `/resume` an edited conversation:
+## What it shows
 
-- **Prefer *Extract* (Edit mode → "Save to new convo")** over deleting messages. It writes a new conversation file and leaves the original untouched, so you can always fall back to the original if replay misbehaves.
-- **If you must delete**, duplicate the conversation first (Conversations view → Dup), so the original is preserved.
-- Deleting a whole conversation or project is fine — those just remove files and don't touch message chains.
+Three views, each paginated + sortable + searchable:
 
-The tool tries to keep edits "resume-safe" (re-links `parentUuid` chains, strips orphan `tool_use` / `tool_result` blocks), but there may be other undocumented invariants Claude Code's replay relies on.
+- **Projects** — one entry per `~/.claude/projects/*` subdirectory. Convo count, total size, preview, aggregate stats.
+- **Conversations** — all `.jsonl` sessions in a project. Toggle active/archived. Card view shows inline stats. Delete/archive/duplicate per-row.
+- **Messages** — chat view. Tool calls and results render as inline badges. Thinking blocks collapsed by default. Toggle to render whitespace (`·` for spaces, `→` for tabs) when you care about exact text. Edit mode surfaces per-message Copy / Scrub (split-button with transform variants) / Delete, and a bulk action bar when messages are selected.
+
+**Overview chart** on Projects and Conversations views: activity over day/week/month buckets, with modes for message count, tokens, or USD cost. Aggregate totals and cost estimates for the selected window.
+
+## Install + run
+
+Requirements: Python 3.8+, a browser, Claude Code installed at least once (so `~/.claude/projects/` exists).
+
+```bash
+pipx install llm-lens-web     # or: uv tool install llm-lens-web
+llm-lens-web                  # opens http://localhost:5111
+```
+
+Custom port: `llm-lens-web 8080`. The server binds `0.0.0.0` — reachable on your LAN. There's no auth, so don't run it on an untrusted network.
+
+Upgrade / uninstall: `pipx upgrade llm-lens-web` / `pipx uninstall llm-lens-web` (substitute `uv tool` if that's what you used).
 
 ---
 
-## For users: running it
+## For developers
 
-### Requirements
-
-- Python 3.8+
-- A browser
-- At least one supported LLM CLI installed and used at least once (currently: Claude Code, which populates `~/.claude/projects/`)
-
-### Install
-
-The recommended way is [`pipx`](https://pipx.pypa.io/) or [`uv tool`](https://docs.astral.sh/uv/guides/tools/), which install CLI apps into isolated environments and put them on your `PATH`:
-
-```bash
-# with pipx
-pipx install llm-lens-web
-
-# or with uv
-uv tool install llm-lens-web
-```
-
-Then run:
-
-```bash
-llm-lens-web
-```
-
-and open [http://localhost:5111](http://localhost:5111) in your browser.
-
-To use a different port:
-
-```bash
-llm-lens-web 8080
-```
-
-The server binds to `0.0.0.0` so it is also reachable from other devices on your local network on whatever port you choose. It has no authentication — only run it on a trusted network.
-
-### Alternative: plain pip
-
-```bash
-pip install llm-lens-web
-llm-lens-web
-```
-
-### Upgrading / uninstalling
-
-```bash
-pipx upgrade llm-lens-web      # or: uv tool upgrade llm-lens-web
-pipx uninstall llm-lens-web    # or: uv tool uninstall llm-lens-web
-```
-
----
-
-## For developers / contributors
-
-### Project layout
+### Layout
 
 ```
-pyproject.toml          Package metadata & dependencies
+pyproject.toml          Package metadata
 llm_lens/
-  __init__.py           Flask backend — REST API + static file serving + main() entry point
-  peek_cache.py         Persistent sidecar cache (~/.cache/llm-lens/sessions.json) — token stats, titles, tombstones
+  __init__.py           Flask backend: REST API, static serving, main()
+  peek_cache.py         Persistent sidecar cache (token stats, titles, tombstones)
   static/
-    index.html          Single-page app shell
-    css/styles.css      All styles (dark/light theme via CSS vars)
+    index.html          SPA shell
+    css/styles.css      All styles; dark/light via CSS vars
     js/
-      main.js           Entry point: routing, theme, delegated click handler
-      state.js          Shared mutable state + localStorage persistence
-      api.js            Thin fetch wrappers for every backend endpoint
-      router.js         Hash-based client-side router
-      toolbar.js        Toolbar rendering helper
-      modal.js          Confirm dialog
-      utils.js          Formatting helpers (timeAgo, fmtSize, esc, etc.)
+      main.js           Routing + delegated click handler
+      state.js          Shared state + localStorage
+      api.js            Fetch wrappers
+      router.js         Hash router
+      toolbar.js        Toolbar helper
+      modal.js          Confirm dialogs
+      utils.js          Formatting + PRICING table
       views/
-        projects.js     Projects list view
-        conversations.js Conversations list view
-        messages.js     Message thread view
+        projects.js
+        conversations.js
+        messages.js
 ```
 
-No frontend build step. No bundler. No npm. The frontend is plain ES modules loaded directly by the browser.
+No build step. Plain ES modules.
 
-### Running locally (editable install)
+### Running locally
 
 ```bash
-git clone <repo-url>
-cd llm-lens
+git clone <repo>
+cd llm-cli-session-web
 pip install -e .
 LLM_LENS_DEBUG=1 llm-lens-web
 ```
 
-`-e` (editable) installs the package so code edits take effect immediately. Setting `LLM_LENS_DEBUG=1` enables Flask's auto-reloader.
+`-e` + `LLM_LENS_DEBUG=1` gives edit-reload.
 
-### Backend
+### Design notes
 
-`llm_lens/__init__.py` is a single-file Flask app. Key design notes:
+- **Data source.** `CLAUDE_PROJECTS_DIR = ~/.claude/projects/` is hardcoded. Each subdirectory is a project; each `.jsonl` is a conversation. Main provider coupling.
+- **Sidecar cache.** `~/.cache/llm-lens/sessions.json`, keyed on `(filepath, mtime, size)` so entries auto-invalidate. Debounced atomic writes; in-process `@lru_cache` in front for hot reads.
+- **Tombstones.** Deleted conversations leave a `deleted_delta` entry preserving final stats so project/overview rollups stay honest. Path-reuse handled by keying on `(pre-delete mtime, size)`.
+- **Archive.** `rename` to `~/.cache/llm-lens/archive/<folder>/`, mtime preserved so time-bucketed stats don't shift.
+- **Duplicate.** New file UUID *and* rewritten `sessionId`/`uuid`/`parentUuid` inside so `/resume` doesn't collide with the parent. Sidecar `<new-id>.dup.json` records the shared-prefix stats so aggregation subtracts them while the parent still exists.
+- **Word lists.** User-curated at `~/.cache/llm-lens/word_lists.json` (`{swears, filler}`). Empty list = opt-out (not "fall back to defaults"). Defaults shipped in code and exposed via `GET /api/word-lists/defaults`.
+- **Mutations.** Plain filesystem ops: `unlink`, `rename`, `shutil.copy2`, line-filtered rewrites. No database.
 
-- **`~/.claude/projects/` is the data source.** The path is hardcoded as `CLAUDE_PROJECTS_DIR`. Each subdirectory is a "project"; each `.jsonl` file inside is a conversation. This is the main provider-specific coupling today — see [Extending to other providers](#extending-to-other-providers).
-- **Persistent sidecar cache** (`peek_cache.py`). Token stats, titles, and deletion tombstones are stored in `~/.cache/llm-lens/sessions.json`, keyed on `(filepath, mtime, size)` so entries auto-invalidate when the underlying file changes. Writes are debounced and flushed atomically. An in-process `@lru_cache` layer sits in front for hot reads within a single request cycle.
-- **Archive system.** Archiving a conversation moves its `.jsonl` file to `~/.cache/llm-lens/archive/<folder>/` (preserving mtime) rather than deleting it. Archived conversations are excluded from the active view but browseable and restorable. Deletion tombstones persist the final token stats of deleted conversations so they are still included in overview rollups.
-- **Stats.** Toll usage is derived directly from JSONL files. Token counts (`input`, `output`, `cache_read`, `cache_creation`, `thinking`) are read from actual `message.usage` fields generated by the Anthropic API, from each assistant turn in the Claude Code JSONL — no estimation. Per-model breakdowns (`per_model` dict) are tracked alongside aggregate totals.
-- **Costs.** Estimated USD cost is computed based on tokens calculated from the above information and the pricing table in `utils.js` (captured from `claude.com/pricing` on 2026-04-14; update `PRICING` in `utils.js` when rates change).
-- **Pagination everywhere.** Projects, conversations, and messages are all paginated. The conversations endpoint supports server-side sort by recency and size; sort-by-message-count loads all files and sorts in Python (unavoidable since line counts require reading each file).
-- **Mutations are plain filesystem ops.** Delete = `unlink`. Archive = `rename` to archive dir. Duplicate = `shutil.copy2`. Extract = filtered line-by-line copy to a new UUID-named file. No database.
-
-### Frontend
-
-The frontend is a small hand-rolled SPA:
-
-- **Hash router** (`router.js`) — three routes: `/`, `/p/:folder`, `/p/:folder/c/:convoId`.
-- **Delegated click handler** (`main.js`) — all interactive elements carry `data-action="..."`. One top-level listener on `document.body` dispatches to an actions map. No inline handlers anywhere.
-- **Edit mode** — a global toggle that adds `edit-mode` to `<body>`. Message checkboxes and a floating selection bar appear only in this mode.
-- **Content rendering** — `processContent()` in `messages.js` handles thinking blocks (`<thinking>...</thinking>`) and tool call markers (`[Tool: name]`, `[Tool Result]`) before HTML-escaping the rest. Thinking blocks become collapsible toggles. Tool calls become styled badges.
-
-### API reference
+### API
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/overview` | Calendar-aligned activity buckets (`range`, `mode`, `group_by`, `offset`) |
-| `GET` | `/api/projects` | All projects with metadata |
-| `POST` | `/api/projects/stats` | Aggregate token stats across multiple projects |
-| `GET` | `/api/projects/:folder/conversations` | Paginated conversations (`offset`, `limit`, `sort`, `desc`) |
-| `GET` | `/api/projects/:folder/archived` | All archived conversations for a project |
-| `POST` | `/api/projects/:folder/stats` | Aggregate token stats for a project (batched by conversation IDs) |
-| `POST` | `/api/projects/:folder/names` | Bulk-fetch custom titles for a set of conversation IDs |
-| `POST` | `/api/projects/:folder/refresh-cache` | Force re-scan all conversations and flush the sidecar cache |
-| `GET` | `/api/projects/:folder/conversations/:id` | Paginated messages (`offset`, `limit`) |
-| `GET` | `/api/projects/:folder/conversations/:id/stats` | Token stats for a single conversation |
-| `DELETE` | `/api/projects/:folder/conversations/:id` | Delete a conversation (stats tombstoned in cache) |
-| `POST` | `/api/projects/:folder/conversations/:id/archive` | Archive a conversation |
-| `POST` | `/api/projects/:folder/conversations/:id/unarchive` | Unarchive a conversation |
-| `POST` | `/api/projects/:folder/conversations/:id/duplicate` | Duplicate a conversation |
-| `DELETE` | `/api/projects/:folder/conversations/:id/messages/:uuid` | Delete a single message |
-| `POST` | `/api/projects/:folder/conversations/:id/extract` | Create new conversation from selected message UUIDs |
-| `POST` | `/api/projects/:folder/conversations/bulk-delete` | Delete multiple conversations |
-| `POST` | `/api/projects/:folder/conversations/bulk-archive` | Archive multiple conversations |
-| `POST` | `/api/projects/:folder/conversations/bulk-unarchive` | Unarchive multiple conversations |
+| `GET` | `/api/overview` | Activity buckets (`range`, `mode`, `group_by`, `offset`) |
+| `GET` | `/api/projects` | All projects + metadata |
+| `POST` | `/api/projects/stats` | Aggregate token stats across projects |
+| `GET` | `/api/projects/:folder/conversations` | Paginated conversations |
+| `GET` | `/api/projects/:folder/archived` | Archived conversations |
+| `POST` | `/api/projects/:folder/stats` | Aggregate stats for a project |
+| `POST` | `/api/projects/:folder/names` | Bulk custom-title fetch |
+| `POST` | `/api/projects/:folder/refresh-cache` | Re-scan + flush sidecar |
+| `GET` | `/api/projects/:folder/conversations/:id` | Paginated messages |
+| `GET` | `/api/projects/:folder/conversations/:id/stats` | Stats for one conversation |
+| `DELETE` | `/api/projects/:folder/conversations/:id` | Delete (stats tombstoned) |
+| `POST` | `/api/projects/:folder/conversations/:id/archive` | Archive |
+| `POST` | `/api/projects/:folder/conversations/:id/unarchive` | Unarchive |
+| `POST` | `/api/projects/:folder/conversations/:id/duplicate` | Duplicate (rewrites IDs, writes sidecar) |
+| `DELETE` | `/api/projects/:folder/conversations/:id/messages/:uuid` | Delete one message |
+| `POST` | `/api/projects/:folder/conversations/:id/messages/:uuid/scrub` | Transform one message. Body: `{kind: "scrub"\|"normalize_whitespace"\|"remove_swears"\|"remove_filler"}` |
+| `POST` | `/api/projects/:folder/conversations/:id/extract` | New convo from selected UUIDs |
+| `POST` | `/api/projects/:folder/conversations/bulk-delete` | Bulk delete |
+| `POST` | `/api/projects/:folder/conversations/bulk-archive` | Bulk archive |
+| `POST` | `/api/projects/:folder/conversations/bulk-unarchive` | Bulk unarchive |
 | `DELETE` | `/api/projects/:folder` | Delete an entire project |
+| `GET` | `/api/word-lists` | Effective swears + filler lists |
+| `POST` | `/api/word-lists` | Persist user-curated lists |
+| `GET` | `/api/word-lists/defaults` | Shipped defaults |
 
-All mutation endpoints invalidate the sidecar cache for affected files and return `{"ok": true}` on success.
+All mutations invalidate the sidecar cache for affected files and return `{"ok": true}` on success.
 
 ### Adding features
 
-- New backend endpoints go in `llm_lens/__init__.py` following the existing pattern (route → filesystem op → cache invalidation → JSON response).
-- New frontend actions: add an entry to the `actions` map in `main.js`, implement the function in the relevant view file, and add a `data-action="..."` attribute to whatever HTML element triggers it.
-- Styles are all in `static/css/styles.css` using CSS custom properties for theming. Dark theme is the default; `.light` on `<body>` overrides the vars.
+- New backend endpoint: add a route in `__init__.py` following the pattern (route → fs op → cache invalidation → JSON).
+- New frontend action: register in the `actions` map in `main.js`, implement in the relevant view, tag the HTML element with `data-action="..."`.
 
 ---
 
 ## Extending to other providers
 
-Today `llm-lens-web` only supports Claude Code. The codebase is single-provider but structured so a second provider is straightforward to add. The Claude-specific surface area is small:
+Claude-specific surface is small:
 
-- `CLAUDE_PROJECTS_DIR` — where to look on disk
-- `_peek_jsonl_cached` / `_parse_messages_cached` — JSONL shape (`message.role`, content blocks `text`/`tool_use`/`tool_result`/`thinking`, `isSidechain`, `isMeta`, `file-history-snapshot`, `uuid`, `cwd`, `timestamp`)
-- Mutation endpoints — line-level JSONL ops for delete/duplicate/extract
+- `CLAUDE_PROJECTS_DIR` — discovery path
+- `_peek_jsonl_cached` / `_parse_messages_cached` — JSONL shape (`message.role`, content blocks, `isSidechain`, `isMeta`, `file-history-snapshot`, `uuid`, `cwd`, `timestamp`)
+- Mutation endpoints — line-level JSONL ops
 
-When adding a second provider, the recommended refactor is:
+When adding a second provider:
 
-1. Introduce a `Provider` protocol with methods like `discover_projects()`, `list_conversations(project)`, `read_messages(convo)`, `delete_conversation(convo)`.
-2. Move the existing Claude logic into `llm_lens/providers/claude_code.py` behind that interface.
+1. Define a `Provider` protocol with `discover_projects()`, `list_conversations()`, `read_messages()`, `delete_conversation()`, etc.
+2. Move current logic to `llm_lens/providers/claude_code.py` behind it.
 3. Add the new provider as a sibling module.
-4. Add a `:provider` segment to API routes (`/api/:provider/projects/...`) and a provider selector to the frontend.
-5. Declare per-provider dependencies as `[project.optional-dependencies]` extras in `pyproject.toml`, e.g. `pip install llm-lens-web[codex]`.
+4. Add `:provider` to API routes and a provider selector to the frontend.
+5. Declare per-provider deps as `[project.optional-dependencies]` extras.
 
-Don't pre-build this abstraction before the second provider exists — extract it from two working implementations rather than guessing.
+Don't pre-build the abstraction before there's a second implementation — extract from two working ones, not from guesses.

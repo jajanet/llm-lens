@@ -659,6 +659,56 @@ def test_normalize_whitespace_collapses_runs_and_blank_lines(client, tmp_path):
     assert text == "hello world\n\nnext paragraph"
 
 
+def test_normalize_whitespace_preserves_indented_code(client, tmp_path):
+    """Lines that start with a space/tab are left alone — collapsing them
+    would destroy Python/YAML/Makefile indentation. Only trailing WS is
+    stripped from indented lines."""
+    path = tmp_path / "proj" / "wi.jsonl"
+    body = "def foo():\n    if x:\n        return    42   \n"
+    write_jsonl(path, [msg("u1", None, body)])
+
+    client.post(
+        "/api/projects/proj/conversations/wi/messages/u1/scrub",
+        json={"kind": "normalize_whitespace"},
+    )
+    with open(path) as f:
+        text = json.loads(f.readline())["message"]["content"][0]["text"]
+    # Indentation preserved; trailing spaces on indented line stripped;
+    # internal "return    42" left as-is because the line is indented
+    # (we don't know if the multi-space is meaningful).
+    assert "    if x:" in text
+    assert "        return    42" in text
+    assert "        return    42   " not in text  # trailing stripped
+
+
+def test_normalize_whitespace_skips_fenced_code_blocks(client, tmp_path):
+    """Inside a triple-backtick fence, every character is left intact —
+    fences mark explicit code where any normalization is risky."""
+    path = tmp_path / "proj" / "wf.jsonl"
+    body = (
+        "see   below:\n"
+        "```python\n"
+        "x  =  1\n"
+        "if  x:    print('a    b')\n"
+        "```\n"
+        "and    after."
+    )
+    write_jsonl(path, [msg("u1", None, body)])
+
+    client.post(
+        "/api/projects/proj/conversations/wf/messages/u1/scrub",
+        json={"kind": "normalize_whitespace"},
+    )
+    with open(path) as f:
+        text = json.loads(f.readline())["message"]["content"][0]["text"]
+    # Prose lines collapsed
+    assert "see below:" in text
+    assert "and after." in text
+    # Fence contents byte-for-byte
+    assert "x  =  1" in text
+    assert "if  x:    print('a    b')" in text
+
+
 def test_transform_rejects_unknown_kind(client, tmp_path):
     path = tmp_path / "proj" / "w.jsonl"
     write_jsonl(path, [msg("u1", None, "hi")])
