@@ -238,6 +238,92 @@ body.edit-mode .chat-bubble .msg-actions-row .btn-del-msg { display: inline-flex
 }
 .word-lists-grid > div > .btn { margin-top: 6px; }
 
+.tool-badge-bash + .bash-cmd-preview {
+  display: inline-block; vertical-align: middle;
+  margin-left: 6px; padding: 1px 6px; border-radius: 4px;
+  background: var(--bg2); border: 1px solid var(--border);
+  font-size: 12px; max-width: 60ch; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.bash-cmd-full {
+  display: inline-block; margin-left: 4px; vertical-align: middle;
+}
+.bash-cmd-full > summary {
+  font-size: 11px; color: var(--text3); cursor: pointer;
+  list-style: none;
+}
+.bash-cmd-full > summary::-webkit-details-marker { display: none; }
+.bash-cmd-full[open] > summary { color: var(--text2); }
+.bash-cmd-full > pre {
+  margin: 4px 0; padding: 6px 8px; border-radius: 4px;
+  background: var(--bg2); border: 1px solid var(--border);
+  font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  max-width: 100%;
+}
+
+.secret-mask {
+  display: inline-block; padding: 0 4px; border-radius: 3px;
+  background: rgba(255, 180, 0, 0.18); border: 1px dashed rgba(255, 180, 0, 0.5);
+  color: var(--text2); font-size: 11px; cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+.secret-mask:hover { background: rgba(255, 180, 0, 0.32); }
+.stats-pct {
+  color: var(--text3); font-size: 11px; font-variant-numeric: tabular-nums;
+  margin-left: 4px;
+}
+
+.stats-table.stats-tools-3col .stats-c {
+  text-align: right; font-variant-numeric: tabular-nums;
+  white-space: nowrap; padding-left: 12px;
+}
+
+.stats-table tr.row-hidden { display: none; }
+.stats-table.rows-expanded tr.row-hidden { display: table-row; }
+.stats-table tr.show-more-row > td {
+  text-align: center; padding: 6px 8px;
+  border-top: 1px dashed var(--border);
+  background: color-mix(in srgb, var(--bg2) 60%, transparent);
+}
+.stats-table tr.show-more-row button {
+  background: transparent; border: 0; padding: 2px 8px;
+  color: var(--accent); cursor: pointer; font-size: 12px;
+  text-decoration: underline dotted;
+  font-family: inherit;
+}
+.stats-table tr.show-more-row button:hover {
+  text-decoration: underline;
+}
+
+.stats-tab-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 0 0 8px; border-bottom: 1px solid var(--border);
+}
+.stats-tab-bar .stats-view-toggle {
+  margin: 0; border: 1px solid var(--border); border-bottom: 0;
+  border-radius: 6px 6px 0 0; padding: 4px 10px;
+}
+.stats-tab-toggle {
+  display: flex; gap: 0;
+}
+.stats-tab-btn {
+  background: transparent; border: 0; padding: 8px 16px;
+  font-size: 13px; color: var(--text2); cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  font-family: inherit;
+}
+.stats-tab-btn:hover { color: var(--text); }
+.stats-tab-btn.active {
+  color: var(--accent); border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.secret-revealed {
+  background: rgba(255, 100, 100, 0.12);
+  border-bottom: 1px dotted rgba(255, 100, 100, 0.6);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
 .ws-dot, .ws-tab { color: var(--text3); opacity: 0.45; }
 .ws-tab { letter-spacing: 0.2em; }
 
@@ -251,9 +337,21 @@ body.edit-mode .chat-bubble .msg-actions-row .btn-del-msg { display: inline-flex
   position: fixed; top: 0; left: 0; right: 0; bottom: 0;
   background: var(--modal-bg); display: flex; align-items: center; justify-content: center; z-index: 100;
 }
-.modal { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 24px; max-width: 400px; width: 90%; }
-.modal:has(.stats-matrix) { max-width: 780px; }
-.modal:has(.stats-matrix) .modal-body { overflow-x: auto; }
+.modal {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+  padding: 24px; max-width: 400px; width: 90%; position: relative;
+  max-height: calc(100vh - 96px); display: flex; flex-direction: column;
+}
+.modal-close {
+  position: absolute; top: 12px; right: 12px; z-index: 1;
+  background: transparent; border: none; color: var(--text2);
+  font-size: 22px; line-height: 1; cursor: pointer; padding: 2px 6px;
+  border-radius: 4px;
+}
+.modal-close:hover { color: var(--heading); background: var(--bg3); }
+.modal:has(.stats-modal) { max-width: 780px; }
+.modal:has(.stats-modal) .modal-body { overflow-x: auto; }
+.modal:has(.stats-modal) .modal-actions { display: none; }
 .modal h3 { color: var(--red); margin-bottom: 12px; font-size: 16px; }
 .modal p { color: var(--text2); font-size: 13px; margin-bottom: 20px; }
 .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
@@ -334,7 +432,7 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
 }
 
 /* Stats modal (messages view). Uses existing .modal shell from modal.js. */
-.modal .modal-body { margin: 8px 0 14px; }
+.modal .modal-body { margin: 8px 0 14px; overflow-y: auto; min-height: 0; }
 .modal .stats-loading { color: var(--text3); font-style: italic; animation: lens-pulse 1.2s ease-in-out infinite; }
 .modal .stats-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .modal .stats-table td { padding: 4px 8px; border-bottom: 1px solid var(--border); }
@@ -405,19 +503,49 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
 
 .modal .stats-view-toggle {
   display: inline-flex; gap: 14px;
-  padding: 4px 10px; margin-bottom: 10px;
+  padding: 4px 10px;
   background: var(--bg2); border: 1px solid var(--border); border-radius: 6px;
   font-size: 12px; color: var(--text2);
 }
 .modal .stats-view-toggle label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
 .modal .stats-view-toggle input { margin: 0; }
 
-.modal .stats-table.stats-matrix { table-layout: auto; }
+.modal .stats-table.stats-matrix { width: 100%; }
+.modal .stats-table.stats-matrix code {
+  display: inline-block; max-width: 17ch;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  vertical-align: middle; cursor: pointer;
+  position: relative;
+}
+.modal .stats-table.stats-matrix code.expanded {
+  max-width: none; overflow: visible; white-space: normal; word-break: break-all;
+}
+.modal .stats-table .stats-note-row code {
+  max-width: none; overflow: visible; cursor: default; position: static;
+}
+.modal .stats-table.stats-matrix code[data-full]::after {
+  content: attr(data-full);
+  position: absolute; left: 0; top: 100%; z-index: 20;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 8px; font-size: 12px; color: var(--text);
+  white-space: nowrap; pointer-events: none;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  display: none;
+}
+.modal .stats-table.stats-matrix code[data-full]:hover::after {
+  display: block;
+}
+.modal .stats-table.stats-matrix code.expanded::after {
+  display: none;
+}
 .modal .stats-table.stats-matrix th,
 .modal .stats-table.stats-matrix td {
   padding: 4px 10px;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
+}
+.modal .stats-table.stats-matrix td.stats-note-row {
+  white-space: normal;
 }
 .modal .stats-table.stats-matrix th {
   text-align: right; font-weight: 600;
@@ -427,9 +555,9 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
   border-bottom: 1px solid var(--border);
 }
 .modal .stats-table.stats-matrix th.stats-k,
-.modal .stats-table.stats-matrix td.stats-k { text-align: left; width: auto; }
+.modal .stats-table.stats-matrix td.stats-k { text-align: left; width: 18ch; max-width: 18ch; }
 .modal .stats-table.stats-matrix td.stats-v {
-  text-align: right; width: auto;
+  text-align: right;
   color: var(--text); font-weight: normal;
 }
 .modal .stats-table.stats-matrix tr:last-child td { border-bottom: none; }
@@ -464,6 +592,25 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
   border-bottom: none !important; padding-top: 6px !important;
 }
 .modal sup { font-size: 9px; color: var(--text3); padding: 0 1px; }
+
+.stats-tip {
+  border-bottom: 1px dotted var(--text3);
+  cursor: help;
+  position: relative;
+}
+.stats-tip:hover .stats-tip-body { display: block; }
+.stats-tip-body {
+  display: none;
+  position: absolute; left: 0; top: calc(100% + 4px); z-index: 30;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 10px; font-size: 11px; color: var(--text);
+  white-space: normal; width: max-content; max-width: 260px;
+  line-height: 1.4; font-weight: normal; text-transform: none; letter-spacing: 0;
+  pointer-events: none;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.stats-tip-body p { margin: 0; }
+.stats-tip-body p + p { margin-top: 6px; color: var(--text2); }
 
 /* "+N" badge for model / branches overflow in the compact card strip. */
 .card .card-stats .stats-more {

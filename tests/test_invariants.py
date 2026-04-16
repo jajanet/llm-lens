@@ -903,6 +903,91 @@ def test_swear_strip_tidies_punctuation_and_double_spaces(client, tmp_path):
     assert " ." not in text
 
 
+def _bash_assistant(uuid, parent, command, tid="b1"):
+    return {
+        "uuid": uuid,
+        "parentUuid": parent,
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+                {"type": "tool_use", "id": tid, "name": "Bash",
+                 "input": {"command": command}},
+            ],
+            "usage": {"input_tokens": 0, "output_tokens": 0,
+                      "cache_read_input_tokens": 0,
+                      "cache_creation_input_tokens": 0},
+        },
+    }
+
+
+def test_extract_command_name_handles_wrappers_and_paths():
+    from llm_lens import _extract_command_name as ex
+    assert ex("grep foo bar") == "grep"
+    assert ex("sudo apt install foo") == "apt"
+    assert ex("env FOO=1 BAR=2 grep x") == "grep"
+    assert ex("/usr/bin/python3 script.py") == "python3"
+    # bash -c '...' recurses into the inner script
+    assert ex("bash -c 'ls -la | grep foo'") == "ls"
+    # pipelines: first command wins
+    assert ex("ls -la | wc -l") == "ls"
+    assert ex("") == ""
+    # Known limitation: `sudo -u user cmd` will mis-attribute to "user"
+    # because we don't know per-flag arg-arity. Documented, not fixed —
+    # the common `sudo cmd` form covers most cases.
+
+
+def test_stats_counts_bash_commands_by_name(client, tmp_path):
+    path = tmp_path / "proj" / "cmd.jsonl"
+    write_jsonl(path, [
+        msg("u1", None, "do stuff"),
+        _bash_assistant("a1", "u1", "grep foo file.txt", tid="b1"),
+        _bash_assistant("a2", "a1", "grep bar other.txt", tid="b2"),
+        _bash_assistant("a3", "a2", "sudo apt update", tid="b3"),
+        _bash_assistant("a4", "a3", "sed -i 's/x/y/' f", tid="b4"),
+    ])
+
+    s = client.get("/api/projects/proj/conversations/cmd/stats").get_json()
+    assert s["commands"] == {"grep": 2, "apt": 1, "sed": 1}
+
+
+def test_messages_endpoint_attaches_bash_commands_to_message(client, tmp_path):
+    path = tmp_path / "proj" / "cmd.jsonl"
+    write_jsonl(path, [
+        msg("u1", None, "search"),
+        _bash_assistant("a1", "u1", "grep -r foo .", tid="b1"),
+    ])
+
+    data = client.get("/api/projects/proj/conversations/cmd?limit=100").get_json()
+    a = next(m for m in data["main"] if m["uuid"] == "a1")
+    assert "[Tool: Bash:b1]" in a["content"]
+    assert a["commands"] == [{"id": "b1", "command": "grep -r foo ."}]
+
+
+def test_non_bash_tool_use_doesnt_attach_commands_field(client, tmp_path):
+    path = tmp_path / "proj" / "cmd.jsonl"
+    write_jsonl(path, [
+        msg("u1", None, "read"),
+        {
+            "uuid": "a1",
+            "parentUuid": "u1",
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "r1", "name": "Read",
+                     "input": {"path": "/etc/hosts"}},
+                ],
+            },
+        },
+    ])
+
+    data = client.get("/api/projects/proj/conversations/cmd?limit=100").get_json()
+    a = next(m for m in data["main"] if m["uuid"] == "a1")
+    assert "commands" not in a
+
+
 def test_cache_invalidated_after_delete_conversation(client, tmp_path):
     path = tmp_path / "proj" / "c.jsonl"
     write_jsonl(path, [msg("a", None, "alpha")])
@@ -1301,10 +1386,11 @@ def test_parser_renders_tool_use_and_tool_result_blocks(client, tmp_path):
     data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
     by_uuid = {m["uuid"]: m for m in data["main"]}
 
-    assert "[Tool: Read]" in by_uuid["a"]["content"]
+    # Marker now embeds the tool_use id so the frontend can correlate the
+    # badge with command data attached to the message.
+    assert "[Tool: Read:t1]" in by_uuid["a"]["content"]
     assert "calling tool" in by_uuid["a"]["content"]
     assert "[Tool Result]" in by_uuid["r"]["content"]
-    # role round-trip for both assistant and user paths
     assert by_uuid["a"]["role"] == "assistant"
     assert by_uuid["r"]["role"] == "user"
 

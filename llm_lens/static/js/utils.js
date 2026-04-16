@@ -103,6 +103,64 @@ function costByType(s, type) {
   return anyPriced ? total : null;
 }
 
+
+function _toolTurnUsd(tt, price) {
+  if (!tt || !price) return 0;
+  return (tt.input_tokens || 0) * price.input / 1_000_000
+       + (tt.output_tokens || 0) * price.output / 1_000_000
+       + (tt.cache_read_tokens || 0) * price.cache_read / 1_000_000
+       + (tt.cache_creation_tokens || 0) * price.cache_write / 1_000_000;
+}
+
+// USD cost summed across all turns that contained a `tool_use` of this name.
+// Note: a turn calling a tool N times still counts the turn cost once for
+// that tool — frontend divides by total calls to get an "avg per call"
+// approximation. Returns null when no priced model contributed.
+function costForTool(s, name) {
+  const pm = (s && s.per_model) || {};
+  let total = 0;
+  let any = false;
+  for (const [m, mstats] of Object.entries(pm)) {
+    const p = priceFor(m);
+    if (!p) continue;
+    const tt = (mstats.tool_turn_tokens || {})[name];
+    if (!tt) continue;
+    total += _toolTurnUsd(tt, p);
+    any = true;
+  }
+  // Fallback for legacy / single-model stats objects without per_model.
+  if (!any && s && s.models && s.models.length === 1) {
+    const p = priceFor(s.models[0]);
+    const tt = (s.tool_turn_tokens || {})[name];
+    if (p && tt) return _toolTurnUsd(tt, p);
+  }
+  return any ? total : null;
+}
+
+
+// Same idea as costForTool but bucketed by extracted Bash command name.
+// Uses per_model.command_turn_tokens; falls back to single-model attribution
+// for legacy stats objects.
+function costForCommand(s, name) {
+  const pm = (s && s.per_model) || {};
+  let total = 0;
+  let any = false;
+  for (const [m, mstats] of Object.entries(pm)) {
+    const p = priceFor(m);
+    if (!p) continue;
+    const tt = (mstats.command_turn_tokens || {})[name];
+    if (!tt) continue;
+    total += _toolTurnUsd(tt, p);
+    any = true;
+  }
+  if (!any && s && s.models && s.models.length === 1) {
+    const p = priceFor(s.models[0]);
+    const tt = (s.command_turn_tokens || {})[name];
+    if (p && tt) return _toolTurnUsd(tt, p);
+  }
+  return any ? total : null;
+}
+
 function totalCost(s) {
   let t = 0;
   let any = false;
@@ -645,9 +703,6 @@ function pickAxisLabels(keys, bucket, anchor, isCurrent) {
 export function renderStatsModalBody(s, opts) {
   if (!s) return '<div class="stats-dim">No data.</div>';
   opts = opts || {};
-  // Modal respects whatever the overview-bar toggles are currently set to.
-  // No inline toggle UI inside the modal — single source of truth lives in
-  // the overview bar.
   const f = opts.filters || { active: true, archived: false, deleted: false };
 
   const perModel = s.per_model || {};
@@ -668,11 +723,30 @@ export function renderStatsModalBody(s, opts) {
       <label><input type="radio" name="stats-view" value="by-model" data-action="set-stats-view"> By model</label>
     </div>` : "";
 
-  let html = `<div class="stats-modal">${viewToggleHtml}`;
-  html += `<div class="stats-view stats-view-combined">${renderStatsCombined(s, { ...opts, filters: f })}</div>`;
-  if (canSplit) {
-    html += `<div class="stats-view stats-view-by-model" hidden>${renderStatsByModel(s, { ...opts, filters: f }, modelList)}</div>`;
-  }
+  const tabBarHtml = `
+    <div class="stats-tab-bar">
+      <div class="stats-tab-toggle" role="tablist">
+        <button class="stats-tab-btn active" data-action="set-stats-tab" data-tab="activity">Activity</button>
+        <button class="stats-tab-btn" data-action="set-stats-tab" data-tab="cost">Cost</button>
+      </div>
+      ${viewToggleHtml}
+    </div>`;
+
+  const baseOpts = { ...opts, filters: f };
+  const combinedActivity = renderStatsCombined(s, { ...baseOpts, mode: "activity" });
+  const combinedCost     = renderStatsCombined(s, { ...baseOpts, mode: "cost" });
+  const byModelActivity  = canSplit ? renderStatsByModel(s, { ...baseOpts, mode: "activity" }, modelList) : "";
+  const byModelCost      = canSplit ? renderStatsByModel(s, { ...baseOpts, mode: "cost" }, modelList) : "";
+
+  let html = `<div class="stats-modal">${tabBarHtml}`;
+  html += `<div class="stats-tab stats-tab-activity">`;
+  html += `<div class="stats-view stats-view-combined">${combinedActivity}</div>`;
+  if (canSplit) html += `<div class="stats-view stats-view-by-model" hidden>${byModelActivity}</div>`;
+  html += `</div>`;
+  html += `<div class="stats-tab stats-tab-cost" hidden>`;
+  html += `<div class="stats-view stats-view-combined">${combinedCost}</div>`;
+  if (canSplit) html += `<div class="stats-view stats-view-by-model" hidden>${byModelCost}</div>`;
+  html += `</div>`;
   html += `</div>`;
   return html;
 }
@@ -683,13 +757,43 @@ function totalTokens(p) {
          (p.cache_read_tokens || 0) + (p.cache_creation_tokens || 0);
 }
 
+// Default visible row count for breakdown tables. Anything past this is
+// hidden behind a click-to-expand row at the bottom — keeps modals from
+// becoming a wall of text when a project has 40+ tools or commands.
+const ROW_LIMIT = 8;
+
+function _truncatedTable(opts) {
+  // opts: { rows: array of {html, key?}, total, colspan, extraClass?, header? }
+  // Each entry's html should already be a `<tr>...</tr>` string. If
+  // `entries.length > ROW_LIMIT`, hidden rows get a `row-hidden` class
+  // and a "show N more" footer row toggles a class on the wrapping
+  // table to reveal them.
+  const { rows, colspan, extraClass = "", header = "" } = opts;
+  const id = "tbl_" + Math.random().toString(36).slice(2, 8);
+  const visible = rows.slice(0, ROW_LIMIT).join("");
+  const overflow = rows.length - ROW_LIMIT;
+  let hidden = "";
+  let footer = "";
+  if (overflow > 0) {
+    // Inject row-hidden class into each overflow row's <tr>. Brittle but
+    // simple — the helper requires rows to start with literal "<tr".
+    hidden = rows.slice(ROW_LIMIT)
+      .map((r) => r.replace(/^<tr(\s|>)/, '<tr class="row-hidden"$1'))
+      .join("");
+    const moreLabel = `show ${overflow} more`;
+    footer = `<tr class="show-more-row"><td colspan="${colspan}">
+      <button data-action="toggle-table-rows" data-target="${id}" data-more-label="${moreLabel}">${moreLabel}</button>
+    </td></tr>`;
+  }
+  return `<table id="${id}" class="stats-table ${extraClass}">${header}${visible}${hidden}${footer}</table>`;
+}
+
 function renderStatsCombined(s, opts) {
   opts = opts || {};
+  const mode = opts.mode || "activity";  // "activity" | "cost"
   const f = opts.filters || { active: true, archived: false, deleted: false };
   const a = s.archived_delta || {};
   const d = s.deleted_delta  || {};
-  // Build an "effective" stats object that respects the three toggles for
-  // the aggregated tables. Archived/Deleted breakdowns below stay from raw.
   const sum = (k) => (f.active ? (s[k] || 0) : 0)
                    + (f.archived ? (a[k] || 0) : 0)
                    + (f.deleted  ? (d[k] || 0) : 0);
@@ -701,6 +805,13 @@ function renderStatsCombined(s, opts) {
     if (f.deleted) add(d.tool_uses);
     return out;
   };
+  const mergeCommands = () => {
+    const out = {};
+    const add = (obj) => { for (const [n, c] of Object.entries(obj || {})) out[n] = (out[n] || 0) + c; };
+    if (f.active) add(s.commands);
+    if (f.archived) add(a.commands);
+    return out;
+  };
   const eff = {
     input_tokens: sum("input_tokens"),
     output_tokens: sum("output_tokens"),
@@ -708,14 +819,22 @@ function renderStatsCombined(s, opts) {
     cache_creation_tokens: sum("cache_creation_tokens"),
     thinking_count: sum("thinking_count"),
     tool_uses: mergeToolUses(),
+    commands: mergeCommands(),
+  };
+
+  const pct = (n, total) => {
+    if (!total) return "—";
+    if (!n) return "0%";
+    const p = (n / total) * 100;
+    if (p < 1) return "<1%";
+    return `${p.toFixed(1)}%`;
   };
 
   const totalIn = eff.input_tokens + eff.cache_read_tokens + eff.cache_creation_tokens;
+  const tokenGrandTotal = totalIn + eff.output_tokens;
   const toolEntries = Object.entries(eff.tool_uses).sort((a, b) => b[1] - a[1]);
   const toolTotal = toolEntries.reduce((n, [, c]) => n + c, 0);
 
-  // Cost: computed on effective numbers using the same priceFor logic by
-  // hand-building a stat-shaped object that costByType can read.
   const costCarrier = { ...eff, models: s.models, per_model: s.per_model };
   const costIn  = costByType(costCarrier, "input_tokens");
   const costCR  = costByType(costCarrier, "cache_read_tokens");
@@ -725,15 +844,6 @@ function renderStatsCombined(s, opts) {
   const totalInCost = [costIn, costCR, costCW].reduce((a, v) => a + (v || 0), 0);
   const anyPriced = costTot != null;
 
-  const tokenRows3 = [
-    ["Context tokens (cumulative)", fmtTokens(totalIn), anyPriced ? fmtCost(totalInCost) : "—"],
-    ['<span class="stats-note">summed per turn — cache reads inflate this</span>', "", ""],
-    ["&nbsp;&nbsp;&nbsp;&nbsp;direct input", fmtTokens(eff.input_tokens), fmtCost(costIn)],
-    ["&nbsp;&nbsp;&nbsp;&nbsp;cache read", fmtTokens(eff.cache_read_tokens), fmtCost(costCR)],
-    ['&nbsp;&nbsp;&nbsp;&nbsp;cache write<sup>1</sup>', fmtTokens(eff.cache_creation_tokens), fmtCost(costCW)],
-    ["Output tokens", fmtTokens(eff.output_tokens), fmtCost(costOut)],
-  ];
-
   const branchLine = (() => {
     if (s.branches && s.branches.length) {
       return s.branches.map((b) => `<code>${esc(b)}</code>`).join(", ");
@@ -741,6 +851,115 @@ function renderStatsCombined(s, opts) {
     if (s.git_branch) return `<code>${esc(s.git_branch)}</code>`;
     return '<span class="stats-dim">none</span>';
   })();
+
+  const makeTable = (rows) => {
+    const trs = rows.map(([k, v]) =>
+      `<tr><td class="stats-k">${k}</td><td class="stats-v">${v}</td></tr>`
+    ).join("");
+    return `<table class="stats-table">${trs}</table>`;
+  };
+
+  // ===== Activity-mode token table (counts + pct, no $) =====
+  const fmtTokPct = (n) => `${fmtTokens(n)} <span class="stats-pct">(${pct(n, tokenGrandTotal)})</span>`;
+  const tokenRowsActivity = [
+    ["Context tokens (cumulative)", fmtTokPct(totalIn)],
+    ['<span class="stats-note">summed per turn — cache reads inflate this</span>', ""],
+    [`&nbsp;&nbsp;&nbsp;&nbsp;${_tip("direct input")}`, fmtTokPct(eff.input_tokens)],
+    [`&nbsp;&nbsp;&nbsp;&nbsp;${_tip("cache read")}`, fmtTokPct(eff.cache_read_tokens)],
+    [`&nbsp;&nbsp;&nbsp;&nbsp;${_tip("cache write")}<sup>1</sup>`, fmtTokPct(eff.cache_creation_tokens)],
+    [_tip("Output tokens"), fmtTokPct(eff.output_tokens)],
+  ];
+  const tokenActivityTable = `<table class="stats-table">
+    ${tokenRowsActivity.map(([k, v]) => `<tr><td class="stats-k">${k}</td><td class="stats-v">${v}</td></tr>`).join("")}
+    <tr><td colspan="2" class="stats-note stats-note-row"><sup>1</sup> ${esc(COST_ASSUMPTION_NOTE)}</td></tr>
+  </table>`;
+
+  // ===== Cost-mode token table (3-col with $) =====
+  const tokenRowsCost = [
+    ["Context tokens (cumulative)", fmtTokPct(totalIn), anyPriced ? fmtCost(totalInCost) : "—"],
+    ['<span class="stats-note">summed per turn — cache reads inflate this</span>', "", ""],
+    [`&nbsp;&nbsp;&nbsp;&nbsp;${_tip("direct input")}`, fmtTokPct(eff.input_tokens), fmtCost(costIn)],
+    [`&nbsp;&nbsp;&nbsp;&nbsp;${_tip("cache read")}`, fmtTokPct(eff.cache_read_tokens), fmtCost(costCR)],
+    [`&nbsp;&nbsp;&nbsp;&nbsp;${_tip("cache write")}<sup>1</sup>`, fmtTokPct(eff.cache_creation_tokens), fmtCost(costCW)],
+    [_tip("Output tokens"), fmtTokPct(eff.output_tokens), fmtCost(costOut)],
+  ];
+  const tokenCostTable = (() => {
+    const trs = tokenRowsCost.map(([k, v, c]) =>
+      `<tr><td class="stats-k">${k}</td><td class="stats-v">${v}</td><td class="stats-c">${c}</td></tr>`
+    ).join("");
+    const totalTr = anyPriced
+      ? `<tr class="stats-total"><td class="stats-k">Total cost<sup>2</sup></td><td class="stats-v"></td><td class="stats-c">${fmtCost(costTot)}</td></tr>`
+      : "";
+    const note = `<tr><td colspan="3" class="stats-note stats-note-row">
+      <sup>1</sup> ${esc(COST_ASSUMPTION_NOTE)}<br>
+      <sup>2</sup> ${esc(PRICING_SOURCE_NOTE)}
+    </td></tr>`;
+    return `<table class="stats-table stats-tokens-3col">${trs}${totalTr}${note}</table>`;
+  })();
+
+  // ===== Activity tool/command tables (counts only, with row truncation) =====
+  const breakdownTable = (entries, total, extraClass = "") => {
+    if (!entries.length) return "";
+    const rows = entries.map(([name, c]) =>
+      `<tr><td class="stats-k"><code>${esc(name)}</code></td><td class="stats-v">${c} <span class="stats-pct">(${pct(c, total)})</span></td></tr>`
+    );
+    const id = "tbl_" + Math.random().toString(36).slice(2, 8);
+    const visible = rows.slice(0, ROW_LIMIT).join("");
+    const overflow = rows.length - ROW_LIMIT;
+    const hidden = overflow > 0
+      ? rows.slice(ROW_LIMIT).map((r) => r.replace(/^<tr(\s|>)/, '<tr class="row-hidden"$1')).join("")
+      : "";
+    const moreLabel = `show ${overflow} more`;
+    const moreRow = overflow > 0
+      ? `<tr class="show-more-row"><td colspan="2"><button data-action="toggle-table-rows" data-target="${id}" data-more-label="${moreLabel}">${moreLabel}</button></td></tr>`
+      : "";
+    return `<table id="${id}" class="stats-table ${extraClass}">${visible}${hidden}${moreRow}
+      <tr class="stats-total"><td class="stats-k">total</td><td class="stats-v">${total}</td></tr>
+    </table>`;
+  };
+
+  // ===== Cost tool/command tables (3-col: name | total cost | avg cost / call) =====
+  const costPerCallTable = (entries, total, costLookup, headLabel, footnoteSup) => {
+    if (!entries.length) return "";
+    let totalCost = 0;
+    let anyCost = false;
+    const rows = entries.map(([name, c]) => {
+      const turnCost = costLookup(s, name);
+      const avg = (turnCost == null || c === 0) ? null : turnCost / c;
+      if (turnCost != null) {
+        totalCost += turnCost;
+        anyCost = true;
+      }
+      return `<tr>
+        <td class="stats-k"><code>${esc(name)}</code></td>
+        <td class="stats-c">${turnCost == null ? "—" : fmtCost(turnCost)}</td>
+        <td class="stats-c">${avg == null ? "—" : fmtCost(avg)}</td>
+      </tr>`;
+    });
+    const id = "tbl_" + Math.random().toString(36).slice(2, 8);
+    const visible = rows.slice(0, ROW_LIMIT).join("");
+    const overflow = rows.length - ROW_LIMIT;
+    const hidden = overflow > 0
+      ? rows.slice(ROW_LIMIT).map((r) => r.replace(/^<tr(\s|>)/, '<tr class="row-hidden"$1')).join("")
+      : "";
+    const moreLabel = `show ${overflow} more`;
+    const moreRow = overflow > 0
+      ? `<tr class="show-more-row"><td colspan="3"><button data-action="toggle-table-rows" data-target="${id}" data-more-label="${moreLabel}">${moreLabel}</button></td></tr>`
+      : "";
+    const totalRow = `<tr class="stats-total">
+      <td class="stats-k">total (${total} calls)</td>
+      <td class="stats-c">${anyCost ? fmtCost(totalCost) : ""}</td>
+      <td class="stats-c"></td>
+    </tr>`;
+    return `<table id="${id}" class="stats-table stats-tools-3col">
+      <tr>
+        <th class="stats-k">${esc(headLabel)}</th>
+        <th class="stats-c">total cost<sup>${footnoteSup}</sup></th>
+        <th class="stats-c">avg cost / call</th>
+      </tr>
+      ${visible}${hidden}${moreRow}${totalRow}
+    </table>`;
+  };
 
   const sessionRows = [];
   if (opts.convoCount != null) sessionRows.push(["Conversations", String(opts.convoCount)]);
@@ -754,82 +973,98 @@ function renderStatsCombined(s, opts) {
       : '<span class="stats-dim">none</span>'],
   );
 
-  const makeTable = (rows) => {
-    const trs = rows.map(([k, v]) =>
-      `<tr><td class="stats-k">${k}</td><td class="stats-v">${v}</td></tr>`
-    ).join("");
-    return `<table class="stats-table">${trs}</table>`;
-  };
-  const makeTable3 = (rows) => {
-    const trs = rows.map(([k, v, c]) =>
-      `<tr><td class="stats-k">${k}</td><td class="stats-v">${v}</td><td class="stats-c">${c}</td></tr>`
-    ).join("");
-    const totalTr = anyPriced
-      ? `<tr class="stats-total"><td class="stats-k">Total cost<sup>2</sup></td><td class="stats-v"></td><td class="stats-c">${fmtCost(costTot)}</td></tr>`
-      : "";
-    const note = `<tr><td colspan="3" class="stats-note stats-note-row">
-      <sup>1</sup> ${esc(COST_ASSUMPTION_NOTE)}<br>
-      <sup>2</sup> ${esc(PRICING_SOURCE_NOTE)}
-    </td></tr>`;
-    return `<table class="stats-table stats-tokens-3col">${trs}${totalTr}${note}</table>`;
-  };
-
   const deltaSection = (delta, label, cls) => {
     if (!delta) return "";
     const tEntries = Object.entries(delta.tool_uses || {}).sort((a, b) => b[1] - a[1]);
     const tTotal = tEntries.reduce((n, [, c]) => n + c, 0);
     const inTok = (delta.input_tokens || 0) + (delta.cache_read_tokens || 0) + (delta.cache_creation_tokens || 0);
-    const hasContent = tTotal || inTok || (delta.output_tokens || 0) || (delta.messages_deleted || 0);
+    const outTok = delta.output_tokens || 0;
+    const grandTok = inTok + outTok;
+    const hasContent = tTotal || inTok || outTok || (delta.messages_deleted || 0);
     if (!hasContent) return "";
+    const pctTok = (n) => `${fmtTokens(n)} <span class="stats-pct">(${pct(n, grandTok)})</span>`;
     const rows = [];
     if (delta.messages_deleted) rows.push(["Messages deleted", String(delta.messages_deleted)]);
     rows.push(
-      ["Input tokens (cumulative)", fmtTokens(inTok)],
-      ["Output tokens", fmtTokens(delta.output_tokens || 0)],
+      ["Input tokens (cumulative)", pctTok(inTok)],
+      ["Output tokens", pctTok(outTok)],
       ["Tool-use blocks", String(tTotal)],
       ["Thinking blocks", String(delta.thinking_count || 0)],
     );
     let body = makeTable(rows);
-    if (tEntries.length) {
-      const trs = tEntries.map(([name, c]) =>
-        `<tr><td class="stats-k"><code>${esc(name)}</code></td><td class="stats-v">${c}</td></tr>`
-      ).join("");
-      body += `<table class="stats-table stats-deleted-tools">${trs}</table>`;
-    }
+    if (tEntries.length) body += breakdownTable(tEntries, tTotal, "stats-deleted-tools");
     return `<details class="stats-section ${cls}"><summary>${label}</summary>${body}</details>`;
   };
 
   let html = "";
-  html += `<details class="stats-section" open><summary>Tokens</summary>${makeTable3(tokenRows3)}</details>`;
-
-  if (toolEntries.length) {
-    const toolRows = toolEntries.map(([name, c]) =>
-      `<tr><td class="stats-k"><code>${esc(name)}</code></td><td class="stats-v">${c}</td></tr>`
-    ).join("");
-    html += `<details class="stats-section" open><summary>Tool-use breakdown (${toolTotal})</summary>
-      <table class="stats-table">${toolRows}
-        <tr class="stats-total"><td class="stats-k">total</td><td class="stats-v">${toolTotal}</td></tr>
-      </table></details>`;
+  if (mode === "activity") {
+    html += `<details class="stats-section" open><summary>Tokens</summary>${tokenActivityTable}</details>`;
+    if (toolEntries.length) {
+      html += `<details class="stats-section" open><summary>Tool-use breakdown (${toolTotal})</summary>
+        ${breakdownTable(toolEntries, toolTotal)}</details>`;
+    }
+    const cmdEntries = Object.entries(eff.commands).sort((a, b) => b[1] - a[1]);
+    if (cmdEntries.length) {
+      const cmdTotal = cmdEntries.reduce((n, [, c]) => n + c, 0);
+      const note = `<p class="stats-note" style="margin:4px 0 8px">
+        Per-command name from Bash tool_use calls. Wrappers
+        (<code>sudo</code>, <code>env X=1</code>, <code>bash -c</code>) are
+        stripped; pipelines count the first command.
+      </p>`;
+      html += `<details class="stats-section"><summary>Bash commands (${cmdTotal})</summary>
+        ${note}
+        ${breakdownTable(cmdEntries, cmdTotal)}</details>`;
+    }
+    html += `<details class="stats-section" open><summary>Session info</summary>${makeTable(sessionRows)}</details>`;
+    html += deltaSection(s.archived_delta, "Archived content", "stats-section-archived");
+    html += deltaSection(s.deleted_delta,  "Deleted content",  "stats-section-deleted");
+  } else {
+    // Cost mode
+    html += `<details class="stats-section" open><summary>Tokens</summary>${tokenCostTable}</details>`;
+    if (toolEntries.length) {
+      const footnote = `<p class="stats-note" style="margin:4px 0 8px">
+        <sup>3</sup> Naive even-split attribution: each tool_use block in a
+        turn gets <code>turn_cost / num_blocks_in_turn</code>. Total cost
+        column = sum of those shares for this tool. Avg per call = total /
+        call count. Bottom-row total = sum across tools = cost of every
+        turn that involved a tool (pure-prose turns aren't counted here).
+      </p>`;
+      html += `<details class="stats-section" open><summary>Cost per tool (${toolTotal} calls)</summary>
+        ${footnote}
+        ${costPerCallTable(toolEntries, toolTotal, costForTool, "Tool", 3)}
+      </details>`;
+    }
+    const cmdEntries = Object.entries(eff.commands).sort((a, b) => b[1] - a[1]);
+    if (cmdEntries.length) {
+      const cmdTotal = cmdEntries.reduce((n, [, c]) => n + c, 0);
+      const note = `<p class="stats-note" style="margin:4px 0 8px">
+        Per-command from Bash tool_use blocks.<br>
+        <sup>3</sup> Same naive even-split as tool cost, refined to the
+        command level. Bottom-row total should match Bash's <em>total
+        cost</em> in the Cost-per-tool table when every command is recognized.
+      </p>`;
+      html += `<details class="stats-section"><summary>Cost per Bash command (${cmdTotal} calls)</summary>
+        ${note}
+        ${costPerCallTable(cmdEntries, cmdTotal, costForCommand, "Command", 3)}
+      </details>`;
+    }
   }
-
-  html += `<details class="stats-section" open><summary>Session info</summary>${makeTable(sessionRows)}</details>`;
-  // Always-visible breakdowns (content-driven). These don't depend on the
-  // toggle flags — they're the raw archived/deleted numbers for reference.
-  html += deltaSection(s.archived_delta, "Archived content", "stats-section-archived");
-  html += deltaSection(s.deleted_delta,  "Deleted content",  "stats-section-deleted");
   return html;
 }
 
 function renderStatsByModel(s, opts, modelList) {
+  opts = opts || {};
+  const mode = opts.mode || "activity";  // "activity" | "cost"
   const pm = s.per_model || {};
-  // Tokens matrix: rows = models, cols = [direct in, cache read, cache write, output, total].
+
+  // Tokens-by-model matrix (counts only).
   const tokHead = `<tr>
       <th class="stats-k">Model</th>
-      <th class="stats-v">direct in</th>
-      <th class="stats-v">cache read</th>
-      <th class="stats-v">cache write</th>
-      <th class="stats-v">output</th>
-      <th class="stats-v">total</th>
+      <th class="stats-v">${_tip("direct in")}</th>
+      <th class="stats-v">${_tip("cache read")}</th>
+      <th class="stats-v">${_tip("cache write")}</th>
+      <th class="stats-v">${_tip("output")}</th>
+      <th class="stats-v">${_tip("total")}</th>
     </tr>`;
   const tokRows = modelList.map((m) => {
     const p = pm[m] || {};
@@ -848,16 +1083,15 @@ function renderStatsByModel(s, opts, modelList) {
     </tr>`;
   }).join("");
 
-  // Cost matrix: rows = models, cols = [input, cache read, cache write*, output, total].
-  // Asterisk on cache-write header ties to the 5-min TTL assumption footnote.
+  // Cost-by-model matrix.
   const anyUnpriced = modelList.some((m) => !priceFor(m));
   const costHead = `<tr>
       <th class="stats-k">Model</th>
-      <th class="stats-v">input</th>
-      <th class="stats-v">cache read</th>
-      <th class="stats-v">cache write<sup>1</sup></th>
-      <th class="stats-v">output</th>
-      <th class="stats-v">total</th>
+      <th class="stats-v">${_tip("input")}</th>
+      <th class="stats-v">${_tip("cache read")}</th>
+      <th class="stats-v">${_tip("cache write")}<sup>1</sup></th>
+      <th class="stats-v">${_tip("output")}</th>
+      <th class="stats-v">${_tip("total")}</th>
     </tr>`;
   let costTotalSum = 0;
   let costAny = false;
@@ -866,7 +1100,7 @@ function renderStatsByModel(s, opts, modelList) {
     const stats = pm[m] || {};
     if (!p) {
       return `<tr>
-        <td class="stats-k"><code>${esc(shortModel(m))}</code><sup>3</sup></td>
+        <td class="stats-k"><code>${esc(shortModel(m))}</code><sup>4</sup></td>
         <td class="stats-v" colspan="5"><span class="stats-dim">no published price</span></td>
       </tr>`;
     }
@@ -894,10 +1128,9 @@ function renderStatsByModel(s, opts, modelList) {
   const costFootnotes = `<tr><td colspan="6" class="stats-note stats-note-row">
       <sup>1</sup> ${esc(COST_ASSUMPTION_NOTE)}<br>
       <sup>2</sup> ${esc(PRICING_SOURCE_NOTE)}
-      ${anyUnpriced ? '<br><sup>3</sup> no published price — excluded from total.' : ""}
+      ${anyUnpriced ? '<br><sup>4</sup> no published price — excluded from total.' : ""}
     </td></tr>`;
 
-  // Tool matrix: rows = tool names (union), cols = each model + total.
   const toolNames = new Set();
   for (const m of modelList) {
     for (const name of Object.keys((pm[m] || {}).tool_uses || {})) toolNames.add(name);
@@ -907,38 +1140,153 @@ function renderStatsByModel(s, opts, modelList) {
     const total = perM.reduce((a, b) => a + b, 0);
     return { name, perM, total };
   }).sort((a, b) => b.total - a.total);
+  const grandToolTotal = toolCounts.reduce((a, t) => a + t.total, 0);
+  const pct = (n, t) => (t > 0 ? `${(n * 100 / t).toFixed(1)}%` : "");
 
-  let html = "";
-  html += `<details class="stats-section" open><summary>Tokens by model</summary>
-    <table class="stats-table stats-matrix">${tokHead}${tokRows}</table></details>`;
-
-  html += `<details class="stats-section" open><summary>Cost by model</summary>
-    <table class="stats-table stats-matrix">${costHead}${costRows}${costTotalRow}${costFootnotes}</table></details>`;
-
-  if (toolCounts.length) {
-    const toolHead = `<tr>
-        <th class="stats-k">Tool</th>
+  const matrixSection = (sectionLabel, items, totalGrand, opts2 = {}) => {
+    if (!items.length) return "";
+    const colspan = modelList.length + 3;
+    const head = `<tr>
+        <th class="stats-k">${esc(opts2.headLabel || "Item")}</th>
         ${modelList.map((m) => `<th class="stats-v"><code>${esc(shortModel(m))}</code></th>`).join("")}
         <th class="stats-v">total</th>
+        <th class="stats-pct">% of total</th>
       </tr>`;
-    const toolRows = toolCounts.map(({ name, perM, total }) => `<tr>
+    const rows = items.map(({ name, perM, total }) => `<tr>
         <td class="stats-k"><code>${esc(name)}</code></td>
         ${perM.map((c) => `<td class="stats-v">${c || ""}</td>`).join("")}
         <td class="stats-v stats-total-col">${total}</td>
-      </tr>`).join("");
+        <td class="stats-pct">${pct(total, totalGrand)}</td>
+      </tr>`);
+    const totals = modelList.map((m) =>
+      items.reduce((acc, it, idx) => acc + (it.perM[idx] || 0), 0)
+    );
     const totalRow = `<tr class="stats-total">
         <td class="stats-k">total</td>
-        ${modelList.map((m) => {
-          const t = Object.values((pm[m] || {}).tool_uses || {}).reduce((a, b) => a + b, 0);
-          return `<td class="stats-v">${t || ""}</td>`;
-        }).join("")}
-        <td class="stats-v stats-total-col">${toolCounts.reduce((a, t) => a + t.total, 0)}</td>
+        ${totals.map((t) => `<td class="stats-v">${t || ""}</td>`).join("")}
+        <td class="stats-v stats-total-col">${totalGrand}</td>
+        <td class="stats-pct">${totalGrand > 0 ? "100.0%" : ""}</td>
       </tr>`;
-    html += `<details class="stats-section" open><summary>Tool-use by model</summary>
-      <table class="stats-table stats-matrix">${toolHead}${toolRows}${totalRow}</table></details>`;
-  }
+    const id = "tbl_" + Math.random().toString(36).slice(2, 8);
+    const visible = rows.slice(0, ROW_LIMIT).join("");
+    const overflow = rows.length - ROW_LIMIT;
+    const hidden = overflow > 0
+      ? rows.slice(ROW_LIMIT).map((r) => r.replace(/^<tr(\s|>)/, '<tr class="row-hidden"$1')).join("")
+      : "";
+    const moreLabel = `show ${overflow} more`;
+    const moreRow = overflow > 0
+      ? `<tr class="show-more-row"><td colspan="${colspan}"><button data-action="toggle-table-rows" data-target="${id}" data-more-label="${moreLabel}">${moreLabel}</button></td></tr>`
+      : "";
+    return `<details class="stats-section" open><summary>${sectionLabel}</summary>
+      <table id="${id}" class="stats-table stats-matrix">${head}${visible}${hidden}${moreRow}${totalRow}</table></details>`;
+  };
 
-  // Session info: same as combined (not per-model).
+  const cmdNames = new Set();
+  for (const m of modelList) {
+    for (const name of Object.keys((pm[m] || {}).commands || {})) cmdNames.add(name);
+  }
+  const cmdItems = [...cmdNames].map((name) => {
+    const perM = modelList.map((m) => ((pm[m] || {}).commands || {})[name] || 0);
+    const total = perM.reduce((a, b) => a + b, 0);
+    return { name, perM, total };
+  }).sort((a, b) => b.total - a.total);
+  const grandCmdTotal = cmdItems.reduce((a, t) => a + t.total, 0);
+
+  const thinkPerM = modelList.map((m) => (pm[m] || {}).thinking_count || 0);
+  const grandThink = thinkPerM.reduce((a, b) => a + b, 0);
+  const thinkItems = grandThink ? [{ name: "thinking blocks", perM: thinkPerM, total: grandThink }] : [];
+
+  const costMatrixSection = (sectionLabel, items, tokensFor, costMode) => {
+    if (!items.entries.length) return "";
+    const colspan = modelList.length + 2;
+    const head = `<tr>
+        <th class="stats-k">${esc(items.headLabel || "Name")}</th>
+        ${modelList.map((m) => `<th class="stats-v"><code>${esc(shortModel(m))}</code></th>`).join("")}
+        <th class="stats-v">overall</th>
+      </tr>`;
+    const perModelTotalUsd = modelList.map(() => 0);
+    const perModelTotalCalls = modelList.map(() => 0);
+    const perModelHasPriced = modelList.map(() => false);
+    const rows = items.entries.map(({ name, perM }) => {
+      let rowUsd = 0;
+      let rowCalls = 0;
+      let rowAnyPriced = false;
+      const cells = modelList.map((m, idx) => {
+        const calls = perM[idx] || 0;
+        if (!calls) return `<td class="stats-v stats-dim">—</td>`;
+        const p = priceFor(m);
+        const tt = tokensFor(m, name);
+        if (!p || !tt) return `<td class="stats-v stats-dim">—</td>`;
+        const usd = _toolTurnUsd(tt, p);
+        perModelTotalUsd[idx] += usd;
+        perModelTotalCalls[idx] += calls;
+        perModelHasPriced[idx] = true;
+        rowUsd += usd;
+        rowCalls += calls;
+        rowAnyPriced = true;
+        const cellVal = costMode === "total" ? usd : usd / calls;
+        return `<td class="stats-v">${fmtCost(cellVal)}</td>`;
+      }).join("");
+      const overallVal = !rowAnyPriced || rowCalls === 0
+        ? `<span class="stats-dim">—</span>`
+        : (costMode === "total" ? fmtCost(rowUsd) : fmtCost(rowUsd / rowCalls));
+      return `<tr>
+        <td class="stats-k"><code>${esc(name)}</code></td>
+        ${cells}
+        <td class="stats-v stats-total-col">${overallVal}</td>
+      </tr>`;
+    });
+    let totalRow = "";
+    if (costMode === "total") {
+      const cells = perModelHasPriced.map((hp, idx) =>
+        `<td class="stats-v">${hp ? fmtCost(perModelTotalUsd[idx]) : ""}</td>`
+      ).join("");
+      const grandUsd = perModelTotalUsd.reduce((a, b) => a + b, 0);
+      const grandHas = perModelHasPriced.some(Boolean);
+      totalRow = `<tr class="stats-total">
+        <td class="stats-k">total</td>
+        ${cells}
+        <td class="stats-v stats-total-col">${grandHas ? fmtCost(grandUsd) : ""}</td>
+      </tr>`;
+    } else {
+      const cells = perModelHasPriced.map((hp, idx) =>
+        `<td class="stats-v">${hp && perModelTotalCalls[idx] ? fmtCost(perModelTotalUsd[idx] / perModelTotalCalls[idx]) : ""}</td>`
+      ).join("");
+      const grandUsd = perModelTotalUsd.reduce((a, b) => a + b, 0);
+      const grandCalls = perModelTotalCalls.reduce((a, b) => a + b, 0);
+      const grandOverall = grandCalls ? fmtCost(grandUsd / grandCalls) : "";
+      totalRow = `<tr class="stats-total">
+        <td class="stats-k">overall avg</td>
+        ${cells}
+        <td class="stats-v stats-total-col">${grandOverall}</td>
+      </tr>`;
+    }
+    const foot = `<tr><td colspan="${colspan}" class="stats-note stats-note-row">
+      <sup>3</sup> Naive even-split: each tool_use block in a turn gets
+      <code>turn_cost / num_blocks_in_turn</code>. Cells priced via that
+      cell's model. Avg per call = priced share / call count;
+      total = sum of priced shares.
+    </td></tr>`;
+    const id = "tbl_" + Math.random().toString(36).slice(2, 8);
+    const visible = rows.slice(0, ROW_LIMIT).join("");
+    const overflow = rows.length - ROW_LIMIT;
+    const hidden = overflow > 0
+      ? rows.slice(ROW_LIMIT).map((r) => r.replace(/^<tr(\s|>)/, '<tr class="row-hidden"$1')).join("")
+      : "";
+    const moreLabel = `show ${overflow} more`;
+    const moreRow = overflow > 0
+      ? `<tr class="show-more-row"><td colspan="${colspan}"><button data-action="toggle-table-rows" data-target="${id}" data-more-label="${moreLabel}">${moreLabel}</button></td></tr>`
+      : "";
+    return `<details class="stats-section" open><summary>${sectionLabel}</summary>
+      <table id="${id}" class="stats-table stats-matrix">${head}${visible}${hidden}${moreRow}${totalRow}${foot}</table>
+    </details>`;
+  };
+
+  const toolTokensFor = (m, name) => ((pm[m] || {}).tool_turn_tokens || {})[name];
+  const cmdTokensFor  = (m, name) => ((pm[m] || {}).command_turn_tokens || {})[name];
+  const toolBundle = { headLabel: "Tool",    entries: toolCounts };
+  const cmdBundle  = { headLabel: "Command", entries: cmdItems };
+
   const branchLine = (() => {
     if (s.branches && s.branches.length) return s.branches.map((b) => `<code>${esc(b)}</code>`).join(", ");
     if (s.git_branch) return `<code>${esc(s.git_branch)}</code>`;
@@ -947,15 +1295,51 @@ function renderStatsByModel(s, opts, modelList) {
   const sessionRows = [];
   if (opts.convoCount != null) sessionRows.push(["Conversations", String(opts.convoCount)]);
   sessionRows.push(
-    ["Thinking blocks", String(s.thinking_count || 0)],
     [s.branches ? "Git branches seen" : "Git branch", branchLine],
   );
-  const trs = sessionRows.map(([k, v]) =>
+  const sessionTrs = sessionRows.map(([k, v]) =>
     `<tr><td class="stats-k">${k}</td><td class="stats-v">${v}</td></tr>`
   ).join("");
-  html += `<details class="stats-section" open><summary>Session info</summary>
-    <table class="stats-table">${trs}</table></details>`;
+
+  let html = "";
+  if (mode === "activity") {
+    html += `<details class="stats-section" open><summary>Tokens by model</summary>
+      <table class="stats-table stats-matrix">${tokHead}${tokRows}</table></details>`;
+    html += matrixSection(`Tool-use by model (${grandToolTotal})`, toolCounts, grandToolTotal, { headLabel: "Tool" });
+    html += matrixSection(`Bash commands by model (${grandCmdTotal})`, cmdItems, grandCmdTotal, { headLabel: "Command" });
+    html += matrixSection("Thinking blocks by model", thinkItems, grandThink, { headLabel: "" });
+    html += `<details class="stats-section" open><summary>Session info</summary>
+      <table class="stats-table">${sessionTrs}</table></details>`;
+  } else {
+    html += `<details class="stats-section" open><summary>Tokens</summary>
+      <table class="stats-table stats-matrix">${costHead}${costRows}${costTotalRow}${costFootnotes}</table></details>`;
+    html += costMatrixSection(`Cost per tool by model (${grandToolTotal} calls)<sup>3</sup>`, toolBundle, toolTokensFor, "total");
+    html += costMatrixSection(`Avg cost per tool call by model<sup>3</sup>`, toolBundle, toolTokensFor, "avg");
+    if (cmdItems.length) {
+      html += costMatrixSection(`Cost per Bash command by model (${grandCmdTotal} calls)<sup>3</sup>`, cmdBundle, cmdTokensFor, "total");
+      html += costMatrixSection(`Avg cost per Bash command call by model<sup>3</sup>`, cmdBundle, cmdTokensFor, "avg");
+    }
+  }
   return html;
+}
+
+
+const TOKEN_TIPS = {
+  "direct input":  "Fresh tokens not in cache.\nTo reduce: use shorter prompts, cacheable system instructions.",
+  "direct in":     "Fresh tokens not in cache.\nTo reduce: use shorter prompts, cacheable system instructions.",
+  "input":         "Fresh tokens not in cache.\nTo reduce: use shorter prompts, cacheable system instructions.",
+  "cache read":    "Cached context re-sent every turn — cheap per token but volume adds up fast.\nTo reduce: use new conversations instead of extending long ones, use /compact, delete old messages.",
+  "cache write":   "Tokens written into cache when context changes (~25% surcharge).\nTo reduce: keep system prompts and CLAUDE.md stable, avoid frequent tool config changes, use /compact.",
+  "output":        "Tokens generated by Claude.\nTo reduce: ask for concise answers, lower max_tokens.",
+  "output tokens": "Tokens generated by Claude.\nTo reduce: ask for concise answers, lower max_tokens.",
+  "total":         "Sum of all token types.",
+};
+function _tip(label) {
+  const key = label.replace(/<[^>]*>/g, "").trim().toLowerCase();
+  const tip = TOKEN_TIPS[key];
+  if (!tip) return label;
+  const paragraphs = tip.split("\n").map((p) => `<p>${esc(p)}</p>`).join("");
+  return `<span class="stats-tip">${label}<span class="stats-tip-body">${paragraphs}</span></span>`;
 }
 
 export function esc(s) {

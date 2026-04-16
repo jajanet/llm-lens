@@ -150,22 +150,89 @@ def _custom_title(filepath: Path, stat: os.stat_result):
 # I/O cost once per file rev.
 _STATS_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens",
                "cache_creation_tokens", "models", "tool_uses",
-               "thinking_count", "git_branch", "per_model")
+               "thinking_count", "git_branch", "per_model", "commands",
+               "tool_turn_tokens", "command_turn_tokens")
+
+
+# Tokens that wrap another command and shouldn't be counted themselves
+# (`sudo grep foo` → "grep", not "sudo"). Env assignments (`FOO=1 grep x`)
+# are also skipped by detecting `=` in a leading token.
+_CMD_WRAPPERS = {"sudo", "bash", "sh", "nohup", "time", "exec", "env",
+                 "xargs", "doas", "command"}
+
+import shlex as _shlex
+
+def _extract_command_name(cmd: str) -> str:
+    """Best-effort extract the invoked command name from a shell string.
+
+    - `sudo apt install foo` → `apt`
+    - `env FOO=1 grep x` → `grep`
+    - `bash -c "ls -la | wc"` → `ls` (recurses into the script)
+    - `/usr/bin/python3 ...` → `python3`
+    - pipes/chains: returns the first command (`ls -la | grep foo` → `ls`).
+
+    Returns "" when we can't figure it out.
+    """
+    if not cmd:
+        return ""
+    cmd = cmd.strip()
+    try:
+        tokens = _shlex.split(cmd)
+    except ValueError:
+        tokens = cmd.split()
+    if not tokens:
+        return ""
+    # Recurse into the inner script for `bash -c 'script'` / `sh -c '...'`.
+    if len(tokens) >= 3 and tokens[0] in ("bash", "sh") and tokens[1] == "-c":
+        inner = _extract_command_name(tokens[2])
+        if inner:
+            return inner
+    # Walk past env assignments, wrappers, and flags until we hit the real command.
+    for tok in tokens:
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+            continue  # VAR=value prefix
+        if tok in _CMD_WRAPPERS:
+            continue
+        if tok.startswith("-"):
+            continue
+        return tok.rsplit("/", 1)[-1]
+    return tokens[0].rsplit("/", 1)[-1]
 
 
 @lru_cache(maxsize=256)
 def _stats_cached(filepath_str: str, mtime: float, size: int):
     """One-pass aggregation of model(s), token totals, tool-use and thinking
-    block counts, and the session's starting git branch. Token counts come
-    from each assistant message's real `message.usage` — no estimation.
+    block counts, shell-command frequencies (from Bash tool_use blocks),
+    and the session's starting git branch. Token counts come from each
+    assistant message's real `message.usage` — no estimation.
+
+    Per-model breakdowns (`per_model`) include `tool_uses`, `commands`,
+    `thinking_count`, `tool_turn_tokens`, and `command_turn_tokens`.
+
+    Cost attribution (both `tool_turn_tokens` and `command_turn_tokens`):
+    each `tool_use` block in a turn gets an equal slice of the turn's
+    `usage` (turn_cost / num_blocks_in_turn). For tool-level the slice is
+    keyed by tool name; for command-level (Bash only) the slice is keyed
+    by the extracted command name. Summing across tools (or across
+    commands within Bash's slice) equals the actual turn cost — so
+    avg-cost-per-call (share / call_count) doesn't double-count.
     """
     input_tokens = output_tokens = cache_read = cache_creation = 0
     models = []
     tool_uses = {}
+    commands: dict = {}
     thinking_count = 0
+    tool_turn_tokens: dict = {}
+    command_turn_tokens: dict = {}
     git_branch = None
     per_model: dict = {}
     last_model = "?"
+
+    def _ttt_bucket(d: dict, name: str):
+        return d.setdefault(name, {
+            "input_tokens": 0.0, "output_tokens": 0.0,
+            "cache_read_tokens": 0.0, "cache_creation_tokens": 0.0,
+        })
 
     try:
         with open(filepath_str, "r") as fh:
@@ -193,7 +260,9 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
                 pm = per_model.setdefault(mkey, {
                     "input_tokens": 0, "output_tokens": 0,
                     "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                    "tool_uses": {},
+                    "tool_uses": {}, "commands": {},
+                    "thinking_count": 0,
+                    "tool_turn_tokens": {}, "command_turn_tokens": {},
                 })
 
                 usage = msg.get("usage") or {}
@@ -210,6 +279,10 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
                 pm["cache_read_tokens"] += cr_t
                 pm["cache_creation_tokens"] += cc_t
 
+                # First pass: tally tool_use / thinking, extract Bash command
+                # names, and remember (tool_name, command_name?) per block so
+                # the second pass can split the turn's cost across them.
+                tool_block_entries = []  # (tool_name, command_name | None)
                 content = msg.get("content")
                 if isinstance(content, list):
                     for block in content:
@@ -220,8 +293,47 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
                             name = block.get("name") or "?"
                             tool_uses[name] = tool_uses.get(name, 0) + 1
                             pm["tool_uses"][name] = pm["tool_uses"].get(name, 0) + 1
+                            cname = None
+                            if name == "Bash":
+                                cmd = (block.get("input") or {}).get("command", "")
+                                cname = _extract_command_name(cmd) or None
+                                if cname:
+                                    commands[cname] = commands.get(cname, 0) + 1
+                                    pm["commands"][cname] = pm["commands"].get(cname, 0) + 1
+                            tool_block_entries.append((name, cname))
                         elif t == "thinking":
                             thinking_count += 1
+                            pm["thinking_count"] += 1
+
+                # Second pass: each block gets 1/N of the turn's tokens.
+                # Tool share goes to tool_turn_tokens[name]; if the block
+                # has a command name (Bash only), the same share also goes
+                # to command_turn_tokens[cname]. Sum across tools = turn
+                # cost; sum across commands within Bash = Bash's share.
+                n_blocks = len(tool_block_entries)
+                if n_blocks:
+                    share_in = in_t / n_blocks
+                    share_out = out_t / n_blocks
+                    share_cr = cr_t / n_blocks
+                    share_cc = cc_t / n_blocks
+                    for tname, cname in tool_block_entries:
+                        for tgt in (
+                            _ttt_bucket(tool_turn_tokens, tname),
+                            _ttt_bucket(pm["tool_turn_tokens"], tname),
+                        ):
+                            tgt["input_tokens"] += share_in
+                            tgt["output_tokens"] += share_out
+                            tgt["cache_read_tokens"] += share_cr
+                            tgt["cache_creation_tokens"] += share_cc
+                        if cname:
+                            for tgt in (
+                                _ttt_bucket(command_turn_tokens, cname),
+                                _ttt_bucket(pm["command_turn_tokens"], cname),
+                            ):
+                                tgt["input_tokens"] += share_in
+                                tgt["output_tokens"] += share_out
+                                tgt["cache_read_tokens"] += share_cr
+                                tgt["cache_creation_tokens"] += share_cc
     except OSError:
         pass
 
@@ -235,6 +347,9 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
         "thinking_count": thinking_count,
         "git_branch": git_branch,
         "per_model": per_model,
+        "commands": commands,
+        "tool_turn_tokens": tool_turn_tokens,
+        "command_turn_tokens": command_turn_tokens,
     }
 
 
@@ -280,6 +395,47 @@ def _fold_delta_into(target: dict, delta: dict):
         target[k] = target.get(k, 0) + (delta.get(k) or 0)
     for name, count in (delta.get("tool_uses") or {}).items():
         target["tool_uses"][name] = target["tool_uses"].get(name, 0) + count
+
+
+_TTT_FIELDS = ("input_tokens", "output_tokens",
+               "cache_read_tokens", "cache_creation_tokens")
+
+
+def _merge_ttt(target: dict, src: dict):
+    """In-place merge of two `tool_turn_tokens` dicts (`{name: {tokens, turns}}`)."""
+    if not src:
+        return
+    for name, vals in src.items():
+        bucket = target.setdefault(name, {k: 0 for k in _TTT_FIELDS})
+        for k in _TTT_FIELDS:
+            bucket[k] = bucket.get(k, 0) + (vals.get(k) or 0)
+
+
+def _merge_per_model(target: dict, src: dict):
+    """In-place merge of a per_model dict produced by _stats_cached."""
+    if not src:
+        return
+    for mkey, mstats in src.items():
+        pm = target.setdefault(mkey, {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "tool_uses": {}, "commands": {},
+            "thinking_count": 0,
+            "tool_turn_tokens": {}, "command_turn_tokens": {},
+        })
+        for field in ("input_tokens", "output_tokens",
+                      "cache_read_tokens", "cache_creation_tokens",
+                      "thinking_count"):
+            pm[field] = pm.get(field, 0) + (mstats.get(field) or 0)
+        for name, count in (mstats.get("tool_uses") or {}).items():
+            pm["tool_uses"][name] = pm["tool_uses"].get(name, 0) + count
+        for name, count in (mstats.get("commands") or {}).items():
+            pm.setdefault("commands", {})
+            pm["commands"][name] = pm["commands"].get(name, 0) + count
+        _merge_ttt(pm.setdefault("tool_turn_tokens", {}),
+                   mstats.get("tool_turn_tokens") or {})
+        _merge_ttt(pm.setdefault("command_turn_tokens", {}),
+                   mstats.get("command_turn_tokens") or {})
 
 
 def _duplicate_sidecar_path(jsonl_path: Path) -> Path:
@@ -391,6 +547,7 @@ def _parse_messages_cached(filepath_str: str, mtime: float, size: int):
             is_meta = entry.get("isMeta", False)
             is_sidechain = entry.get("isSidechain", False)
 
+            tool_commands = []  # bash-only for now: {id, command}
             if isinstance(content, list):
                 parts = []
                 for block in content:
@@ -400,7 +557,16 @@ def _parse_messages_cached(filepath_str: str, mtime: float, size: int):
                     if t == "text":
                         parts.append(block.get("text", ""))
                     elif t == "tool_use":
-                        parts.append(f"[Tool: {block.get('name', '?')}]")
+                        name = block.get("name", "?")
+                        tid = block.get("id", "")
+                        # Embed the id in the marker so the frontend can
+                        # correlate a Bash badge with its command entry
+                        # from `tool_commands` (see below).
+                        parts.append(f"[Tool: {name}:{tid}]")
+                        if name == "Bash":
+                            cmd = (block.get("input") or {}).get("command", "")
+                            if cmd:
+                                tool_commands.append({"id": tid, "command": cmd})
                     elif t == "tool_result":
                         parts.append("[Tool Result]")
                     elif t == "thinking":
@@ -415,6 +581,8 @@ def _parse_messages_cached(filepath_str: str, mtime: float, size: int):
                 continue
 
             msg = {"uuid": uid, "role": role, "content": content if isinstance(content, str) else str(content), "timestamp": ts}
+            if tool_commands:
+                msg["commands"] = tool_commands
             (side if is_sidechain else main).append(msg)
 
     def dedup(msgs):
@@ -611,12 +779,14 @@ def api_overview():
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_creation_tokens": 0,
         "tool_uses": {}, "thinking_count": 0,
-        "per_model": {},
+        "per_model": {}, "commands": {},
+        "tool_turn_tokens": {}, "command_turn_tokens": {},
     }
     archived_total = {
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_creation_tokens": 0,
         "tool_uses": {}, "thinking_count": 0, "messages_deleted": 0,
+        "commands": {}, "tool_turn_tokens": {}, "command_turn_tokens": {},
     }
     deleted_total = {
         "input_tokens": 0, "output_tokens": 0,
@@ -656,8 +826,6 @@ def api_overview():
             "tool_uses": {}, "thinking_count": 0, "messages_deleted": 0,
         }), delta)
 
-    # Optional folder scope — when set, only that project's jsonls (live +
-    # archive) contribute.
     folder = request.args.get("folder")
 
     def _live_dirs():
@@ -699,6 +867,10 @@ def api_overview():
                 totals[k] += s.get(k) or 0
             for name, count in (s.get("tool_uses") or {}).items():
                 totals["tool_uses"][name] = totals["tool_uses"].get(name, 0) + count
+            for name, count in (s.get("commands") or {}).items():
+                totals["commands"][name] = totals["commands"].get(name, 0) + count
+            _merge_ttt(totals["tool_turn_tokens"], s.get("tool_turn_tokens") or {})
+            _merge_ttt(totals["command_turn_tokens"], s.get("command_turn_tokens") or {})
             for m in s.get("models") or []:
                 if m and m not in models_seen:
                     models_seen.append(m)
@@ -716,33 +888,14 @@ def api_overview():
                 bucket["tool_uses"][name] = bucket["tool_uses"].get(name, 0) + count
             bucket["tool_calls"] += sum((s.get("tool_uses") or {}).values())
             bucket["convos"] += 1
-            for mkey, mstats in (s.get("per_model") or {}).items():
-                pm = bucket["per_model"].setdefault(mkey, {
-                    "input_tokens": 0, "output_tokens": 0,
-                    "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                    "tool_uses": {},
-                })
-                tpm = totals["per_model"].setdefault(mkey, {
-                    "input_tokens": 0, "output_tokens": 0,
-                    "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                    "tool_uses": {},
-                })
-                for field in ("input_tokens", "output_tokens",
-                              "cache_read_tokens", "cache_creation_tokens"):
-                    v = mstats.get(field) or 0
-                    pm[field] += v
-                    tpm[field] += v
-                for name, count in (mstats.get("tool_uses") or {}).items():
-                    pm["tool_uses"][name] = pm["tool_uses"].get(name, 0) + count
-                    tpm["tool_uses"][name] = tpm["tool_uses"].get(name, 0) + count
+            _merge_per_model(bucket["per_model"], s.get("per_model") or {})
+            _merge_per_model(totals["per_model"], s.get("per_model") or {})
 
             dd = s.get("deleted_delta") or {}
             if dd:
                 _fold_delta_into(deleted_total, dd)
                 _fold_into_bucket_delta(key, "deleted_delta", dd)
 
-    # Archived convos — same time-bucketing logic, but contribute to
-    # `archived_delta` instead of the active totals.
     for arch_dir in _archive_dirs():
         for fp in arch_dir.glob("*.jsonl"):
             try:
@@ -763,6 +916,12 @@ def api_overview():
                 "tool_uses": s.get("tool_uses") or {},
             }
             _fold_delta_into(archived_total, archived_entry)
+            for name, count in (s.get("commands") or {}).items():
+                archived_total["commands"][name] = archived_total["commands"].get(name, 0) + count
+            _merge_ttt(archived_total["tool_turn_tokens"],
+                       s.get("tool_turn_tokens") or {})
+            _merge_ttt(archived_total["command_turn_tokens"],
+                       s.get("command_turn_tokens") or {})
             key = _bucket_key(stat.st_mtime, bucket_unit)
             _fold_into_bucket_delta(key, "archived_delta", archived_entry)
             dd = s.get("deleted_delta") or {}
@@ -770,8 +929,6 @@ def api_overview():
                 _fold_delta_into(deleted_total, dd)
                 _fold_into_bucket_delta(key, "deleted_delta", dd)
 
-    # Tombstones — entries under any scoped folder whose file is gone. Bucket
-    # them by `deleted_at` since they have no mtime.
     tomb_roots = [*_live_dirs(), *_archive_dirs()]
     for root in tomb_roots:
         for path, entry in peek_cache.iter_folder(root):
@@ -827,12 +984,14 @@ def api_projects_stats():
             "input_tokens": 0, "output_tokens": 0,
             "cache_read_tokens": 0, "cache_creation_tokens": 0,
             "tool_uses": {}, "thinking_count": 0,
-            "per_model": {},
+            "per_model": {}, "commands": {},
+            "tool_turn_tokens": {}, "command_turn_tokens": {},
         }
         archived_total = {
             "input_tokens": 0, "output_tokens": 0,
             "cache_read_tokens": 0, "cache_creation_tokens": 0,
             "tool_uses": {}, "thinking_count": 0, "messages_deleted": 0,
+            "commands": {}, "tool_turn_tokens": {}, "command_turn_tokens": {},
         }
         deleted_total = {
             "input_tokens": 0, "output_tokens": 0,
@@ -849,24 +1008,17 @@ def api_projects_stats():
                 totals[k] += s.get(k) or 0
             for name, count in (s.get("tool_uses") or {}).items():
                 totals["tool_uses"][name] = totals["tool_uses"].get(name, 0) + count
+            for name, count in (s.get("commands") or {}).items():
+                totals["commands"][name] = totals["commands"].get(name, 0) + count
+            _merge_ttt(totals["tool_turn_tokens"], s.get("tool_turn_tokens") or {})
+            _merge_ttt(totals["command_turn_tokens"], s.get("command_turn_tokens") or {})
             for m in s.get("models") or []:
                 if m and m not in models_seen:
                     models_seen.append(m)
             b = s.get("git_branch")
             if b and b not in branches_seen:
                 branches_seen.append(b)
-            for mkey, mstats in (s.get("per_model") or {}).items():
-                pm = totals["per_model"].setdefault(mkey, {
-                    "input_tokens": 0, "output_tokens": 0,
-                    "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                    "tool_uses": {},
-                })
-                pm["input_tokens"] += mstats.get("input_tokens") or 0
-                pm["output_tokens"] += mstats.get("output_tokens") or 0
-                pm["cache_read_tokens"] += mstats.get("cache_read_tokens") or 0
-                pm["cache_creation_tokens"] += mstats.get("cache_creation_tokens") or 0
-                for name, count in (mstats.get("tool_uses") or {}).items():
-                    pm["tool_uses"][name] = pm["tool_uses"].get(name, 0) + count
+            _merge_per_model(totals["per_model"], s.get("per_model") or {})
 
         if project_dir.exists():
             for fp in project_dir.glob("*.jsonl"):
@@ -896,6 +1048,12 @@ def api_projects_stats():
                     "thinking_count": s.get("thinking_count") or 0,
                     "tool_uses": s.get("tool_uses") or {},
                 })
+                for name, count in (s.get("commands") or {}).items():
+                    archived_total["commands"][name] = archived_total["commands"].get(name, 0) + count
+                _merge_ttt(archived_total["tool_turn_tokens"],
+                           s.get("tool_turn_tokens") or {})
+                _merge_ttt(archived_total["command_turn_tokens"],
+                           s.get("command_turn_tokens") or {})
                 # Archived convos can still have their own deleted_delta if
                 # messages were deleted before archiving.
                 dd = s.get("deleted_delta") or {}

@@ -80,6 +80,7 @@ export function render() {
   items.sort(sortComparator());
 
   const overviewHtml = renderOverviewBar();
+  const totalSize = items.reduce((s, p) => s + (p.total_size_kb || 0), 0);
 
   if (!items.length) {
     const empty = state.mode === "archived"
@@ -89,7 +90,7 @@ export function render() {
     return;
   }
 
-  const grid = state.viewMode === "list" ? renderTable(items) : renderCards(items);
+  const grid = state.viewMode === "list" ? renderTable(items, totalSize) : renderCards(items, totalSize);
   app.innerHTML = overviewHtml + grid;
 }
 
@@ -156,7 +157,8 @@ export function renderOverviewBar() {
     </div>`;
 }
 
-function renderTable(items) {
+function renderTable(items, totalSize) {
+  const pct = (kb) => totalSize > 0 ? `${(kb / totalSize * 100).toFixed(1)}%` : "";
   let h = '<div class="tbl-wrap"><table class="tbl"><thead><tr>';
   h += `<th data-action="sort-projects" data-col="name">Project${arrow(state, "name")}</th>`;
   h += `<th data-action="sort-projects" data-col="convos" style="text-align:right">Convos${arrow(state, "convos")}</th>`;
@@ -173,7 +175,7 @@ function renderTable(items) {
           <div style="font-size:11px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px">${esc(p.latest_preview)}</div>
         </td>
         <td class="col-count">${p.conversation_count}</td>
-        <td class="col-size">${fmtSize(p.total_size_kb)}</td>
+        <td class="col-size">${fmtSize(p.total_size_kb)} <span class="stats-pct">(${pct(p.total_size_kb)})</span></td>
         <td class="col-time" title="${escAttr(timeAbs(p.last_activity))}">${timeAgo(p.last_activity)}</td>
         <td class="col-actions">
           <button class="btn-danger btn-sm" data-action="delete-project" data-folder="${escAttr(p.folder)}" data-name="${escAttr(sp)}">Del</button>
@@ -183,7 +185,8 @@ function renderTable(items) {
   return h + "</tbody></table></div>";
 }
 
-function renderCards(items) {
+function renderCards(items, totalSize) {
+  const pct = (kb) => totalSize > 0 ? `${(kb / totalSize * 100).toFixed(1)}%` : "";
   let h = '<div class="card-grid">';
   for (const p of items) {
     const sp = shortPath(p.path);
@@ -204,7 +207,7 @@ function renderCards(items) {
         <div class="card-footer">
           <span class="badge">${p.conversation_count} convos</span>
           ${archBadge}
-          <span class="badge">${fmtSize(p.total_size_kb)}</span>
+          <span class="badge">${fmtSize(p.total_size_kb)} <span class="stats-pct">(${pct(p.total_size_kb)})</span></span>
           <span class="time-label" title="${escAttr(timeAbs(p.last_activity))}">${timeAgo(p.last_activity)}</span>
           <span style="flex:1"></span>
           <button class="btn-danger btn-sm" data-action="delete-project" data-folder="${escAttr(p.folder)}" data-name="${escAttr(sp)}">Del</button>

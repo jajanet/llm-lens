@@ -130,8 +130,10 @@ export function render() {
   app.innerHTML = h;
 }
 
-function processContent(raw) {
-  // Preserve thinking blocks as placeholders
+function processContent(raw, commands) {
+  const cmdById = {};
+  for (const c of commands || []) cmdById[c.id] = c.command;
+
   const thinkingBlocks = [];
   let c = raw.replace(/<thinking>([\s\S]*?)<\/thinking>/g, (_, inner) => {
     if (!inner.trim()) return "";
@@ -146,9 +148,24 @@ function processContent(raw) {
 
   const toolBadges = [];
   const toolNames = [];
-  c = c.replace(/\[Tool: ([^\]]+)\]/g, (_, name) => {
+  // Marker shapes emitted by the backend parser:
+  //   [Tool: Read]            (legacy / no id)
+  //   [Tool: Bash:tool_use_id]
+  c = c.replace(/\[Tool: ([^:\]]+)(?::([^\]]+))?\]/g, (_, name, tid) => {
     const ph = `__TOOL_${toolBadges.length}__`;
-    toolBadges.push(`<span class="tool-badge">${esc(name)}</span>`);
+    let badge;
+    if (name === "Bash" && tid && cmdById[tid]) {
+      const raw = cmdById[tid];
+      const oneLine = raw.replace(/\n+/g, " ↵ ");
+      const preview = oneLine.length > 80 ? oneLine.slice(0, 80) + "…" : oneLine;
+      badge =
+        `<span class="tool-badge tool-badge-bash">${esc(name)}</span>` +
+        `<code class="bash-cmd-preview">${maskSecrets(preview)}</code>` +
+        `<details class="bash-cmd-full"><summary>show full</summary><pre>${maskSecrets(raw)}</pre></details>`;
+    } else {
+      badge = `<span class="tool-badge">${esc(name)}</span>`;
+    }
+    toolBadges.push(badge);
     toolNames.push(name);
     return ph;
   });
@@ -167,9 +184,6 @@ function processContent(raw) {
   if (!hasText && !thinkingBlocks.length && !hasTools) return { html: "", hasText: false, toolNames: [] };
 
   c = esc(c);
-  // Whitespace markers go in AFTER esc() (so we're working with literal chars,
-  // not escape sequences) but BEFORE placeholder substitution (so we don't
-  // touch the HTML inside __THINK_ / __TOOL_ replacements).
   if (state.showWhitespace) {
     c = c.replace(/ /g, '<span class="ws-dot">·</span>')
          .replace(/\t/g, '<span class="ws-tab">→</span>');
@@ -180,18 +194,51 @@ function processContent(raw) {
   return { html: c, hasText, toolNames };
 }
 
+
+// Patterns for known sensitive substrings. Conservative: only match
+// strings that are obviously credentials. Anything that matches gets
+// replaced with a clickable "reveal" span; the original is preserved in
+// data-secret so the user can opt to see it.
+const SECRET_PATTERNS = [
+  /sk-ant-[A-Za-z0-9_\-]{20,}/g,
+  /sk-[A-Za-z0-9]{32,}/g,
+  /ghp_[A-Za-z0-9]{30,}/g,
+  /gho_[A-Za-z0-9]{30,}/g,
+  /github_pat_[A-Za-z0-9_]{20,}/g,
+  /xox[bpoa]-[A-Za-z0-9\-]{10,}/g,
+  /AKIA[A-Z0-9]{16}/g,
+  /AIza[A-Za-z0-9_\-]{35}/g,
+  /Bearer\s+[A-Za-z0-9._\-]{16,}/g,
+  // env-style: NAME_KEY=value, NAME_TOKEN=value, etc.
+  /\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|API_KEY)\s*=\s*\S+/g,
+  // URL with embedded password: scheme://user:pass@host
+  /\b[a-z]+:\/\/[^\s:@]+:[^\s@]+@\S+/g,
+];
+
+export function maskSecrets(text) {
+  if (!text) return "";
+  // We need to escape first, then walk the escaped string looking for
+  // matches. But patterns include literal characters that survive escape
+  // (alphanumerics, hyphens, underscores). So escape first, then run
+  // patterns on the escaped string — same matches work.
+  let out = esc(text);
+  for (const re of SECRET_PATTERNS) {
+    out = out.replace(re, (m) =>
+      `<span class="secret-mask" data-action="reveal-secret" data-secret="${esc(m).replace(/"/g, "&quot;")}" title="Click to reveal">[sensitive]</span>`
+    );
+  }
+  return out;
+}
+
 function renderChatMessages(msgs, query) {
-  // First pass: process each message and compute {rendered, hasText, toolNames}.
   const processed = [];
   for (const m of msgs) {
-    const c = processContent(m.content || "");
+    const c = processContent(m.content || "", m.commands);
     if (!c.html) continue;
     const finalHtml = query ? highlightText(c.html, query) : c.html;
     processed.push({ m, html: finalHtml, hasText: c.hasText, toolNames: c.toolNames });
   }
 
-  // Second pass: coalesce consecutive tool-only messages into groups. A match
-  // in the query forces a group open so search hits stay visible.
   const qLower = (query || "").toLowerCase();
   const groups = [];
   let i = 0;
@@ -203,7 +250,6 @@ function renderChatMessages(msgs, query) {
       i++;
       continue;
     }
-    // Collect run of tool-only messages
     const run = [];
     let forceOpen = false;
     while (i < processed.length) {
@@ -215,8 +261,6 @@ function renderChatMessages(msgs, query) {
       i++;
     }
     if (run.length === 1) {
-      // Don't bother grouping a single tool bubble — render it directly
-      // in the compact-tool style via the normal path below.
       groups.push({ kind: "msg", items: run, compact: true });
     } else {
       groups.push({ kind: "group", items: run, forceOpen });
@@ -363,6 +407,21 @@ export function openBulkTransformMenu(anchorEl) {
     };
     document.addEventListener("click", handler, true);
   }, 0);
+}
+
+
+export function revealSecret(el) {
+  if (!el || !el.dataset) return;
+  const original = el.dataset.secret || "";
+  if (!original) return;
+  // Swap the mask span for a plain text node containing the original.
+  // Keep behavior local — no re-render, no network call. Once revealed,
+  // stays revealed until the view re-renders.
+  const replacement = document.createElement("span");
+  replacement.className = "secret-revealed";
+  replacement.textContent = original;
+  replacement.title = "Revealed — scroll away or reload to re-hide";
+  el.replaceWith(replacement);
 }
 
 export function clearSelection() {

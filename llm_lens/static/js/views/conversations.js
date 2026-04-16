@@ -191,6 +191,7 @@ export function render() {
   }
 
   const overviewHtml = renderOverviewBar();
+  const totalSize = items.reduce((s, c) => s + (c.size_kb || 0), 0);
 
   if (!items.length) {
     const empty = state.mode === "archived"
@@ -200,7 +201,7 @@ export function render() {
     return;
   }
 
-  const body = state.viewMode === "list" ? renderTable(items) : renderCards(items);
+  const body = state.viewMode === "list" ? renderTable(items, totalSize) : renderCards(items, totalSize);
   // Pagination only applies in Active mode (archived set is fully fetched).
   const more = state.mode !== "archived" && state.convoItems.length < state.convoTotal
     ? `<div class="load-more-bar"><button class="btn" data-action="load-more-convos">Load more (${state.convoItems.length} / ${state.convoTotal})</button></div>`
@@ -212,7 +213,8 @@ function copyIconSvg() {
   return '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="9" height="9" rx="1.5"></rect><path d="M3 10.5V3a1.5 1.5 0 0 1 1.5-1.5H11"></path></svg>';
 }
 
-function renderTable(items) {
+function renderTable(items, totalSize) {
+  const pct = (kb) => totalSize > 0 ? `${(kb / totalSize * 100).toFixed(1)}%` : "";
   let h = '<div class="tbl-wrap"><table class="tbl"><thead><tr>';
   h += `<th class="col-check"><input type="checkbox" style="accent-color:var(--accent)" data-action="toggle-all-convos"></th>`;
   h += `<th class="col-name">Name</th>`;
@@ -240,7 +242,7 @@ function renderTable(items) {
         </td>
         <td class="col-name${dimCls}${loadCls}"><div class="col-name-wrap"><span class="col-name-text">${archBadge}${esc(nameText)}</span>${copyBtn}</div></td>
         <td class="col-preview">${esc(c.preview)}</td>
-        <td class="col-size">${fmtSize(c.size_kb)}</td>
+        <td class="col-size">${fmtSize(c.size_kb)} <span class="stats-pct">(${pct(c.size_kb)})</span></td>
         <td class="col-time" title="${escAttr(timeAbs(c.last_modified))}">${timeAgo(c.last_modified)}</td>
         <td class="col-actions">
           ${archBtn}
@@ -252,7 +254,8 @@ function renderTable(items) {
   return h + "</tbody></table></div>";
 }
 
-function renderCards(items) {
+function renderCards(items, totalSize) {
+  const pct = (kb) => totalSize > 0 ? `${(kb / totalSize * 100).toFixed(1)}%` : "";
   let h = '<div class="card-grid">';
   for (const c of items) {
     const ck = state.selected.has(c.id) ? "checked" : "";
@@ -279,7 +282,7 @@ function renderCards(items) {
         <div class="card-stats">${statsInner}</div>
         <div class="card-footer">
           ${archBadge}
-          <span class="badge">${fmtSize(c.size_kb)}</span>
+          <span class="badge">${fmtSize(c.size_kb)} <span class="stats-pct">(${pct(c.size_kb)})</span></span>
           <span class="time-label" title="${escAttr(timeAbs(c.last_modified))}">${timeAgo(c.last_modified)}</span>
           <span style="flex:1"></span>
           ${archBtn}

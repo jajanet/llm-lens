@@ -140,6 +140,28 @@ const actions = {
   "toggle-all-msgs":  (_e, el) => Messages.toggleAllMsgs(),
 
   "open-word-lists":  ()       => Messages.openWordListsModal(),
+
+  "reveal-secret":    (_e, el) => Messages.revealSecret(el),
+
+  "toggle-table-rows": (_e, el) => {
+    const t = document.getElementById(el.dataset.target);
+    if (!t) return;
+    const expanded = t.classList.toggle("rows-expanded");
+    el.textContent = expanded ? "show less" : (el.dataset.moreLabel || "show more");
+  },
+
+  "set-stats-tab":    (_e, el) => {
+    const modal = el.closest(".modal");
+    if (!modal) return;
+    const t = el.dataset.tab;
+    modal.querySelectorAll(".stats-tab").forEach((n) => {
+      if (n.classList.contains(`stats-tab-${t}`)) n.removeAttribute("hidden");
+      else n.setAttribute("hidden", "");
+    });
+    modal.querySelectorAll(".stats-tab-btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.tab === t);
+    });
+  },
   "copy-selected":    ()       => Messages.copySelected(),
   "save-selected":    ()       => Messages.saveSelected(),
   "delete-selected":  ()       => Messages.deleteSelected(),
@@ -222,6 +244,19 @@ document.body.addEventListener("click", (e) => {
   if (!actionEl) return;
   const handler = actions[actionEl.dataset.action];
   if (handler) handler(e, actionEl);
+});
+
+document.body.addEventListener("click", (e) => {
+  const code = e.target.closest(".stats-matrix code");
+  if (!code || code.closest(".stats-note-row")) return;
+  code.classList.toggle("expanded");
+});
+document.body.addEventListener("mouseover", (e) => {
+  const code = e.target.closest && e.target.closest(".stats-matrix code");
+  if (!code || code.closest(".stats-note-row")) return;
+  if (!code.dataset.full && code.scrollWidth > code.clientWidth) {
+    code.dataset.full = code.textContent;
+  }
 });
 
 initRouter();

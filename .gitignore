@@ -11,3 +11,4 @@ dist/
 
 # Secrets
 .pypi-token
+.mcp.json

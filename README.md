@@ -7,7 +7,9 @@ A local, offline web UI for auditing, pruning, and cleaning the conversation his
 
 **Local only.** No API key. No auth. No outbound network. Never invokes `claude`. Reads and rewrites `~/.claude/projects/*.jsonl` on your machine, nothing else.
 
-Three things, in order of why they actually matter:
+> **Status: alpha.** Active development, fast-moving surface. APIs, JSONL marker formats, sidecar layouts, and word-list semantics all change without notice between commits. Pin a version if you depend on any of it. Bug reports and pull requests welcome; expect churn.
+
+## Why you'd use it
 
 ### 1. Know what you're spending
 
@@ -28,6 +30,16 @@ This is the lever that's easy to miss. Anything you remove from a conversation s
 
 Deletes don't vanish from your accounting. Per-conversation `deleted_delta` tombstones are stored in the sidecar cache so project- and overview-level rollups still reflect what you actually spent. Duplicating a conversation writes a sidecar recording the shared-prefix stats so the copy doesn't double-count against the parent while both exist.
 
+### 4. See what the agent actually ran
+
+Every Bash `tool_use` block is parsed for the underlying command name and counted: `grep × 42, git × 31, sed × 8`. Wrappers like `sudo`, `env FOO=1`, and `bash -c '...'` are stripped (the inner script is what counts); pipelines attribute to the first command. The per-conversation stats modal has a **Bash commands** section with the breakdown.
+
+In the Messages view, Bash badges expand inline to show the actual command — truncated preview by default, click `show full` for the whole thing. Strings that look like API keys, GitHub/Slack/AWS/OpenAI/Anthropic tokens, `Bearer` headers, `*_KEY=`/`*_SECRET=`/`*_PASSWORD=` env assignments, or URLs with embedded passwords are masked as `[sensitive]` and require a click to reveal — safer to screenshot or share-screen with this on.
+
+### 5. Read the file like an IDE when you need to
+
+A whitespace-rendering toggle (`·` for spaces, `→` for tabs) on the Messages view, useful when tracking down stray characters in scrubbed/normalized text or comparing what the agent wrote to what you expected. Off by default; off doesn't affect on-disk content.
+
 ## Workflows
 
 ### Audit a month
@@ -47,6 +59,10 @@ Select the messages to redact. Scrub. The chain, UUIDs, and token counts stay in
 ### Cut agent-priming language across a session
 
 Open the Messages view. Edit mode → Select all → split-button `▾` → **Remove swears** or **Remove filler / drift phrases**. Both are doing the same job — stripping language that degrades the next turn's output, whether by emotional priming (swears) or sycophancy-induced drift (filler). Curate either list via **Curate word lists…** (stored at `~/.cache/llm-lens/word_lists.json`).
+
+### Audit shell activity in a session
+
+Open a conversation's stats modal → **Bash commands** section. See the frequency-ranked list of what was run. For specific calls, scroll the Messages view: each Bash badge is expandable inline and shows the full command (with sensitive-pattern masking on by default).
 
 ## Safety model
 
@@ -69,7 +85,7 @@ Three views, each paginated + sortable + searchable:
 
 - **Projects** — one entry per `~/.claude/projects/*` subdirectory. Convo count, total size, preview, aggregate stats.
 - **Conversations** — all `.jsonl` sessions in a project. Toggle active/archived. Card view shows inline stats. Delete/archive/duplicate per-row.
-- **Messages** — chat view. Tool calls and results render as inline badges. Thinking blocks collapsed by default. Toggle to render whitespace (`·` for spaces, `→` for tabs) when you care about exact text. Edit mode surfaces per-message Copy / Scrub (split-button with transform variants) / Delete, and a bulk action bar when messages are selected.
+- **Messages** — chat view. Tool calls and results render as inline badges; Bash badges expand to show the actual command with sensitive-string masking. Thinking blocks collapsed by default. Toggle to render whitespace (`·` for spaces, `→` for tabs) when you care about exact text. Edit mode surfaces per-message Copy / Scrub (split-button with transform variants: scrub / normalize whitespace / remove swears / remove filler) / Delete, plus a bulk action bar with select-all when messages are selected.
 
 **Overview chart** on Projects and Conversations views: activity over day/week/month buckets, with modes for message count, tokens, or USD cost. Aggregate totals and cost estimates for the selected window.
 
@@ -135,6 +151,8 @@ LLM_LENS_DEBUG=1 llm-lens-web
 - **Archive.** `rename` to `~/.cache/llm-lens/archive/<folder>/`, mtime preserved so time-bucketed stats don't shift.
 - **Duplicate.** New file UUID *and* rewritten `sessionId`/`uuid`/`parentUuid` inside so `/resume` doesn't collide with the parent. Sidecar `<new-id>.dup.json` records the shared-prefix stats so aggregation subtracts them while the parent still exists.
 - **Word lists.** User-curated at `~/.cache/llm-lens/word_lists.json` (`{swears, filler}`). Empty list = opt-out (not "fall back to defaults"). Defaults shipped in code and exposed via `GET /api/word-lists/defaults`.
+- **Bash command extraction.** `_extract_command_name(cmd)` parses each Bash `tool_use`'s `input.command`, strips wrappers (`sudo`, `env VAR=…`, `bash -c '…'` recurses into the inner script) and pipeline tail, returns the first real command. Aggregated per-conversation as `stats.commands: {name: count}`. Tool-use markers in parsed messages are now `[Tool: Bash:<tool_use_id>]` so the frontend can correlate a badge with the command attached to the message via the `commands: [{id, command}]` field.
+- **Secret masking.** Frontend-only. `SECRET_PATTERNS` in `views/messages.js` matches well-known credential shapes (Anthropic/OpenAI/GitHub/Slack/AWS/Google keys, `Bearer …`, `*_KEY=`/`*_SECRET=`/`*_PASSWORD=` env-style, URL-embedded passwords). Matches render as `[sensitive]` chips with the original in `data-secret`; `revealSecret(el)` swaps the chip for the raw text on click. Conservative — high-entropy strings without a known prefix won't match.
 - **Mutations.** Plain filesystem ops: `unlink`, `rename`, `shutil.copy2`, line-filtered rewrites. No database.
 
 ### API

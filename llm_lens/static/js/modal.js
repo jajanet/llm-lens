@@ -32,6 +32,7 @@ export function showInfoModal({ title, body }) {
   overlay.className = "modal-overlay";
   overlay.innerHTML = `
     <div class="modal">
+      <button class="modal-close" data-modal-cancel aria-label="Close">&times;</button>
       <h3>${title}</h3>
       <div class="modal-body">${body}</div>
       <div class="modal-actions">
