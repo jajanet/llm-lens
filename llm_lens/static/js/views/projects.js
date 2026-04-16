@@ -110,6 +110,7 @@ export function renderOverviewBar() {
     ? renderStatsInline(state.overview.totals, {
         includeArchived: state.filters.archived,
         includeDeleted:  state.filters.deleted,
+        planContextWindow: state.planContextWindow,
       })
     : '<span class="stats-dim is-loading">loading...</span>';
 
@@ -194,6 +195,7 @@ function renderCards(items, totalSize) {
       ? renderStatsInline(p.stats, {
           includeArchived: state.filters.archived,
           includeDeleted:  state.filters.deleted,
+          planContextWindow: state.planContextWindow,
         })
       : '<span class="stats-dim is-loading">loading...</span>';
     const archBadge = p.archived_count
@@ -277,6 +279,7 @@ async function hydrateProjectStats(projects) {
     if (box) box.innerHTML = renderStatsInline(p.stats, {
       includeArchived: state.filters.archived,
       includeDeleted:  state.filters.deleted,
+      planContextWindow: state.planContextWindow,
     });
   }
 }
@@ -294,9 +297,14 @@ export async function hydrateOverview() {
   // Bump a request counter so out-of-order responses (fast prev/next clicks)
   // can't overwrite newer state with older window data.
   const myReq = ++overviewReqId;
+  // Tag filter only applies when viewing a single project (tag assignments
+  // are per-folder).
+  const tags = state.overviewScope && state.activeTagFilters && state.activeTagFilters.length
+    ? state.activeTagFilters
+    : null;
   let data;
   try {
-    data = await api.overview(state.overviewRange, state.overviewOffset, state.overviewScope);
+    data = await api.overview(state.overviewRange, state.overviewOffset, state.overviewScope, tags);
   } catch { return; }
   if (myReq !== overviewReqId) return;
   state.overview = data;
@@ -307,6 +315,7 @@ export async function hydrateOverview() {
   if (stats) stats.innerHTML = renderStatsInline(data.totals, {
     includeArchived: state.filters.archived,
     includeDeleted:  state.filters.deleted,
+    planContextWindow: state.planContextWindow,
   });
   const periodEl = bar.querySelector(".overview-period");
   if (periodEl) periodEl.textContent = periodLabel();

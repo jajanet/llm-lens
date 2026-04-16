@@ -37,15 +37,15 @@ export function fmtTokens(n) {
 // pricing or the API surface changes. Order matters — more-specific matchers
 // (e.g. opus-4-6) come before more-general ones (opus-4).
 const PRICING = [
-  { match: /opus-4-6/,   input: 5,    output: 25,   cache_write: 6.25,  cache_read: 0.50 },
-  { match: /sonnet-4-6/, input: 3,    output: 15,   cache_write: 3.75,  cache_read: 0.30 },
-  { match: /haiku-4-5/,  input: 1,    output: 5,    cache_write: 1.25,  cache_read: 0.10 },
-  { match: /opus-4-5/,   input: 5,    output: 25,   cache_write: 6.25,  cache_read: 0.50 },
-  { match: /sonnet-4-5/, input: 3,    output: 15,   cache_write: 3.75,  cache_read: 0.30 },
-  { match: /opus-4-1/,   input: 15,   output: 75,   cache_write: 18.75, cache_read: 1.50 },
-  { match: /opus-4/,     input: 15,   output: 75,   cache_write: 18.75, cache_read: 1.50 },
-  { match: /sonnet-4/,   input: 3,    output: 15,   cache_write: 3.75,  cache_read: 0.30 },
-  { match: /haiku-3/,    input: 0.25, output: 1.25, cache_write: 0.30,  cache_read: 0.03 },
+  { match: /opus-4-6/,   input: 5,    output: 25,   cache_write: 6.25,  cache_read: 0.50, context_window: 200_000 },
+  { match: /sonnet-4-6/, input: 3,    output: 15,   cache_write: 3.75,  cache_read: 0.30, context_window: 200_000 },
+  { match: /haiku-4-5/,  input: 1,    output: 5,    cache_write: 1.25,  cache_read: 0.10, context_window: 200_000 },
+  { match: /opus-4-5/,   input: 5,    output: 25,   cache_write: 6.25,  cache_read: 0.50, context_window: 200_000 },
+  { match: /sonnet-4-5/, input: 3,    output: 15,   cache_write: 3.75,  cache_read: 0.30, context_window: 200_000 },
+  { match: /opus-4-1/,   input: 15,   output: 75,   cache_write: 18.75, cache_read: 1.50, context_window: 200_000 },
+  { match: /opus-4/,     input: 15,   output: 75,   cache_write: 18.75, cache_read: 1.50, context_window: 200_000 },
+  { match: /sonnet-4/,   input: 3,    output: 15,   cache_write: 3.75,  cache_read: 0.30, context_window: 200_000 },
+  { match: /haiku-3/,    input: 0.25, output: 1.25, cache_write: 0.30,  cache_read: 0.03, context_window: 200_000 },
 ];
 
 export const COST_ASSUMPTION_NOTE =
@@ -58,6 +58,30 @@ function priceFor(model) {
   if (!model) return null;
   for (const p of PRICING) if (p.match.test(model)) return p;
   return null;
+}
+
+export function contextWindowFor(model, observedTokens, userPlanWindow) {
+  // If the caller knows the account's plan window (from /api/meta/context-window),
+  // that's authoritative — use it directly. This avoids the case where a small
+  // session on a 1M plan gets rendered against a 200k denominator.
+  if (userPlanWindow && userPlanWindow > 0) return userPlanWindow;
+
+  // Fallback when plan isn't known yet: infer from the session itself.
+  // Claude Code's JSONL writes `message.model` as plain `claude-opus-4-6`
+  // even in 1M-context sessions, so we also check observed usage: if the
+  // last turn already exceeded 200k, the session is definitely on 1M.
+  // Still honor an explicit `[1m]` marker if one ever appears.
+  let base;
+  if (!model) base = 200_000;
+  else if (/\[1m\]/i.test(model)) base = 1_000_000;
+  else {
+    const p = priceFor(model);
+    base = (p && p.context_window) || 200_000;
+  }
+  if (observedTokens && observedTokens > base) {
+    return observedTokens > 200_000 ? 1_000_000 : base;
+  }
+  return base;
 }
 
 // USD cost for a single (model, stats-bundle) pair. `stats` keys are the
@@ -919,7 +943,7 @@ function renderStatsCombined(s, opts) {
   };
 
   // ===== Cost tool/command tables (3-col: name | total cost | avg cost / call) =====
-  const costPerCallTable = (entries, total, costLookup, headLabel, footnoteSup) => {
+  const costPerCallTable = (entries, total, costLookup, headLabel) => {
     if (!entries.length) return "";
     let totalCost = 0;
     let anyCost = false;
@@ -951,13 +975,17 @@ function renderStatsCombined(s, opts) {
       <td class="stats-c">${anyCost ? fmtCost(totalCost) : ""}</td>
       <td class="stats-c"></td>
     </tr>`;
+    const foot = `<tr><td colspan="3" class="stats-note stats-note-row">
+      <sup>3</sup> Naive even-split: each tool_use block in a turn gets
+      <code>turn_cost / num_blocks</code>. Avg = total / call count.
+    </td></tr>`;
     return `<table id="${id}" class="stats-table stats-tools-3col">
       <tr>
         <th class="stats-k">${esc(headLabel)}</th>
-        <th class="stats-c">total cost<sup>${footnoteSup}</sup></th>
-        <th class="stats-c">avg cost / call</th>
+        <th class="stats-c">total cost<sup>3</sup></th>
+        <th class="stats-c">avg cost / call<sup>3</sup></th>
       </tr>
-      ${visible}${hidden}${moreRow}${totalRow}
+      ${visible}${hidden}${moreRow}${totalRow}${foot}
     </table>`;
   };
 
@@ -1022,30 +1050,15 @@ function renderStatsCombined(s, opts) {
     // Cost mode
     html += `<details class="stats-section" open><summary>Tokens</summary>${tokenCostTable}</details>`;
     if (toolEntries.length) {
-      const footnote = `<p class="stats-note" style="margin:4px 0 8px">
-        <sup>3</sup> Naive even-split attribution: each tool_use block in a
-        turn gets <code>turn_cost / num_blocks_in_turn</code>. Total cost
-        column = sum of those shares for this tool. Avg per call = total /
-        call count. Bottom-row total = sum across tools = cost of every
-        turn that involved a tool (pure-prose turns aren't counted here).
-      </p>`;
       html += `<details class="stats-section" open><summary>Cost per tool (${toolTotal} calls)</summary>
-        ${footnote}
-        ${costPerCallTable(toolEntries, toolTotal, costForTool, "Tool", 3)}
+        ${costPerCallTable(toolEntries, toolTotal, costForTool, "Tool")}
       </details>`;
     }
     const cmdEntries = Object.entries(eff.commands).sort((a, b) => b[1] - a[1]);
     if (cmdEntries.length) {
       const cmdTotal = cmdEntries.reduce((n, [, c]) => n + c, 0);
-      const note = `<p class="stats-note" style="margin:4px 0 8px">
-        Per-command from Bash tool_use blocks.<br>
-        <sup>3</sup> Same naive even-split as tool cost, refined to the
-        command level. Bottom-row total should match Bash's <em>total
-        cost</em> in the Cost-per-tool table when every command is recognized.
-      </p>`;
       html += `<details class="stats-section"><summary>Cost per Bash command (${cmdTotal} calls)</summary>
-        ${note}
-        ${costPerCallTable(cmdEntries, cmdTotal, costForCommand, "Command", 3)}
+        ${costPerCallTable(cmdEntries, cmdTotal, costForCommand, "Command")}
       </details>`;
     }
   }
@@ -1201,8 +1214,8 @@ function renderStatsByModel(s, opts, modelList) {
     const colspan = modelList.length + 2;
     const head = `<tr>
         <th class="stats-k">${esc(items.headLabel || "Name")}</th>
-        ${modelList.map((m) => `<th class="stats-v"><code>${esc(shortModel(m))}</code></th>`).join("")}
-        <th class="stats-v">overall</th>
+        ${modelList.map((m) => `<th class="stats-v"><code>${esc(shortModel(m))}</code><sup>3</sup></th>`).join("")}
+        <th class="stats-v">overall<sup>3</sup></th>
       </tr>`;
     const perModelTotalUsd = modelList.map(() => 0);
     const perModelTotalCalls = modelList.map(() => 0);
@@ -1313,11 +1326,11 @@ function renderStatsByModel(s, opts, modelList) {
   } else {
     html += `<details class="stats-section" open><summary>Tokens</summary>
       <table class="stats-table stats-matrix">${costHead}${costRows}${costTotalRow}${costFootnotes}</table></details>`;
-    html += costMatrixSection(`Cost per tool by model (${grandToolTotal} calls)<sup>3</sup>`, toolBundle, toolTokensFor, "total");
-    html += costMatrixSection(`Avg cost per tool call by model<sup>3</sup>`, toolBundle, toolTokensFor, "avg");
+    html += costMatrixSection(`Cost per tool by model (${grandToolTotal} calls)`, toolBundle, toolTokensFor, "total");
+    html += costMatrixSection("Avg cost per tool call by model", toolBundle, toolTokensFor, "avg");
     if (cmdItems.length) {
-      html += costMatrixSection(`Cost per Bash command by model (${grandCmdTotal} calls)<sup>3</sup>`, cmdBundle, cmdTokensFor, "total");
-      html += costMatrixSection(`Avg cost per Bash command call by model<sup>3</sup>`, cmdBundle, cmdTokensFor, "avg");
+      html += costMatrixSection(`Cost per Bash command by model (${grandCmdTotal} calls)`, cmdBundle, cmdTokensFor, "total");
+      html += costMatrixSection("Avg cost per Bash command call by model", cmdBundle, cmdTokensFor, "avg");
     }
   }
   return html;

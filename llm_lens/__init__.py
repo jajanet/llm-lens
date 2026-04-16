@@ -31,6 +31,7 @@ def _mtime_iso(mtime: float) -> str:
 from flask import Flask, jsonify, request, send_from_directory
 
 from . import peek_cache
+from . import tag_store
 
 app = Flask(__name__, static_folder="static")
 
@@ -151,7 +152,9 @@ def _custom_title(filepath: Path, stat: os.stat_result):
 _STATS_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens",
                "cache_creation_tokens", "models", "tool_uses",
                "thinking_count", "git_branch", "per_model", "commands",
-               "tool_turn_tokens", "command_turn_tokens")
+               "tool_turn_tokens", "command_turn_tokens",
+               "last_context_input_tokens", "last_context_cache_creation_tokens",
+               "last_context_cache_read_tokens", "last_model_for_context")
 
 
 # Tokens that wrap another command and shouldn't be counted themselves
@@ -216,6 +219,12 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
     by the extracted command name. Summing across tools (or across
     commands within Bash's slice) equals the actual turn cost — so
     avg-cost-per-call (share / call_count) doesn't double-count.
+
+    `last_context_*` fields snapshot the final main-thread assistant
+    turn's usage — the model's view of the conversation at that point,
+    which is what determines how close we are to compaction. Sidechains
+    (Task-subagent turns) are skipped because their usage reflects the
+    subagent's context, not the main conversation's.
     """
     input_tokens = output_tokens = cache_read = cache_creation = 0
     models = []
@@ -227,6 +236,8 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
     git_branch = None
     per_model: dict = {}
     last_model = "?"
+    last_ctx_in = last_ctx_cc = last_ctx_cr = 0
+    last_ctx_model = ""
 
     def _ttt_bucket(d: dict, name: str):
         return d.setdefault(name, {
@@ -278,6 +289,15 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
                 pm["output_tokens"] += out_t
                 pm["cache_read_tokens"] += cr_t
                 pm["cache_creation_tokens"] += cc_t
+
+                # Snapshot the last main-thread turn's context usage.
+                # Sidechains (Task subagents) have their own usage that
+                # doesn't reflect the main convo's state.
+                if not entry.get("isSidechain"):
+                    last_ctx_in = in_t
+                    last_ctx_cc = cc_t
+                    last_ctx_cr = cr_t
+                    last_ctx_model = mkey
 
                 # First pass: tally tool_use / thinking, extract Bash command
                 # names, and remember (tool_name, command_name?) per block so
@@ -350,6 +370,10 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
         "commands": commands,
         "tool_turn_tokens": tool_turn_tokens,
         "command_turn_tokens": command_turn_tokens,
+        "last_context_input_tokens": last_ctx_in,
+        "last_context_cache_creation_tokens": last_ctx_cc,
+        "last_context_cache_read_tokens": last_ctx_cr,
+        "last_model_for_context": last_ctx_model,
     }
 
 
@@ -391,7 +415,8 @@ def _fold_delta_into(target: dict, delta: dict):
     if not delta:
         return
     for k in ("input_tokens", "output_tokens", "cache_read_tokens",
-              "cache_creation_tokens", "thinking_count", "messages_deleted"):
+              "cache_creation_tokens", "thinking_count", "messages_deleted",
+              "messages_scrubbed"):
         target[k] = target.get(k, 0) + (delta.get(k) or 0)
     for name, count in (delta.get("tool_uses") or {}).items():
         target["tool_uses"][name] = target["tool_uses"].get(name, 0) + count
@@ -700,7 +725,6 @@ def _bucket_key(mtime: float, bucket: str) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
-
 def _shift_months(dt: datetime, months: int) -> datetime:
     """Shift `dt` by N calendar months, keeping day-of-month when possible
     (clamps to end-of-month when the target month is shorter)."""
@@ -763,6 +787,10 @@ def api_overview():
     Three buckets: active (live jsonls), `archived_delta` (archived jsonls,
     still contribute time-aligned since archive preserves mtime), and
     `deleted_delta` (tombstones bucketed by `deleted_at`).
+
+    Optional `tags=0,2` query param (folder-scoped only): further restrict to
+    conversations carrying any of those tag indices. Ignored when no folder
+    is set, since tag assignments are keyed per-folder.
     """
     rng = request.args.get("range", "all")
     try:
@@ -828,6 +856,26 @@ def api_overview():
 
     folder = request.args.get("folder")
 
+    # Tag filter: only honored when a folder is scoped (tag assignments are
+    # per-folder). Resolve the allowed convo-id set up front so the inner
+    # loops can skip cheaply.
+    tags_param = request.args.get("tags", "").strip()
+    allowed_ids: set | None = None
+    if tags_param and folder:
+        try:
+            tag_indices = {int(t) for t in tags_param.split(",") if t.strip()}
+        except ValueError:
+            tag_indices = set()
+        if tag_indices:
+            assignments = tag_store.get_project(folder).get("assignments", {})
+            allowed_ids = {cid for cid, tags in assignments.items()
+                           if any(t in tag_indices for t in tags)}
+
+    def _convo_allowed(fp: Path) -> bool:
+        if allowed_ids is None:
+            return True
+        return fp.stem in allowed_ids
+
     def _live_dirs():
         if not CLAUDE_PROJECTS_DIR.exists():
             return []
@@ -853,6 +901,8 @@ def api_overview():
 
     for project_dir in _live_dirs():
         for fp in project_dir.glob("*.jsonl"):
+            if not _convo_allowed(fp):
+                continue
             try:
                 stat = fp.stat()
             except OSError:
@@ -898,6 +948,8 @@ def api_overview():
 
     for arch_dir in _archive_dirs():
         for fp in arch_dir.glob("*.jsonl"):
+            if not _convo_allowed(fp):
+                continue
             try:
                 stat = fp.stat()
             except OSError:
@@ -929,22 +981,26 @@ def api_overview():
                 _fold_delta_into(deleted_total, dd)
                 _fold_into_bucket_delta(key, "deleted_delta", dd)
 
-    tomb_roots = [*_live_dirs(), *_archive_dirs()]
-    for root in tomb_roots:
-        for path, entry in peek_cache.iter_folder(root):
-            if path in seen_paths:
-                continue
-            dd = entry.get("deleted_delta") or {}
-            if not dd:
-                continue
-            da = entry.get("deleted_at")
-            if cutoff is not None and (da is None or da < cutoff):
-                continue
-            if cutoff_upper is not None and (da is None or da >= cutoff_upper):
-                continue
-            _fold_delta_into(deleted_total, dd)
-            if da is not None:
-                _fold_into_bucket_delta(_bucket_key(da, bucket_unit), "deleted_delta", dd)
+    # Tombstones: only surface when NOT tag-filtering. A deleted convo no
+    # longer has tag assignments (cleaned up on delete), so it can't match
+    # a tag filter anyway — including them would silently skew totals.
+    if allowed_ids is None:
+        tomb_roots = [*_live_dirs(), *_archive_dirs()]
+        for root in tomb_roots:
+            for path, entry in peek_cache.iter_folder(root):
+                if path in seen_paths:
+                    continue
+                dd = entry.get("deleted_delta") or {}
+                if not dd:
+                    continue
+                da = entry.get("deleted_at")
+                if cutoff is not None and (da is None or da < cutoff):
+                    continue
+                if cutoff_upper is not None and (da is None or da >= cutoff_upper):
+                    continue
+                _fold_delta_into(deleted_total, dd)
+                if da is not None:
+                    _fold_into_bucket_delta(_bucket_key(da, bucket_unit), "deleted_delta", dd)
 
     totals["models"] = models_seen
     totals["branches"] = branches_seen
@@ -973,13 +1029,39 @@ def api_projects_stats():
       - `archived_delta` — sum of archived convo stats
       - `deleted_delta` — sum of per-convo delete deltas + tombstoned files
 
+    Optional per-project `tags` in the POST body restricts aggregation to
+    conversations assigned any of the listed tag indices. Shape:
+        {"folders": ["foo"], "tags": {"foo": [0, 2]}}
+
     Cold cache: scans every jsonl (live + archive) once per file rev.
     """
-    folders = (request.get_json(silent=True) or {}).get("folders") or []
+    payload = request.get_json(silent=True) or {}
+    folders = payload.get("folders") or []
+    tag_map = payload.get("tags") or {}  # {folder: [tag_idx, ...]}
     out = {}
     for folder in folders:
         project_dir = CLAUDE_PROJECTS_DIR / folder
         archive_dir = _archive_folder(folder)
+
+        # Resolve per-folder tag filter (same per-folder semantics as overview).
+        tag_indices = set()
+        raw = tag_map.get(folder) or []
+        for t in raw:
+            try:
+                tag_indices.add(int(t))
+            except (TypeError, ValueError):
+                pass
+        allowed_ids: set | None = None
+        if tag_indices:
+            assignments = tag_store.get_project(folder).get("assignments", {})
+            allowed_ids = {cid for cid, tags in assignments.items()
+                           if any(t in tag_indices for t in tags)}
+
+        def _convo_allowed(fp: Path, _allowed=allowed_ids) -> bool:
+            if _allowed is None:
+                return True
+            return fp.stem in _allowed
+
         totals = {
             "input_tokens": 0, "output_tokens": 0,
             "cache_read_tokens": 0, "cache_creation_tokens": 0,
@@ -1022,6 +1104,8 @@ def api_projects_stats():
 
         if project_dir.exists():
             for fp in project_dir.glob("*.jsonl"):
+                if not _convo_allowed(fp):
+                    continue
                 seen_paths.add(str(fp))
                 try:
                     s = _stats(fp, fp.stat())
@@ -1033,6 +1117,8 @@ def api_projects_stats():
 
         if archive_dir.exists():
             for fp in archive_dir.glob("*.jsonl"):
+                if not _convo_allowed(fp):
+                    continue
                 seen_paths.add(str(fp))
                 try:
                     s = _stats(fp, fp.stat())
@@ -1059,13 +1145,14 @@ def api_projects_stats():
                 dd = s.get("deleted_delta") or {}
                 _fold_delta_into(deleted_total, dd)
 
-        # Pick up tombstones under live + archive folders.
-        for root in (project_dir, archive_dir):
-            for path, entry in peek_cache.iter_folder(root):
-                if path in seen_paths:
-                    continue
-                dd = entry.get("deleted_delta") or {}
-                _fold_delta_into(deleted_total, dd)
+        # Tombstones: skip when tag-filtering (see comment in api_overview).
+        if allowed_ids is None:
+            for root in (project_dir, archive_dir):
+                for path, entry in peek_cache.iter_folder(root):
+                    if path in seen_paths:
+                        continue
+                    dd = entry.get("deleted_delta") or {}
+                    _fold_delta_into(deleted_total, dd)
 
         totals["models"] = models_seen
         totals["branches"] = branches_seen
@@ -1093,10 +1180,11 @@ def api_conversations(folder):
         files.sort(key=lambda t: t[1].st_size, reverse=desc)
     elif sort == "recent":
         files.sort(key=lambda t: t[1].st_mtime, reverse=desc)
-    # for "msgs" we need line counts — do it after peeking all files
+    # for "msgs" and "context" we need per-file data — sort after peeking all files
 
-    # Build full metadata for the page (or all for client-side sort on msgs)
-    target = files if sort == "msgs" else files[offset:offset + limit]
+    # Build full metadata for the page (or all for client-side sort on msgs/context)
+    needs_full_scan = sort in ("msgs", "context")
+    target = files if needs_full_scan else files[offset:offset + limit]
 
     convos = []
     for f, stat in target:
@@ -1117,11 +1205,23 @@ def api_conversations(folder):
                 with open(f, "rb") as fh:
                     c["message_count"] = sum(1 for _ in fh)
                 peek_cache.set(f, stat, message_count=c["message_count"])
+        elif sort == "context":
+            s = _stats(f, stat)
+            c["_context_tokens"] = (
+                (s.get("last_context_input_tokens") or 0)
+                + (s.get("last_context_cache_creation_tokens") or 0)
+                + (s.get("last_context_cache_read_tokens") or 0)
+            )
         convos.append(c)
 
     if sort == "msgs":
         convos.sort(key=lambda c: c.get("message_count", 0), reverse=desc)
         convos = convos[offset:offset + limit]
+    elif sort == "context":
+        convos.sort(key=lambda c: c.get("_context_tokens", 0), reverse=desc)
+        convos = convos[offset:offset + limit]
+        for c in convos:
+            c.pop("_context_tokens", None)
 
     return jsonify({"items": convos, "total": total, "offset": offset, "limit": limit})
 
@@ -1144,6 +1244,43 @@ def api_refresh_cache(folder):
     _custom_title_cached.cache_clear()
     _parse_messages_cached.cache_clear()
     return jsonify({"ok": True})
+
+
+@app.route("/api/meta/context-window")
+def api_context_window():
+    """Return the effective context-window size to render percentages against.
+
+    The JSONL doesn't record whether a session is on the 200k- or 1M-token
+    plan (the `message.model` field is identical). We use two signals:
+
+    1. `LLM_LENS_CONTEXT_WINDOW` env var — explicit override, wins if set.
+    2. Max observed `last_context_*` tokens across every cached session —
+       if any one session has exceeded 200k, the account must be on the 1M
+       plan, so we apply 1M to every session to keep the denominator honest.
+       Still defaults to 200k when nothing is cached yet.
+    """
+    override = os.environ.get("LLM_LENS_CONTEXT_WINDOW", "").strip()
+    if override:
+        try:
+            val = int(override)
+            return jsonify({"plan_window": val, "max_observed": None, "source": "env"})
+        except ValueError:
+            pass
+
+    max_observed = 0
+    for _, entry in peek_cache.iter_all():
+        ctx = (int(entry.get("last_context_input_tokens") or 0)
+               + int(entry.get("last_context_cache_creation_tokens") or 0)
+               + int(entry.get("last_context_cache_read_tokens") or 0))
+        if ctx > max_observed:
+            max_observed = ctx
+
+    plan_window = 1_000_000 if max_observed > 200_000 else 200_000
+    return jsonify({
+        "plan_window": plan_window,
+        "max_observed": max_observed,
+        "source": "inferred",
+    })
 
 
 def _convo_path(folder: str, convo_id: str) -> Path | None:
@@ -1276,6 +1413,7 @@ def api_delete_conversation(folder, convo_id):
     if sidecar.exists():
         sidecar.unlink()
     peek_cache.mark_deleted(filepath, final_stats)
+    tag_store.remove_conversation(folder, convo_id)
     _invalidate_cache_for(filepath)
     return jsonify({"ok": True})
 
@@ -1348,7 +1486,6 @@ def api_duplicate_conversation(folder, convo_id):
     }))
     _invalidate_cache_for(dst)
     return jsonify({"ok": True, "new_id": new_id})
-
 
 
 @app.route("/api/projects/<folder>/conversations/<convo_id>/archive", methods=["POST"])
@@ -1434,7 +1571,6 @@ def api_archived_conversations(folder):
     return jsonify({"items": convos, "total": len(convos)})
 
 
-
 @app.route("/api/projects/<folder>/conversations/bulk-archive", methods=["POST"])
 def api_bulk_archive(folder):
     """Move many live convos to the archive dir in one call.
@@ -1495,6 +1631,43 @@ def api_bulk_unarchive(folder):
         unarchived += 1
     _invalidate_cache_for(CLAUDE_PROJECTS_DIR / folder)
     return jsonify({"ok": True, "unarchived": unarchived, "skipped": skipped})
+
+
+# ── Tag management ────────────────────────────────────────────────────
+
+@app.route("/api/projects/<folder>/tags")
+def api_get_tags(folder):
+    """Return label definitions + per-conversation assignments for a project."""
+    return jsonify(tag_store.get_project(folder))
+
+
+@app.route("/api/projects/<folder>/tags/labels", methods=["PUT"])
+def api_set_tag_labels(folder):
+    """Replace label definitions for a project (max 5)."""
+    labels = (request.get_json(silent=True) or {}).get("labels", [])
+    tag_store.set_labels(folder, labels)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/projects/<folder>/tags/assign", methods=["POST"])
+def api_assign_tags(folder):
+    """Set the tags for one conversation."""
+    payload = request.get_json(silent=True) or {}
+    convo_id = payload.get("convo_id", "")
+    tags = payload.get("tags", [])
+    tag_store.assign(folder, convo_id, tags)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/projects/<folder>/tags/bulk-assign", methods=["POST"])
+def api_bulk_assign_tag(folder):
+    """Add or remove a single tag from multiple conversations."""
+    payload = request.get_json(silent=True) or {}
+    ids = payload.get("ids", [])
+    tag_index = payload.get("tag", 0)
+    add = payload.get("add", True)
+    count = tag_store.bulk_assign(folder, ids, tag_index, add)
+    return jsonify({"ok": True, "count": count})
 
 
 def _tool_use_ids(entry):
@@ -1588,9 +1761,6 @@ def api_delete_message(folder, convo_id, msg_uuid):
     return jsonify({"ok": True})
 
 
-_SCRUB_PLACEHOLDER = "."
-
-
 def _is_prose_only(message: dict) -> bool:
     """Prose-only = `message.content` is a string or a list containing only
     text blocks. Any tool_use, tool_result, thinking, image, or other
@@ -1612,64 +1782,20 @@ def _is_prose_only(message: dict) -> bool:
     return False
 
 
-def _scrub_content(message: dict):
-    content = message.get("content")
-    if isinstance(content, str):
-        message["content"] = _SCRUB_PLACEHOLDER
-        return
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                block["text"] = _SCRUB_PLACEHOLDER
+def _replace_content(message: dict, new_text: str):
+    """Replace the text content of a prose-only message in place.
 
-
-_WS_RUN_RE = re.compile(r"[ \t]+")
-_NL_RUN_RE = re.compile(r"\n{3,}")
-
-
-def _normalize_ws(text: str) -> str:
-    """Collapse cosmetic whitespace without touching code-shaped content.
-
-    Rules, applied per line:
-      - Inside a triple-backtick fenced code block: leave the line alone.
-      - Lines that start with a space or tab: leave leading whitespace
-        intact (preserves Python/YAML/Makefile indentation, list/quote
-        continuations, indent-style code blocks). Only rstrip trailing
-        whitespace.
-      - All other (prose) lines: collapse runs of inline spaces/tabs to a
-        single space, then rstrip.
-    Then: collapse 3+ consecutive newlines to 2 to tighten paragraph gaps.
-
-    Inline code spans (`` `like this` ``) inside prose lines are not
-    detected — internal multi-space inside a backtick span will still be
-    collapsed. Acceptable v1 trade-off; documented limitation.
+    For string content, swaps the string. For list-of-text-blocks content,
+    collapses to a single text block — the UI shows the blocks joined as one
+    buffer when editing, so saving should produce a single coherent block.
+    Leaves `usage`, `uuid`, `parentUuid`, etc. untouched.
     """
-    out = []
-    in_fence = False
-    for line in text.split("\n"):
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-            out.append(line)
-            continue
-        if in_fence:
-            out.append(line)
-            continue
-        if line and line[0] in " \t":
-            out.append(line.rstrip())
-            continue
-        out.append(_WS_RUN_RE.sub(" ", line).rstrip())
-    return _NL_RUN_RE.sub("\n\n", "\n".join(out))
-
-
-def _normalize_whitespace_content(message: dict):
     content = message.get("content")
     if isinstance(content, str):
-        message["content"] = _normalize_ws(content)
+        message["content"] = new_text
         return
     if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                block["text"] = _normalize_ws(block.get("text") or "")
+        message["content"] = [{"type": "text", "text": new_text}]
 
 
 # Default word/phrase lists. Conservative starting points — users curate
@@ -1753,114 +1879,26 @@ def _save_word_lists(data: dict) -> dict:
     return cleaned
 
 
-_SAFE_STEM_SUFFIXES = ["", "s", "es", "ed", "er", "ers", "ing", "ings", "y", "ery", "ies"]
-
-
-def _swear_regex_parts(words: list) -> list:
-    """Translate user entries into regex fragments.
-
-    A trailing `*` marks a stem — the regex matches the stem followed by
-    one of a closed list of safe suffixes (`s`, `es`, `ed`, `er`, `ers`,
-    `ing`, `y`, etc.), bounded by word boundaries. So `fuck*` catches
-    fuck/fucks/fucker/fucking/etc., and `ass*` catches ass/asses/assing
-    *without* matching `assist`/`assess`/`assistant` — the suffix `ist` /
-    `ess` / `istant` aren't in the safe list.
-
-    Plain (no `*`) words match exactly with word boundaries.
-    """
-    parts = []
-    for w in words or []:
-        if not isinstance(w, str) or not w.strip():
-            continue
-        if w.endswith("*") and len(w) > 1:
-            stem = re.escape(w[:-1])
-            suffix_alt = "|".join(re.escape(s) for s in _SAFE_STEM_SUFFIXES)
-            parts.append(f"{stem}(?:{suffix_alt})")
-        else:
-            parts.append(re.escape(w))
-    return parts
-
-
-def _strip_swears(text: str, words: list) -> str:
-    parts = _swear_regex_parts(words)
-    if not text or not parts:
-        return text
-    pattern = r"\b(?:" + "|".join(parts) + r")\b"
-    out = re.sub(pattern, "", text, flags=re.IGNORECASE)
-    out = re.sub(r"[ \t]{2,}", " ", out)
-    out = re.sub(r"\s+([,.!?;:])", r"\1", out)
-    return out
-
-
-def _strip_filler(text: str, phrases: list) -> str:
-    if not text or not phrases:
-        return text
-    # Sort longest-first so "I apologize for any confusion." matches before
-    # a shorter substring would.
-    pattern = "|".join(re.escape(p) for p in sorted(phrases, key=len, reverse=True))
-    out = re.sub(pattern, "", text, flags=re.IGNORECASE)
-    out = re.sub(r"[ \t]{2,}", " ", out)
-    out = re.sub(r"\n{3,}", "\n\n", out)
-    out = re.sub(r"\s+([,.!?;:])", r"\1", out)
-    return out.strip()
-
-
-def _apply_text_transform(message: dict, fn):
-    content = message.get("content")
-    if isinstance(content, str):
-        message["content"] = fn(content)
-        return
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                block["text"] = fn(block.get("text") or "")
-
-
-def _remove_swears_content(message: dict):
-    words = _load_word_lists()["swears"]
-    _apply_text_transform(message, lambda t: _strip_swears(t, words))
-
-
-def _remove_filler_content(message: dict):
-    phrases = _load_word_lists()["filler"]
-    _apply_text_transform(message, lambda t: _strip_filler(t, phrases))
-
-
-_TRANSFORMS = {
-    "scrub": _scrub_content,
-    "normalize_whitespace": _normalize_whitespace_content,
-    "remove_swears": _remove_swears_content,
-    "remove_filler": _remove_filler_content,
-}
-
-
 @app.route(
-    "/api/projects/<folder>/conversations/<convo_id>/messages/<msg_uuid>/scrub",
+    "/api/projects/<folder>/conversations/<convo_id>/messages/<msg_uuid>/edit",
     methods=["POST"],
 )
-def api_scrub_message(folder, convo_id, msg_uuid):
-    """Apply a text transform to a prose-only message in place.
+def api_edit_message(folder, convo_id, msg_uuid):
+    """Replace the text content of a prose-only message in place.
 
-    `kind` (body JSON) selects the transform:
-      - "scrub" (default): replace text with "."
-      - "normalize_whitespace": collapse runs of spaces/tabs; 3+ newlines → 2
-
-    Both preserve `usage`, `uuid`, `parentUuid`, `sessionId`, and any
-    non-text structural blocks. Stats unchanged because `usage` is left
-    alone — it's a historical billing record, not a recount of bytes.
+    Body: {"text": "<new content>"}. Preserves `usage`, `uuid`, `parentUuid`,
+    `sessionId`, and message shape. Same resume-chain caveats as scrub.
     """
     payload = request.get_json(silent=True) or {}
-    kind = payload.get("kind") or "scrub"
-    transform = _TRANSFORMS.get(kind)
-    if transform is None:
-        return jsonify({
-            "error": f"Unknown transform kind '{kind}'. "
-                     f"Supported: {sorted(_TRANSFORMS)}"
-        }), 400
+    new_text = payload.get("text")
+    if not isinstance(new_text, str):
+        return jsonify({"error": "Missing 'text' (string) in body."}), 400
 
     filepath = CLAUDE_PROJECTS_DIR / folder / f"{convo_id}.jsonl"
     if not filepath.exists():
         return jsonify({"error": "Not found"}), 404
+
+    pre_stat = filepath.stat()
 
     with open(filepath, "r") as f:
         raw_lines = f.readlines()
@@ -1882,18 +1920,19 @@ def api_scrub_message(folder, convo_id, msg_uuid):
     message = target.get("message") or {}
     if not _is_prose_only(message):
         return jsonify({
-            "error": "Transform only applies to prose-only messages (text "
-                     "blocks only — no tool_use, tool_result, thinking, or "
-                     "images)."
+            "error": "Edit only applies to prose-only messages (text blocks "
+                     "only — no tool_use, tool_result, thinking, or images)."
         }), 400
 
-    transform(message)
+    _replace_content(message, new_text)
+
+    peek_cache.accumulate_deleted(filepath, pre_stat, {"messages_scrubbed": 1})
 
     with open(filepath, "w") as f:
         for e in entries:
             f.write(json.dumps(e) + "\n")
     _invalidate_cache_for(filepath)
-    return jsonify({"ok": True, "kind": kind})
+    return jsonify({"ok": True})
 
 
 @app.route("/api/word-lists", methods=["GET"])
@@ -2027,6 +2066,7 @@ def api_bulk_delete(folder):
         if sd and sd.exists():
             shutil.rmtree(sd)
         peek_cache.mark_deleted(fp, final_stats)
+        tag_store.remove_conversation(folder, cid)
         deleted += 1
     _invalidate_cache_for(CLAUDE_PROJECTS_DIR / folder)
     return jsonify({"ok": True, "deleted": deleted})
@@ -2046,6 +2086,7 @@ def api_delete_project(folder):
             final_stats = {}
         peek_cache.mark_deleted(fp, final_stats)
     shutil.rmtree(d)
+    tag_store.remove_folder(folder)
     _invalidate_cache_for(d)
     return jsonify({"ok": True})
 

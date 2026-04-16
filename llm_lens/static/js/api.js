@@ -78,27 +78,31 @@ export const api = {
   singleConversationStats: (folder, convoId) =>
     json(`/api/projects/${folder}/conversations/${convoId}/stats`),
 
-  projectStats: (folders) =>
+  projectStats: (folders, tagsByFolder = null) =>
     json(`/api/projects/stats`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ folders }),
+      body: JSON.stringify(tagsByFolder ? { folders, tags: tagsByFolder } : { folders }),
     }),
 
-  overview: (range = "all", offset = 0, folder = null) => {
+  overview: (range = "all", offset = 0, folder = null, tags = null) => {
     const params = new URLSearchParams({ range, offset: String(offset) });
     if (folder) params.set("folder", folder);
+    if (folder && tags && tags.length) params.set("tags", tags.join(","));
     return json(`/api/overview?${params}`);
   },
+
+  contextWindow: () =>
+    json("/api/meta/context-window"),
 
   deleteMessage: (folder, convoId, msgUuid) =>
     json(`/api/projects/${folder}/conversations/${convoId}/messages/${msgUuid}`, { method: "DELETE" }),
 
-  transformMessage: (folder, convoId, msgUuid, kind = "scrub") =>
-    json(`/api/projects/${folder}/conversations/${convoId}/messages/${msgUuid}/scrub`, {
+  editMessage: (folder, convoId, msgUuid, text) =>
+    json(`/api/projects/${folder}/conversations/${convoId}/messages/${msgUuid}/edit`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind }),
+      body: JSON.stringify({ text }),
     }),
 
 
@@ -120,5 +124,58 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ uuids }),
+    }),
+
+  // ── Tags ──────────────────────────────────────────────────────────
+
+  getTags: (folder) =>
+    json(`/api/projects/${folder}/tags`),
+
+  setTagLabels: (folder, labels) =>
+    json(`/api/projects/${folder}/tags/labels`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ labels }),
+    }),
+
+  assignTags: (folder, convoId, tags) =>
+    json(`/api/projects/${folder}/tags/assign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ convo_id: convoId, tags }),
+    }),
+
+  bulkAssignTag: (folder, ids, tag, add) =>
+    json(`/api/projects/${folder}/tags/bulk-assign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, tag, add }),
+    }),
+
+
+  // ── Tags ──────────────────────────────────────────────────────────
+
+  getTags: (folder) =>
+    json(`/api/projects/${folder}/tags`),
+
+  setTagLabels: (folder, labels) =>
+    json(`/api/projects/${folder}/tags/labels`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ labels }),
+    }),
+
+  assignTags: (folder, convoId, tags) =>
+    json(`/api/projects/${folder}/tags/assign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ convo_id: convoId, tags }),
+    }),
+
+  bulkAssignTag: (folder, ids, tag, add) =>
+    json(`/api/projects/${folder}/tags/bulk-assign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, tag, add }),
     }),
 };

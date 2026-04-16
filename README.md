@@ -19,6 +19,7 @@ Token counts and USD costs come from the actual `message.usage` fields Anthropic
 
 This is the lever that's easy to miss. Anything you remove from a conversation shrinks what Claude Code sends as context the next time you `/resume` it. Less context sent → fewer input tokens billed per turn going forward. The editing tools aren't just cleanup; they're direct downstream cost reduction:
 
+- **Edit** — rewrite a prose message's text in place; `usage`, UUIDs, and the resume chain stay intact. For fine-tuned customization. Prose-only: tool/thinking blocks are locked.
 - **Scrub** — redact a message's text to `.`. Original `usage` is preserved (historical accuracy), but on resume the scrubbed content is what gets sent.
 - **Normalize whitespace** — collapse runs of spaces/tabs and 3+ newlines.
 - **Strip agent-priming language.** Two curated lists for the two flavors, both stored at `~/.cache/llm-lens/word_lists.json` and editable in-app:
@@ -26,19 +27,35 @@ This is the lever that's easy to miss. Anything you remove from a conversation s
   - **Filler / drift phrases** — sycophancy and meta-commentary that nudge the agent off task: "You're absolutely right!", "Let me think step by step.", "I apologize for the confusion.", etc. Same mechanism, different register.
 - **Extract** a pruned subset into a new conversation, leaving the original untouched.
 
-### 3. Stay honest about history
+### 3. Context Window Awareness
+
+Each conversation card shows a `ctx 120k (60%)` badge, and the conversations table has a sortable `Ctx` column. It shows how close Claude Code's auto-compaction will fire. Sort descending to surface sessions near the window; those are the ones worth pruning *before* `/compact` swaps your working memory for a summary. Denominator is 200k by default, promotes to 1M if any session in your cache has exceeded 200k (signal you're on the 1M plan); override with the `LLM_LENS_CONTEXT_WINDOW` env var.
+
+### 4. Stay honest about history
 
 Deletes don't vanish from your accounting. Per-conversation `deleted_delta` tombstones are stored in the sidecar cache so project- and overview-level rollups still reflect what you actually spent. Duplicating a conversation writes a sidecar recording the shared-prefix stats so the copy doesn't double-count against the parent while both exist.
 
-### 4. See what the agent actually ran
+### 5. See what the agent actually ran
 
 Every Bash `tool_use` block is parsed for the underlying command name and counted: `grep × 42, git × 31, sed × 8`. Wrappers like `sudo`, `env FOO=1`, and `bash -c '...'` are stripped (the inner script is what counts); pipelines attribute to the first command. The per-conversation stats modal has a **Bash commands** section with the breakdown.
 
 In the Messages view, Bash badges expand inline to show the actual command — truncated preview by default, click `show full` for the whole thing. Strings that look like API keys, GitHub/Slack/AWS/OpenAI/Anthropic tokens, `Bearer` headers, `*_KEY=`/`*_SECRET=`/`*_PASSWORD=` env assignments, or URLs with embedded passwords are masked as `[sensitive]` and require a click to reveal — safer to screenshot or share-screen with this on.
 
-### 5. Read the file like an IDE when you need to
+### 6. Read the file like an IDE when you need to
 
 A whitespace-rendering toggle (`·` for spaces, `→` for tabs) on the Messages view, useful when tracking down stray characters in scrubbed/normalized text or comparing what the agent wrote to what you expected. Off by default; off doesn't affect on-disk content.
+
+### 7. Slice your project with tags
+
+Each project gets up to **5 colored tags** with custom labels you set yourself (e.g. `bug-fix`, `spike`, `needs-review`). Tags are project-scoped — different projects keep independent label sets — and stored in `~/.cache/llm-lens/tags.json`, separate from `sessions.json` so they survive cache rebuilds. Click a tag in the bar above the conversation list to filter by it; the **overview chart, summary stats, and Stats modal all re-aggregate to just the tagged subset**, so questions like "how much did my bug-fix work cost this month?" are one click away.
+
+Tagging itself is gated behind the **Edit** button, alongside the existing message-level edit mode:
+
+- **Manual selection** — check a few conversations, then click "Tag N selected" in the toolbar. A popup lists existing tags and lets you create-and-apply a new one inline.
+- **Smart-select presets** — `Heavy tools`, `Thinking`, `Expensive`, and `Edited` (any conversation that's had a message scrubbed or deleted). Each has a live slider; matching conversations highlight as you drag. Combined with the assign popup, this is "tag every conversation with >50 tool uses as `heavy`" in three clicks.
+- **From inside a conversation** — pills appear in the breadcrumb with × to remove and + to add. Same tag set as the project view.
+
+Tags persist across archive/unarchive (keyed by conversation ID, not file path) and clean up automatically when a conversation or project is deleted.
 
 ## Workflows
 
@@ -63,6 +80,10 @@ Open the Messages view. Edit mode → Select all → split-button `▾` → **Re
 ### Audit shell activity in a session
 
 Open a conversation's stats modal → **Bash commands** section. See the frequency-ranked list of what was run. For specific calls, scroll the Messages view: each Bash badge is expandable inline and shows the full command (with sensitive-pattern masking on by default).
+
+### Slice the overview by tag
+
+Click **Edit** on the project view. Click an empty tag slot, name it (e.g. `bug-fix`). Use the **Smart-select** presets to find matching conversations — `Edited` for ones you've pruned, `Heavy tools` with the slider for shell-heavy sessions, etc. Click "Tag N matching" → pick the tag. Exit edit mode. Now click that tag pill in the bar: the conversation list, the overview chart, and the per-bucket totals all narrow to just those conversations.
 
 ## Safety model
 
@@ -113,6 +134,7 @@ pyproject.toml          Package metadata
 llm_lens/
   __init__.py           Flask backend: REST API, static serving, main()
   peek_cache.py         Persistent sidecar cache (token stats, titles, tombstones)
+  tag_store.py          Per-project tag labels + assignments (separate sidecar)
   static/
     index.html          SPA shell
     css/styles.css      All styles; dark/light via CSS vars
@@ -147,7 +169,8 @@ LLM_LENS_DEBUG=1 llm-lens-web
 
 - **Data source.** `CLAUDE_PROJECTS_DIR = ~/.claude/projects/` is hardcoded. Each subdirectory is a project; each `.jsonl` is a conversation. Main provider coupling.
 - **Sidecar cache.** `~/.cache/llm-lens/sessions.json`, keyed on `(filepath, mtime, size)` so entries auto-invalidate. Debounced atomic writes; in-process `@lru_cache` in front for hot reads.
-- **Tombstones.** Deleted conversations leave a `deleted_delta` entry preserving final stats so project/overview rollups stay honest. Path-reuse handled by keying on `(pre-delete mtime, size)`.
+- **Tombstones.** Deleted conversations leave a `deleted_delta` entry preserving final stats so project/overview rollups stay honest. Path-reuse handled by keying on `(pre-delete mtime, size)`. Scrub operations contribute a `messages_scrubbed` counter to the same delta so the **Edited** smart-select preset works without re-reading files.
+- **Tags.** Stored in `~/.cache/llm-lens/tags.json` — separate from `sessions.json` so a `peek_cache.hard_clear()` doesn't wipe them. Same lock + debounce-flush pattern as `peek_cache`, plus an `atexit.register(flush)` so abrupt shutdowns still persist. Per-folder shape: `{labels: [{name, color}, ...], assignments: {convo_id: [tag_idx, ...]}}`. Overview/stats endpoints accept an optional `tags` filter that intersects against `assignments` server-side; tombstones are skipped under tag filtering since deleted convos no longer have assignments.
 - **Archive.** `rename` to `~/.cache/llm-lens/archive/<folder>/`, mtime preserved so time-bucketed stats don't shift.
 - **Duplicate.** New file UUID *and* rewritten `sessionId`/`uuid`/`parentUuid` inside so `/resume` doesn't collide with the parent. Sidecar `<new-id>.dup.json` records the shared-prefix stats so aggregation subtracts them while the parent still exists.
 - **Word lists.** User-curated at `~/.cache/llm-lens/word_lists.json` (`{swears, filler}`). Empty list = opt-out (not "fall back to defaults"). Defaults shipped in code and exposed via `GET /api/word-lists/defaults`.
@@ -159,9 +182,9 @@ LLM_LENS_DEBUG=1 llm-lens-web
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/overview` | Activity buckets (`range`, `mode`, `group_by`, `offset`) |
+| `GET` | `/api/overview` | Activity buckets (`range`, `mode`, `group_by`, `offset`, optional `tags=0,2` when `folder` is set) |
 | `GET` | `/api/projects` | All projects + metadata |
-| `POST` | `/api/projects/stats` | Aggregate token stats across projects |
+| `POST` | `/api/projects/stats` | Aggregate token stats across projects (optional `tags: {folder: [idx,...]}` in body) |
 | `GET` | `/api/projects/:folder/conversations` | Paginated conversations |
 | `GET` | `/api/projects/:folder/archived` | Archived conversations |
 | `POST` | `/api/projects/:folder/stats` | Aggregate stats for a project |
@@ -180,6 +203,10 @@ LLM_LENS_DEBUG=1 llm-lens-web
 | `POST` | `/api/projects/:folder/conversations/bulk-archive` | Bulk archive |
 | `POST` | `/api/projects/:folder/conversations/bulk-unarchive` | Bulk unarchive |
 | `DELETE` | `/api/projects/:folder` | Delete an entire project |
+| `GET` | `/api/projects/:folder/tags` | Label definitions + per-conversation assignments |
+| `PUT` | `/api/projects/:folder/tags/labels` | Replace label definitions (max 5; `{labels: [{name, color}, ...]}`) |
+| `POST` | `/api/projects/:folder/tags/assign` | Set tags for one conversation (`{convo_id, tags: [idx,...]}`) |
+| `POST` | `/api/projects/:folder/tags/bulk-assign` | Add or remove a single tag across many (`{ids, tag, add: bool}`) |
 | `GET` | `/api/word-lists` | Effective swears + filler lists |
 | `POST` | `/api/word-lists` | Persist user-curated lists |
 | `GET` | `/api/word-lists/defaults` | Shipped defaults |

@@ -543,3 +543,204 @@ def test_extract_empty_selection_returns_400(client, tmp_path):
         json={"uuids": []},
     )
     assert resp.status_code == 400
+
+
+
+# ----------------------------------------------------------------------------
+# /messages/<uuid>/edit — in-place text replacement. Preserves usage, uuid,
+# and parentUuid (same file-rewrite contract as delete/scrub). Prose-only:
+# messages containing tool_use / tool_result / thinking blocks must be
+# rejected because their shape carries structural meaning.
+# ----------------------------------------------------------------------------
+
+
+def _assistant_with_usage(uuid, parent, text, in_tokens, out_tokens):
+    return {
+        "uuid": uuid,
+        "parentUuid": parent,
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens},
+        },
+    }
+
+
+def test_edit_replaces_text_preserves_usage_and_chain(client, tmp_path):
+    path = tmp_path / "proj" / "s.jsonl"
+    write_jsonl(path, [
+        msg("u1", None, "what is 2+2"),
+        _assistant_with_usage("a1", "u1", "The answer is four.", 100, 20),
+        msg("u2", "a1", "thanks"),
+    ])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/a1/edit",
+        json={"text": "redacted"},
+    )
+    assert resp.status_code == 200
+
+    lines = read_jsonl(path)
+    edited = next(e for e in lines if e["uuid"] == "a1")
+    # Chain untouched.
+    assert edited["parentUuid"] == "u1"
+    # Usage (historical billing record) untouched.
+    assert edited["message"]["usage"]["input_tokens"] == 100
+    assert edited["message"]["usage"]["output_tokens"] == 20
+    # Content collapsed to a single text block holding the new text.
+    assert edited["message"]["content"] == [{"type": "text", "text": "redacted"}]
+    # Neighbours untouched — edit is local.
+    u1 = next(e for e in lines if e["uuid"] == "u1")
+    assert u1["message"]["content"] == [{"type": "text", "text": "what is 2+2"}]
+
+
+def test_edit_accepts_empty_string(client, tmp_path):
+    path = tmp_path / "proj" / "s.jsonl"
+    write_jsonl(path, [msg("u1", None, "original")])
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/u1/edit",
+        json={"text": ""},
+    )
+    assert resp.status_code == 200
+    lines = read_jsonl(path)
+    assert lines[0]["message"]["content"] == [{"type": "text", "text": ""}]
+
+
+def test_edit_rejects_missing_text_field(client, tmp_path):
+    path = tmp_path / "proj" / "s.jsonl"
+    write_jsonl(path, [msg("u1", None, "hi")])
+    # Body without `text` key.
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/u1/edit",
+        json={},
+    )
+    assert resp.status_code == 400
+    # Non-string `text`.
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/u1/edit",
+        json={"text": 42},
+    )
+    assert resp.status_code == 400
+
+
+def test_edit_rejects_message_with_tool_use_block(client, tmp_path):
+    """A message carrying a tool_use block can't be edited — the block links
+    to a tool_result elsewhere; blanket-replacing the content array would
+    break the pairing."""
+    path = tmp_path / "proj" / "s.jsonl"
+    write_jsonl(path, [tool_use_msg("t1", None, tool_id="tu1", text="I'll look that up.")])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/t1/edit",
+        json={"text": "anything"},
+    )
+    assert resp.status_code == 400
+    assert "prose-only" in resp.get_json()["error"]
+
+    # File unchanged — tool_use block still present.
+    lines = read_jsonl(path)
+    assert lines[0]["message"]["content"][1]["type"] == "tool_use"
+
+
+def test_edit_rejects_message_with_tool_result_block(client, tmp_path):
+    path = tmp_path / "proj" / "s.jsonl"
+    write_jsonl(path, [tool_result_msg("r1", None, tool_id="tu1", text="result")])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/r1/edit",
+        json={"text": "anything"},
+    )
+    assert resp.status_code == 400
+    assert "prose-only" in resp.get_json()["error"]
+
+
+def test_edit_rejects_message_with_thinking_block(client, tmp_path):
+    """Thinking blocks carry signature metadata and aren't user-visible;
+    editing would strip them."""
+    path = tmp_path / "proj" / "s.jsonl"
+    thinking_msg = {
+        "uuid": "th1",
+        "parentUuid": None,
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "answer"},
+                {"type": "thinking", "thinking": "let me reason", "signature": "sig"},
+            ],
+        },
+    }
+    write_jsonl(path, [thinking_msg])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/th1/edit",
+        json={"text": "new"},
+    )
+    assert resp.status_code == 400
+    assert "prose-only" in resp.get_json()["error"]
+
+    # File unchanged.
+    lines = read_jsonl(path)
+    assert any(b.get("type") == "thinking" for b in lines[0]["message"]["content"])
+
+
+def test_edit_returns_404_for_missing_message(client, tmp_path):
+    path = tmp_path / "proj" / "s.jsonl"
+    write_jsonl(path, [msg("u1", None, "hi")])
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/does-not-exist/edit",
+        json={"text": "x"},
+    )
+    assert resp.status_code == 404
+
+
+def test_edit_returns_404_for_missing_conversation(client, tmp_path):
+    resp = client.post(
+        "/api/projects/proj/conversations/nope/messages/u1/edit",
+        json={"text": "x"},
+    )
+    assert resp.status_code == 404
+
+
+def test_edit_invalidates_parse_cache(client, tmp_path):
+    """After an edit, reading the conversation back must show the new text —
+    the mtime-keyed parse cache needs to be invalidated."""
+    path = tmp_path / "proj" / "s.jsonl"
+    write_jsonl(path, [msg("u1", None, "original text")])
+    # Prime the cache.
+    pre = client.get("/api/projects/proj/conversations/s").get_json()
+    assert pre["main"][0]["content"] == "original text"
+
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/u1/edit",
+        json={"text": "new text"},
+    )
+    assert resp.status_code == 200
+
+    post = client.get("/api/projects/proj/conversations/s").get_json()
+    assert post["main"][0]["content"] == "new text"
+
+
+def test_edit_on_string_content_keeps_string_shape(client, tmp_path):
+    """Messages whose content was stored as a bare string (rather than a
+    list of text blocks) should still accept edits. The new text replaces
+    the string in place."""
+    path = tmp_path / "proj" / "s.jsonl"
+    # Build a message with string content directly (msg() uses list shape).
+    entry = {
+        "uuid": "u1",
+        "parentUuid": None,
+        "type": "user",
+        "message": {"role": "user", "content": "plain string content"},
+    }
+    write_jsonl(path, [entry])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/u1/edit",
+        json={"text": "replaced"},
+    )
+    assert resp.status_code == 200
+
+    lines = read_jsonl(path)
+    assert lines[0]["message"]["content"] == "replaced"

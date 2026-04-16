@@ -2,6 +2,7 @@
 
 import { state, setTheme, setFilter, setMode } from "./state.js";
 import { defineRoute, initRouter, navigate } from "./router.js";
+import { api } from "./api.js";
 import { updateEditButton } from "./toolbar.js";
 
 import * as Projects from "./views/projects.js";
@@ -135,6 +136,10 @@ const actions = {
 
   "transform-msg":    (_e, el) => Messages.transformMsg(el.dataset.uuid, el.dataset.kind || "scrub"),
   "open-transform-menu": (_e, el) => Messages.openTransformMenu(el.dataset.uuid, el),
+
+  "edit-msg":         (_e, el) => Messages.editMsg(el.dataset.uuid),
+  "save-edit-msg":    (_e, el) => Messages.saveEditMsg(el.dataset.uuid),
+  "cancel-edit-msg":  (_e, el) => Messages.cancelEditMsg(el.dataset.uuid),
   "bulk-transform":   (_e, el) => Messages.bulkTransform(el.dataset.kind || "scrub"),
   "open-bulk-transform-menu": (_e, el) => Messages.openBulkTransformMenu(el),
   "toggle-all-msgs":  (_e, el) => Messages.toggleAllMsgs(),
@@ -186,6 +191,22 @@ const actions = {
     if (state.view === "projects") Projects.setMode(mode);
     else if (state.view === "conversations") Conversations.setMode(mode);
   },
+
+  // Tags (conversations view)
+  "toggle-tag-filter":      (e, el) => { e.stopPropagation(); Conversations.toggleTagFilter(parseInt(el.dataset.tag)); },
+  "rename-tag-start":       (e, el) => { e.stopPropagation(); Conversations.renameTag(parseInt(el.dataset.tag)); },
+  "open-tag-assign-popup":  (e, el) => { e.stopPropagation(); Conversations.openTagAssignPopup(el); },
+  "apply-existing-tag":     (e, el) => { e.stopPropagation(); Conversations.applyExistingTag(parseInt(el.dataset.tag)); },
+  "create-and-assign-tag":  (e, el) => { e.stopPropagation(); Conversations.createAndAssignTag(parseInt(el.dataset.slot)); },
+
+  // Smart-select
+  "smart-select":      (e, el)  => { e.stopPropagation(); Conversations.toggleSmartSelect(el.dataset.preset); },
+  "smart-threshold":   (e)      => Conversations.setSmartThreshold(parseFloat(e.target.value)),
+
+  // Tags (messages view)
+  "remove-convo-tag":  (e, el)  => { e.stopPropagation(); Messages.removeConvoTag(parseInt(el.dataset.tag)); },
+  "open-tag-picker":   (e, el)  => { e.stopPropagation(); Messages.openTagPicker(el); },
+  "pick-convo-tag":    (e, el)  => { e.stopPropagation(); Messages.pickConvoTag(parseInt(el.dataset.tag)); },
 };
 
 // <select> and radio/checkbox inputs fire `change`, not `click` — delegate
@@ -193,6 +214,15 @@ const actions = {
 document.body.addEventListener("change", (e) => {
   const el = e.target;
   if (!el.matches || !el.matches("select[data-action], input[data-action]")) return;
+  const handler = actions[el.dataset.action];
+  if (handler) handler(e, el);
+});
+
+// Range sliders fire `input` on every drag tick for real-time threshold
+// updates (smart-select).
+document.body.addEventListener("input", (e) => {
+  const el = e.target;
+  if (!el.matches || el.type !== "range" || !el.dataset.action) return;
   const handler = actions[el.dataset.action];
   if (handler) handler(e, el);
 });
@@ -258,5 +288,14 @@ document.body.addEventListener("mouseover", (e) => {
     code.dataset.full = code.textContent;
   }
 });
+
+// Fetch the effective context-window plan once on boot. Sets state.planContextWindow
+// which contextWindowFor uses as an override. Fire-and-forget; if this races with
+// the first stats render, the next render will pick it up (re-renders are cheap).
+api.contextWindow().then((r) => {
+  if (r && typeof r.plan_window === "number") {
+    state.planContextWindow = r.plan_window;
+  }
+}).catch(() => {});
 
 initRouter();

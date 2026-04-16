@@ -499,58 +499,6 @@ def test_smoke_bulk_delete_conversations(client, tmp_path):
 # Transforms (scrub family) — every kind once
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("kind,text,assertion", [
-    ("scrub", "this whole message will become a dot",
-     lambda t: t == "."),
-    ("normalize_whitespace", "hello    world\n\n\n\nnext",
-     lambda t: t == "hello world\n\nnext"),
-    ("remove_swears", "this fucking line has fuck in it",
-     lambda t: "fuck" not in t.lower()),
-    ("remove_filler", "Certainly! Here is the answer.",
-     lambda t: "Certainly" not in t and "Here is the answer." in t),
-])
-def test_smoke_each_transform_applies_correctly(client, tmp_path, kind, text, assertion):
-    path = tmp_path / "proj" / "c.jsonl"
-    write_jsonl(path, [user_msg("u1", None, text)])
-
-    resp = client.post(
-        "/api/projects/proj/conversations/c/messages/u1/scrub",
-        json={"kind": kind},
-    )
-    assert resp.status_code == 200, resp.get_json()
-
-    after = json.loads(path.read_text())["message"]["content"][0]["text"]
-    assert assertion(after), f"{kind} produced unexpected output: {after!r}"
-
-
-def test_smoke_transform_preserves_usage(client, tmp_path):
-    """All Option-A transforms leave the assistant turn's `usage` field
-    untouched — this is the historical-billing contract."""
-    path = tmp_path / "proj" / "c.jsonl"
-    write_jsonl(path, [
-        user_msg("u1", None, "ask"),
-        assistant_msg("a1", "u1", "long detailed answer", in_t=500, out_t=200),
-    ])
-    pre = client.get("/api/projects/proj/conversations/c/stats").get_json()
-    client.post(
-        "/api/projects/proj/conversations/c/messages/a1/scrub",
-        json={"kind": "scrub"},
-    )
-    post = client.get("/api/projects/proj/conversations/c/stats").get_json()
-    assert post["input_tokens"] == pre["input_tokens"]
-    assert post["output_tokens"] == pre["output_tokens"]
-
-
-def test_smoke_transform_rejects_non_prose(client, tmp_path):
-    """Constraint guard: messages with tool_use blocks can't be transformed."""
-    path = tmp_path / "proj" / "c.jsonl"
-    write_jsonl(path, [bash_msg("a1", None, "grep foo .")])
-    resp = client.post(
-        "/api/projects/proj/conversations/c/messages/a1/scrub",
-        json={"kind": "scrub"},
-    )
-    assert resp.status_code == 400
-
 
 # ---------------------------------------------------------------------------
 # Word lists
@@ -625,13 +573,3 @@ def test_smoke_404s_on_missing_resources(client, tmp_path):
     assert client.post(
         "/api/projects/nope/conversations/none/duplicate"
     ).status_code == 404
-
-
-def test_smoke_unknown_transform_kind_400(client, tmp_path):
-    path = tmp_path / "proj" / "c.jsonl"
-    write_jsonl(path, [user_msg("u1", None, "hi")])
-    resp = client.post(
-        "/api/projects/proj/conversations/c/messages/u1/scrub",
-        json={"kind": "definitely-not-a-kind"},
-    )
-    assert resp.status_code == 400

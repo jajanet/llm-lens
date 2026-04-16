@@ -68,6 +68,22 @@ export const state = {
   overviewGroupBy: "none",
   overviewScope: null,   // null = global; or project folder id
   overview: null,
+
+  // Tag system
+  tagLabels: [],           // [{name, color}, ...] for current folder
+  tagAssignments: {},      // {convo_id: [tagIndex, ...]}
+  activeTagFilters: [],    // tag indices currently filtering (OR)
+  tagMode: null,           // null or {tagIndex: N} for click-to-assign
+
+  // Smart-select presets
+  smartSelect: null,       // null or {preset, threshold}
+  smartMatches: new Set(),
+
+  // Context-window plan for rendering `ctx %`. Populated on boot from
+  // /api/meta/context-window (env override or inferred from max observed).
+  // null until fetched; null lets contextWindowFor fall back to its own
+  // per-session heuristic.
+  planContextWindow: null,
 };
 
 export function persist(key, value) {

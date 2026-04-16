@@ -11,6 +11,24 @@ const app = document.getElementById("app");
 const bc = document.getElementById("breadcrumb");
 const PAGE_MSGS = 60;
 
+import { applyTransform } from "../transforms.js";
+
+const WORD_LIST_KINDS = new Set(["remove_swears", "remove_filler"]);
+
+function needsWordLists(kind) {
+  return WORD_LIST_KINDS.has(kind);
+}
+
+async function ensureWordLists() {
+  if (state.wordLists) return state.wordLists;
+  try {
+    state.wordLists = await api.getWordLists();
+  } catch {
+    state.wordLists = { swears: [], filler: [] };
+  }
+  return state.wordLists;
+}
+
 export async function show(folder, convoId) {
   state.view = "messages";
   state.folder = folder;
@@ -23,6 +41,7 @@ export async function show(folder, convoId) {
   await resolvePath(folder);
   renderBreadcrumb();
   hydrateConvoName(folder, convoId);
+  hydrateConvoTags();
 
   app.innerHTML = '<div class="loading">Loading...</div>';
   state.msgData = await api.messages(folder, convoId, { limit: PAGE_MSGS });
@@ -55,11 +74,101 @@ function renderBreadcrumb() {
   const copyBtn = state.convoId
     ? `<button class="copy-id-btn copy-id-btn-inline" data-action="copy-resume" data-id="${escAttr(state.convoId)}" title="Copy 'claude --resume ${escAttr(state.convoId)}'" aria-label="Copy resume command">${copyIconSvg()}</button>`
     : "";
+  // Tag pills for this conversation. Edit mode adds × to remove and + to add.
+  let tagsHtml = "";
+  if (state.convoId && state.tagLabels && state.tagLabels.length) {
+    const assigned = (state.tagAssignments || {})[state.convoId] || [];
+    const pills = assigned.map((i) => {
+      const label = state.tagLabels[i];
+      if (!label || !label.name) return "";
+      if (state.editMode) {
+        return `<span class="tag-pill tag-pill-sm tag-color-${label.color} tag-pill-removable" data-action="remove-convo-tag" data-tag="${i}" title="Click to remove">${esc(label.name)} <span class="tag-x">×</span></span>`;
+      }
+      return `<span class="tag-pill tag-pill-sm tag-color-${label.color}">${esc(label.name)}</span>`;
+    }).join("");
+    const hasLabels = state.tagLabels.some((l) => l && l.name);
+    const addBtn = state.editMode && hasLabels
+      ? `<button class="bc-tag-add" data-action="open-tag-picker" title="Add tag">+</button>`
+      : "";
+    if (pills || addBtn) {
+      tagsHtml = `<span class="bc-tags">${pills}${addBtn}</span>`;
+    }
+  }
   bc.innerHTML = `
     <a data-action="nav-projects">Projects</a> /
     <a data-action="nav-folder" data-folder="${escAttr(state.folder)}">${esc(state.path)}</a> /
-    <span class="bc-convo-name">${esc(display)}</span>${copyBtn}
+    <span class="bc-convo-name">${esc(display)}</span>${copyBtn}${tagsHtml}
   `;
+}
+
+
+// Fetch tag labels + assignments for this project so the breadcrumb can show
+// tag pills for the currently-open conversation and allow adding/removing.
+export async function hydrateConvoTags() {
+  try {
+    const data = await api.getTags(state.folder);
+    state.tagLabels = data.labels || [];
+    state.tagAssignments = data.assignments || {};
+  } catch {
+    state.tagLabels = state.tagLabels || [];
+    state.tagAssignments = state.tagAssignments || {};
+  }
+  renderBreadcrumb();
+}
+
+// Remove a tag from the current conversation (clicked × on a pill in bc).
+export async function removeConvoTag(tagIndex) {
+  if (!state.convoId) return;
+  const current = (state.tagAssignments[state.convoId] || []).filter((i) => i !== tagIndex);
+  state.tagAssignments[state.convoId] = current;
+  try {
+    await api.assignTags(state.folder, state.convoId, current);
+  } catch { /* best-effort */ }
+  renderBreadcrumb();
+}
+
+// Show a small dropdown of the project's named tags next to the "+" button
+// in the breadcrumb. Click one to toggle it on the current conversation.
+export function openTagPicker(anchorEl) {
+  document.querySelectorAll(".tag-picker").forEach((el) => el.remove());
+  if (!state.convoId || !state.tagLabels) return;
+  const assigned = new Set(state.tagAssignments[state.convoId] || []);
+  const available = state.tagLabels.map((l, i) => ({ ...l, i })).filter((l) => l.name);
+  if (!available.length) return;
+  const pills = available.map((l) =>
+    `<span class="tag-pill tag-pill-sm tag-color-${l.color}${assigned.has(l.i) ? " active" : ""}" data-action="pick-convo-tag" data-tag="${l.i}" title="${assigned.has(l.i) ? "Remove" : "Add"} '${escAttr(l.name)}'">${esc(l.name)}</span>`
+  ).join("");
+  const picker = document.createElement("div");
+  picker.className = "tag-picker";
+  picker.innerHTML = pills;
+  document.body.appendChild(picker);
+  const rect = anchorEl.getBoundingClientRect();
+  picker.style.top = `${rect.bottom + 4 + window.scrollY}px`;
+  picker.style.left = `${rect.left + window.scrollX}px`;
+  // Close when clicking outside
+  setTimeout(() => {
+    const close = (e) => {
+      if (!picker.contains(e.target)) {
+        picker.remove();
+        document.removeEventListener("click", close);
+      }
+    };
+    document.addEventListener("click", close);
+  }, 0);
+}
+
+export async function pickConvoTag(tagIndex) {
+  if (!state.convoId) return;
+  const current = new Set(state.tagAssignments[state.convoId] || []);
+  if (current.has(tagIndex)) current.delete(tagIndex);
+  else current.add(tagIndex);
+  const next = [...current].sort();
+  state.tagAssignments[state.convoId] = next;
+  try {
+    await api.assignTags(state.folder, state.convoId, next);
+  } catch { /* best-effort */ }
+  document.querySelectorAll(".tag-picker").forEach((el) => el.remove());
+  renderBreadcrumb();
 }
 
 function renderToolbar() {
@@ -181,7 +290,8 @@ function processContent(raw, commands) {
   const visible = c.replace(/__THINK_\d+__/g, "").replace(/__TOOL_\d+__/g, "").trim();
   const hasText = Boolean(visible);
   const hasTools = toolBadges.length > 0;
-  if (!hasText && !thinkingBlocks.length && !hasTools) return { html: "", hasText: false, toolNames: [] };
+  const hasThinking = thinkingBlocks.length > 0;
+  if (!hasText && !hasThinking && !hasTools) return { html: "", hasText: false, toolNames: [], hasThinking: false };
 
   c = esc(c);
   if (state.showWhitespace) {
@@ -191,7 +301,7 @@ function processContent(raw, commands) {
   thinkingBlocks.forEach((html, i) => { c = c.replace(`__THINK_${i}__`, html); });
   toolBadges.forEach((html, i) => { c = c.replace(`__TOOL_${i}__`, html); });
   c = c.replace(/\n/g, "<br>");
-  return { html: c, hasText, toolNames };
+  return { html: c, hasText, toolNames, hasThinking };
 }
 
 
@@ -236,7 +346,7 @@ function renderChatMessages(msgs, query) {
     const c = processContent(m.content || "", m.commands);
     if (!c.html) continue;
     const finalHtml = query ? highlightText(c.html, query) : c.html;
-    processed.push({ m, html: finalHtml, hasText: c.hasText, toolNames: c.toolNames });
+    processed.push({ m, html: finalHtml, hasText: c.hasText, toolNames: c.toolNames, hasThinking: c.hasThinking });
   }
 
   const qLower = (query || "").toLowerCase();
@@ -286,16 +396,18 @@ function renderChatMessages(msgs, query) {
 const expandedGroups = new Set();
 
 function renderSingleMsg(p, compact) {
-  const { m, html: c, hasText, toolNames } = p;
+  const { m, html: c, hasText, toolNames, hasThinking } = p;
   const role = m.role === "user" ? "user" : "assistant";
   const ck = state.msgSelected.has(m.uuid) ? "checked" : "";
   const checkHtml = m.uuid
     ? `<input type="checkbox" class="chat-check" ${ck} data-action="toggle-msg-sel" data-uuid="${escAttr(m.uuid)}">`
     : "";
-  const proseOnly = m.uuid && hasText && !(toolNames && toolNames.length);
+  // proseOnly matches backend `_is_prose_only`: text blocks only. Tool and
+  // thinking blocks carry structural meaning and must not be editable.
+  const proseOnly = m.uuid && hasText && !(toolNames && toolNames.length) && !hasThinking;
   const transformBtn = proseOnly
     ? `<span class="split-btn">
-        <button class="btn btn-sm" data-action="transform-msg" data-uuid="${escAttr(m.uuid)}" data-kind="scrub" title="Scrub: replace text with '.'. Preserves usage/stats and resume chain.">Scrub</button>
+        <button class="btn btn-sm" data-action="edit-msg" data-uuid="${escAttr(m.uuid)}" title="Edit this message's text in place. Preserves usage/stats and resume chain.">Edit</button>
         <button class="btn btn-sm split-arrow" data-action="open-transform-menu" data-uuid="${escAttr(m.uuid)}" title="More text transforms">▾</button>
       </span>`
     : "";
@@ -308,10 +420,11 @@ function renderSingleMsg(p, compact) {
     : "";
   const ts = m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : "";
   const bubbleCls = compact ? "chat-bubble tool-bubble" : "chat-bubble";
+  const bubbleUuidAttr = m.uuid ? ` data-uuid="${escAttr(m.uuid)}"` : "";
   const metaHtml = compact
     ? ""
     : `<div class="chat-meta"><span class="role-lbl">${role}</span><span>${ts}</span></div>`;
-  return `<div class="chat-msg ${role}${compact ? " compact" : ""}">${checkHtml}<div class="${bubbleCls}">${actionsHtml}${metaHtml}<div class="msg-content">${c}</div></div></div>`;
+  return `<div class="chat-msg ${role}${compact ? " compact" : ""}">${checkHtml}<div class="${bubbleCls}"${bubbleUuidAttr}>${actionsHtml}${metaHtml}<div class="msg-content">${c}</div></div></div>`;
 }
 
 function renderToolGroup(items, groupId, expanded) {
@@ -496,8 +609,12 @@ export async function transformMsg(uuid, kind = "scrub") {
     title: `${TRANSFORM_LABELS[kind]}?`,
     body,
     onConfirm: async () => {
+      const m = (state.msgData?.main || []).find((x) => x.uuid === uuid);
+      if (!m) return;
+      const lists = needsWordLists(kind) ? await ensureWordLists() : {};
+      const newText = applyTransform(kind, m.content || "", lists);
       try {
-        await api.transformMessage(state.folder, state.convoId, uuid, kind);
+        await api.editMessage(state.folder, state.convoId, uuid, newText);
       } catch (e) {
         alert(`Transform failed: ${e.message}`);
         return;
@@ -505,6 +622,74 @@ export async function transformMsg(uuid, kind = "scrub") {
       show(state.folder, state.convoId);
     },
   });
+}
+
+
+function cssUuid(uuid) {
+  if (window.CSS && typeof CSS.escape === "function") return CSS.escape(uuid);
+  return String(uuid).replace(/["\\]/g, "\\$&");
+}
+
+function autosizeEditTa(ta) {
+  ta.style.height = "auto";
+  ta.style.height = Math.max(80, ta.scrollHeight + 4) + "px";
+}
+
+export function editMsg(uuid) {
+  const menu = document.querySelector(".transform-menu");
+  if (menu) menu.remove();
+  const m = (state.msgData?.main || []).find((x) => x.uuid === uuid);
+  if (!m) return;
+  const bubble = document.querySelector(`.chat-bubble[data-uuid="${cssUuid(uuid)}"]`);
+  if (!bubble || bubble.classList.contains("editing")) return;
+  const content = bubble.querySelector(".msg-content");
+  const actions = bubble.querySelector(".msg-actions-row");
+  if (!content) return;
+
+  bubble.classList.add("editing");
+  bubble._origContent = content.innerHTML;
+  if (actions) bubble._origActions = actions.innerHTML;
+
+  content.innerHTML =
+    `<textarea class="msg-edit-ta" spellcheck="false"></textarea>` +
+    `<div class="msg-edit-hint">Rewrites the file in place. Preserves usage/stats and resume chain — same caveats as scrub.</div>`;
+  const ta = content.querySelector("textarea");
+  ta.value = m.content || "";
+  if (actions) {
+    actions.innerHTML =
+      `<button class="btn btn-sm" data-action="save-edit-msg" data-uuid="${escAttr(uuid)}">Save</button>` +
+      `<button class="btn btn-sm" data-action="cancel-edit-msg" data-uuid="${escAttr(uuid)}">Cancel</button>`;
+  }
+  ta.focus();
+  autosizeEditTa(ta);
+  ta.addEventListener("input", () => autosizeEditTa(ta));
+}
+
+export async function saveEditMsg(uuid) {
+  const bubble = document.querySelector(`.chat-bubble[data-uuid="${cssUuid(uuid)}"]`);
+  if (!bubble) return;
+  const ta = bubble.querySelector(".msg-edit-ta");
+  if (!ta) return;
+  const text = ta.value;
+  try {
+    await api.editMessage(state.folder, state.convoId, uuid, text);
+  } catch (e) {
+    alert(`Edit failed: ${e.message}`);
+    return;
+  }
+  show(state.folder, state.convoId);
+}
+
+export function cancelEditMsg(uuid) {
+  const bubble = document.querySelector(`.chat-bubble[data-uuid="${cssUuid(uuid)}"]`);
+  if (!bubble) return;
+  const content = bubble.querySelector(".msg-content");
+  const actions = bubble.querySelector(".msg-actions-row");
+  if (content && bubble._origContent != null) content.innerHTML = bubble._origContent;
+  if (actions && bubble._origActions != null) actions.innerHTML = bubble._origActions;
+  bubble.classList.remove("editing");
+  delete bubble._origContent;
+  delete bubble._origActions;
 }
 
 export function openTransformMenu(uuid, anchorEl) {
@@ -517,11 +702,13 @@ export function openTransformMenu(uuid, anchorEl) {
   const menu = document.createElement("div");
   menu.className = "transform-menu";
   menu.dataset.uuid = uuid;
+  const editItem =
+    `<button class="btn btn-sm transform-menu-item" data-action="edit-msg" data-uuid="${uuid}">Edit (rewrite text)</button>`;
   const items = Object.entries(TRANSFORM_LABELS)
     .map(([kind, label]) =>
       `<button class="btn btn-sm transform-menu-item" data-action="transform-msg" data-uuid="${uuid}" data-kind="${kind}">${label}</button>`
     ).join("");
-  menu.innerHTML = items +
+  menu.innerHTML = editItem + items +
     `<div class="transform-menu-sep"></div>` +
     `<button class="btn btn-sm transform-menu-item" data-action="open-word-lists">Curate word lists…</button>`;
   const rect = anchorEl.getBoundingClientRect();
@@ -607,6 +794,8 @@ export async function openWordListsModal() {
         alert(`Save failed: ${err.message}`);
         return;
       }
+      // Invalidate cached lists so the next transform fetches the fresh copy.
+      state.wordLists = null;
       close();
     }
   });
@@ -617,10 +806,15 @@ export async function bulkTransform(kind = "scrub") {
   if (!ids.length) return;
   const label = TRANSFORM_LABELS[kind] || kind;
   if (!confirm(`${label} for ${ids.length} selected message(s)? Non-prose messages will be skipped.`)) return;
+  const lists = needsWordLists(kind) ? await ensureWordLists() : {};
+  const byId = new Map((state.msgData?.main || []).map((m) => [m.uuid, m]));
   let ok = 0, skipped = 0, errored = 0;
   for (const id of ids) {
+    const m = byId.get(id);
+    if (!m) { errored++; continue; }
+    const newText = applyTransform(kind, m.content || "", lists);
     try {
-      await api.transformMessage(state.folder, state.convoId, id, kind);
+      await api.editMessage(state.folder, state.convoId, id, newText);
       ok++;
     } catch (e) {
       if ((e.message || "").startsWith("400")) skipped++;
