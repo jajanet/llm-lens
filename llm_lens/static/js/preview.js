@@ -103,7 +103,7 @@ export function computeRows(kind, candidates, opts) {
   for (const m of candidates) {
     const before = m.content || "";
     let after;
-    try { after = applyTransform(kind, before, opts); }
+    try { after = applyTransform(kind, before, { ...opts, role: m.role }); }
     catch { continue; }
     if (after === before) continue;
     const ops = diffWords(before, after);

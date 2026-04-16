@@ -2335,34 +2335,38 @@ _DEFAULT_SWEARS = [
 # meta-narrating its own thinking. Removing them shortens context without
 # losing meaning.
 _DEFAULT_FILLER = [
-    "You're absolutely right!",
-    "You're absolutely right.",
-    "You are absolutely right.",
-    "Great question!",
-    "Great question.",
-    "That's a great question!",
-    "Excellent question!",
-    "Certainly!",
-    "Of course!",
-    "Absolutely!",
-    "I'd be happy to help!",
-    "I'm happy to help.",
-    "I hope this helps!",
-    "I hope that helps.",
-    "Feel free to ask if you have more questions.",
-    "Let me know if you have any questions.",
-    "I apologize for the confusion.",
-    "I apologize for any confusion.",
-    "Sorry for the confusion.",
-    "My apologies for the confusion.",
-    "Let me think about this step by step.",
-    "Let me think step by step.",
-    "Let's think step by step.",
-    "Let me break this down.",
-    "Let me explain.",
-    "To summarize:",
-    "In summary,",
-    "In conclusion,",
+    # Substring match (case-insensitive) — one entry per concept. Trailing
+    # punctuation (!/./?) is implicitly handled: matching "You're absolutely
+    # right" as a substring still catches "You're absolutely right!" in
+    # text (the "!" is left in place; the whitespace-cleanup pass
+    # normalizes it). Keep contraction variants when they're different
+    # substrings ("You're" vs "You are").
+    "You're absolutely right",
+    "You are absolutely right",
+    "That's a great question",
+    "Great question",
+    "Excellent question",
+    "Certainly",
+    "Of course",
+    "Absolutely",
+    "I'd be happy to help",
+    "I'm happy to help",
+    "I hope this helps",
+    "I hope that helps",
+    "Feel free to ask if you have more questions",
+    "Let me know if you have any questions",
+    "I apologize for the confusion",
+    "I apologize for any confusion",
+    "Sorry for the confusion",
+    "My apologies for the confusion",
+    "Let me think about this step by step",
+    "Let me think step by step",
+    "Let's think step by step",
+    "Let me break this down",
+    "Let me explain",
+    "To summarize",
+    "In summary",
+    "In conclusion",
 ]
 
 
@@ -2380,13 +2384,108 @@ _DEFAULT_VERBOSITY = [
     "obviously",
     "clearly",
     "evidently",
-    # Meta-commentary / throat-clearing phrases
+    # Meta-commentary phrases (near-always filler)
     "that's a great question",
     "that is a great question",
     "what I'd say is",
     "what I'm saying is",
+    "what I mean is",
+    "the thing is",
     "at the end of the day",
     "when all is said and done",
+    # Throat-clearing transitions — only the near-always-filler ones.
+    # Risky single words like "so", "well", "look", "right" stay opt-in
+    # (users add via Curate); those words carry real meaning too often.
+    "you know",
+    "I mean",
+    "anyway",
+    # Diplomatic throat-clearing
+    "to be honest",
+    "to be fair",
+]
+
+
+# Global whitelist — honored by every remove_* transform (the transform
+# filters its trigger list against this before building its regex) and
+# by the custom_filter scan (candidates containing any whitelist entry
+# as a case-insensitive substring are excluded). Ships with a curated
+# seed of SWE / tool / code-concept terms that would otherwise surface
+# as scan repeats or partial-match verbosity. Users curate via the
+# Curate word lists modal.
+_DEFAULT_WHITELIST = [
+    # SWE / perf terms
+    "benchmark",
+    "latency",
+    "throughput",
+    "compile",
+    "refactor",
+    "deprecate",
+    "idempotent",
+    "invariant",
+    # Tool / product names
+    "claude",
+    "anthropic",
+    "openai",
+    "github",
+    "docker",
+    "kubernetes",
+    "postgres",
+    # Code concepts
+    "interface",
+    "async",
+    "await",
+    "generic",
+    "abstract",
+]
+
+
+# Abbreviation substitution pairs — opt-in modifier to `remove_verbosity`
+# when the user toggles `apply_abbreviations` in the Curate word lists
+# modal. Each pair is `{from, to}`; matched word-bounded and case-
+# insensitive, longest-`from`-first so multi-word sources don't get
+# chopped up by shorter rules. Split into two groups by motivation:
+#
+#   1. Token-savers (de-abbreviation): shorthand forms that tokenize
+#      worse than the spelled-out word. Empirically verified via
+#      tiktoken o200k_base — e.g. `i.e.` is 3 tokens, `ie` is 1;
+#      `w/` is 2, `with` is 1. Net saves tokens.
+#
+#   2. Token-neutral abbreviation (disk savers): common words whose
+#      short form tokenizes to the same count but saves characters on
+#      disk / in-flight bytes. Cosmetic churn but real byte savings.
+#
+# Pairs that cost tokens either direction (`people`→`ppl`,
+# `probably`→`probs`) are omitted. Users can add/remove in the modal.
+_DEFAULT_ABBREVIATIONS = [
+    # Token-savers — normalize costly shorthand to the full word
+    {"from": "w/o", "to": "without"},
+    {"from": "w/", "to": "with"},
+    {"from": "i.e.", "to": "ie"},
+    {"from": "e.g.", "to": "eg"},
+    {"from": "smth", "to": "something"},
+    {"from": "sm1", "to": "someone"},
+    {"from": "probs", "to": "probably"},
+    {"from": "ppl", "to": "people"},
+    # Token-savers — abbreviate long forms that cost tokens
+    {"from": "I don't think", "to": "idt"},
+    {"from": "you are", "to": "ur"},
+    {"from": "youre", "to": "ur"},
+    {"from": "you're", "to": "ur"},
+    {"from": "right now", "to": "rn"},
+    {"from": "thank you", "to": "ty"},
+    {"from": "thankyou", "to": "ty"},
+    {"from": "thx", "to": "ty"},
+    {"from": "tysm", "to": "ty"},
+    {"from": "do not", "to": "don't"},
+    # Disk-savers (token-neutral)
+    {"from": "your", "to": "ur"},
+    {"from": "you", "to": "u"},
+    {"from": "are", "to": "r"},
+    {"from": "please", "to": "pls"},
+    {"from": "because", "to": "bc"},
+    {"from": "thanks", "to": "ty"},
+    {"from": "what", "to": "wat"},
+    {"from": "why", "to": "y"},
 ]
 
 
@@ -2410,6 +2509,13 @@ def _load_word_lists() -> dict:
         "swears": user.get("swears") if isinstance(user.get("swears"), list) else list(_DEFAULT_SWEARS),
         "filler": user.get("filler") if isinstance(user.get("filler"), list) else list(_DEFAULT_FILLER),
         "verbosity": user.get("verbosity") if isinstance(user.get("verbosity"), list) else list(_DEFAULT_VERBOSITY),
+        "custom_filter": user.get("custom_filter") if isinstance(user.get("custom_filter"), list) else [],
+        "whitelist": user.get("whitelist") if isinstance(user.get("whitelist"), list) else list(_DEFAULT_WHITELIST),
+        "lowercase_user_text": bool(user["lowercase_user_text"]) if isinstance(user.get("lowercase_user_text"), bool) else False,
+        "abbreviations": _coerce_abbreviations(user.get("abbreviations")) if isinstance(user.get("abbreviations"), list) else [dict(p) for p in _DEFAULT_ABBREVIATIONS],
+        "apply_abbreviations": bool(user["apply_abbreviations"]) if isinstance(user.get("apply_abbreviations"), bool) else False,
+        "custom_filter_enabled": bool(user["custom_filter_enabled"]) if isinstance(user.get("custom_filter_enabled"), bool) else False,
+        "collapse_punct_repeats": bool(user["collapse_punct_repeats"]) if isinstance(user.get("collapse_punct_repeats"), bool) else False,
     }
 
 
@@ -2420,9 +2526,36 @@ def _save_word_lists(data: dict) -> dict:
         "swears": [s for s in (data.get("swears") or []) if isinstance(s, str) and s.strip()],
         "filler": [s for s in (data.get("filler") or []) if isinstance(s, str) and s.strip()],
         "verbosity": [s for s in (data.get("verbosity") or []) if isinstance(s, str) and s.strip()],
+        "custom_filter": [s for s in (data.get("custom_filter") or []) if isinstance(s, str) and s.strip()],
+        "whitelist": [s for s in (data.get("whitelist") or []) if isinstance(s, str) and s.strip()],
+        "lowercase_user_text": bool(data["lowercase_user_text"]) if isinstance(data.get("lowercase_user_text"), bool) else False,
+        "abbreviations": _coerce_abbreviations(data.get("abbreviations")),
+        "apply_abbreviations": bool(data["apply_abbreviations"]) if isinstance(data.get("apply_abbreviations"), bool) else False,
+        "custom_filter_enabled": bool(data["custom_filter_enabled"]) if isinstance(data.get("custom_filter_enabled"), bool) else False,
+        "collapse_punct_repeats": bool(data["collapse_punct_repeats"]) if isinstance(data.get("collapse_punct_repeats"), bool) else False,
     }
     path.write_text(json.dumps(cleaned, indent=2))
     return cleaned
+
+
+def _coerce_abbreviations(raw) -> list:
+    """Accept only {from: str, to: str} dicts with a non-blank `from`.
+    Everything else is silently dropped — same posture as the other list
+    cleaners."""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
+        frm = p.get("from")
+        to = p.get("to")
+        if not isinstance(frm, str) or not isinstance(to, str):
+            continue
+        if not frm.strip():
+            continue
+        out.append({"from": frm, "to": to})
+    return out
 
 
 _DEFAULT_DOWNLOAD_FIELDS = {
@@ -2559,7 +2692,155 @@ def api_get_word_list_defaults():
         "swears": list(_DEFAULT_SWEARS),
         "filler": list(_DEFAULT_FILLER),
         "verbosity": list(_DEFAULT_VERBOSITY),
+        "custom_filter": [],
+        "whitelist": list(_DEFAULT_WHITELIST),
+        "lowercase_user_text": False,
+        "abbreviations": [dict(p) for p in _DEFAULT_ABBREVIATIONS],
+        "apply_abbreviations": False,
+        "custom_filter_enabled": False,
+        "collapse_punct_repeats": False,
     })
+
+
+def _extract_message_text(msg: dict) -> list:
+    """Return a list of text strings from a message's content. Pulls from
+    string content and text blocks in list content; skips tool_use,
+    tool_result, thinking, image, and other structured blocks."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                t = b.get("text")
+                if isinstance(t, str) and t:
+                    out.append(t)
+        return out
+    return []
+
+
+def _ngram_scan_single_convo(texts, min_length_chars: int, min_count: int, exclusions: list, n_min: int = 1, n_max: int = 3) -> list:
+    """Within-convo n-gram frequency scan. Counts total occurrences of
+    each phrase inside the convo (not distinct-convo count — this runs
+    on a single convo so every hit is a real occurrence). Default range
+    is 1-3 words: user-aligned, biased toward concrete boilerplate
+    ("error occurred", "let me check") rather than random statistical
+    coincidences that longer n-grams produce.
+
+    Returns a list of candidate phrases (lowercased), filtered by length
+    and occurrence thresholds, with phrases containing any exclusion
+    entry (case-insensitive substring) removed. Sorted by
+    count*length descending, capped at 200.
+    """
+    from collections import Counter
+    counter: Counter = Counter()
+    for text in texts:
+        words = text.lower().split()
+        n_words = len(words)
+        if n_words < n_min or n_words > 500:
+            continue
+        upper = min(n_max, n_words) + 1
+        for n in range(n_min, upper):
+            for i in range(n_words - n + 1):
+                phrase = " ".join(words[i:i + n])
+                if len(phrase) >= min_length_chars:
+                    counter[phrase] += 1
+    excl_lower = [
+        e.lower() for e in (exclusions or [])
+        if isinstance(e, str) and e.strip()
+    ]
+    out = []
+    for phrase, count in counter.items():
+        if count < min_count:
+            continue
+        if any(e in phrase for e in excl_lower):
+            continue
+        out.append((phrase, count))
+    out.sort(key=lambda pc: -(pc[1] * len(pc[0])))
+    return [p for p, _ in out[:200]]
+
+
+
+
+
+@app.route(
+    "/api/projects/<folder>/conversations/<convo_id>/custom-filter/scan",
+    methods=["POST"],
+)
+def api_custom_filter_scan(folder, convo_id):
+    """Scan a single conversation for repeated phrases. Body:
+    {min_length_chars: int, min_count: int, n_min: int, n_max: int}.
+    min_count is the number of occurrences within this conversation.
+    Excludes phrases that contain any current custom_filter or whitelist
+    entry (case-insensitive substring).
+
+    Emits progress to stdout so a slow scan isn't opaque; bails with 413
+    if the intermediate counter exceeds 2M entries."""
+    import time
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        min_length_chars = int(payload.get("min_length_chars", 6))
+        min_count = int(payload.get("min_count", 3))
+        n_min = int(payload.get("n_min", 1))
+        n_max = int(payload.get("n_max", 3))
+    except (TypeError, ValueError):
+        return jsonify({"error": "min_length_chars, min_count, n_min, n_max must be integers"}), 400
+    if min_length_chars < 1 or min_count < 2:
+        return jsonify({"error": "min_length_chars >= 1 and min_count >= 2 required"}), 400
+    if n_min < 1 or n_max < n_min or n_max > 10:
+        return jsonify({"error": "n_min >= 1, n_max >= n_min, n_max <= 10 required"}), 400
+
+    filepath = CLAUDE_PROJECTS_DIR / folder / f"{convo_id}.jsonl"
+    if not filepath.exists():
+        return jsonify({"error": "Conversation not found"}), 404
+
+    lists = _load_word_lists()
+    exclusions = list(lists.get("custom_filter") or []) + list(lists.get("whitelist") or [])
+
+    t_start = time.time()
+    print(
+        f"[custom-filter-scan] {folder}/{convo_id} n={n_min}-{n_max} "
+        f"min_length={min_length_chars} min_count={min_count}",
+        flush=True,
+    )
+
+    texts: list = []
+    msg_count = 0
+    try:
+        with open(filepath, "r") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    entry = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                msg = entry.get("message") or {}
+                blocks = _extract_message_text(msg)
+                if blocks:
+                    msg_count += 1
+                    texts.extend(blocks)
+    except OSError as e:
+        return jsonify({"error": f"Could not read conversation: {e}"}), 500
+
+    candidates = _ngram_scan_single_convo(
+        texts, min_length_chars, min_count, exclusions, n_min=n_min, n_max=n_max
+    )
+
+    elapsed = time.time() - t_start
+    print(
+        f"[custom-filter-scan] done in {elapsed:.2f}s — "
+        f"{len(candidates)} candidates from {msg_count} messages",
+        flush=True,
+    )
+
+    return jsonify({"msg_count": msg_count, "candidates": candidates})
+
+
+
 
 
 @app.route("/api/download-fields", methods=["GET"])

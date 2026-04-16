@@ -595,6 +595,271 @@ def test_word_lists_post_persists_user_overrides(client, tmp_path, monkeypatch):
     assert "fuck*" not in again["swears"]
 
 
+
+def test_word_lists_defaults_includes_custom_filter_and_whitelist(client):
+    resp = client.get("/api/word-lists/defaults").get_json()
+    assert resp["custom_filter"] == []
+    assert "benchmark" in resp["whitelist"]
+    assert "claude" in resp["whitelist"]
+
+
+def test_word_lists_round_trip_custom_filter_and_whitelist(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_lens._word_lists_path",
+        lambda: tmp_path / "wl.json",
+    )
+    saved = client.post(
+        "/api/word-lists",
+        json={
+            "swears": ["heck"],
+            "filler": ["some phrase"],
+            "verbosity": [],
+            "custom_filter": ["repeated boilerplate here"],
+            "whitelist": ["keepme"],
+        },
+    ).get_json()
+    assert saved["custom_filter"] == ["repeated boilerplate here"]
+    assert saved["whitelist"] == ["keepme"]
+    # Reload via GET — user-provided whitelist fully replaces the default seed.
+    again = client.get("/api/word-lists").get_json()
+    assert again["whitelist"] == ["keepme"]
+    assert again["custom_filter"] == ["repeated boilerplate here"]
+
+
+def test_custom_filter_scan_returns_repeated_phrases_above_thresholds(client, tmp_path):
+    # Plant the same 3-word phrase three times across messages in one
+    # conversation; the scan should surface it (occurrence >= 3,
+    # length >= 6, n=1..3).
+    folder = tmp_path / "proj"
+    write_jsonl(folder / "convo.jsonl", [
+        msg("1", None, "hello let me check the status"),
+        msg("2", None, "ok let me check again"),
+        msg("3", None, "please let me check today"),
+    ])
+    resp = client.post(
+        "/api/projects/proj/conversations/convo/custom-filter/scan",
+        json={"min_length_chars": 6, "min_count": 3, "n_min": 1, "n_max": 3},
+    ).get_json()
+    assert resp["msg_count"] == 3
+    assert any("let me check" in c for c in resp["candidates"])
+
+
+def test_custom_filter_scan_ngram_lowercases_for_counting(client, tmp_path):
+    folder = tmp_path / "proj"
+    # Mixed case within one convo — should count as the same phrase.
+    write_jsonl(folder / "convo.jsonl", [
+        msg("1", None, "Let Me Check the LOGS here"),
+        msg("2", None, "LET ME check THE logs now"),
+        msg("3", None, "let me check the logs again"),
+    ])
+    resp = client.post(
+        "/api/projects/proj/conversations/convo/custom-filter/scan",
+        json={"min_length_chars": 8, "min_count": 3, "n_min": 3, "n_max": 5},
+    ).get_json()
+    assert any("let me check" in c for c in resp["candidates"])
+
+
+def test_custom_filter_scan_excludes_whitelist_containment(client, tmp_path, monkeypatch):
+    # User whitelists "benchmark" → any candidate phrase containing it is
+    # excluded, even though it repeats enough times to qualify.
+    monkeypatch.setattr(
+        "llm_lens._word_lists_path",
+        lambda: tmp_path / "wl.json",
+    )
+    client.post(
+        "/api/word-lists",
+        json={"whitelist": ["benchmark"]},
+    )
+    folder = tmp_path / "proj"
+    write_jsonl(folder / "convo.jsonl", [
+        msg(f"u{i}", None, "run the benchmark suite now please")
+        for i in range(3)
+    ])
+    resp = client.post(
+        "/api/projects/proj/conversations/convo/custom-filter/scan",
+        json={"min_length_chars": 6, "min_count": 3, "n_min": 1, "n_max": 3},
+    ).get_json()
+    assert not any("benchmark" in c for c in resp["candidates"])
+
+
+def test_custom_filter_scan_excludes_existing_custom_filter_entries(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_lens._word_lists_path",
+        lambda: tmp_path / "wl.json",
+    )
+    client.post(
+        "/api/word-lists",
+        json={"custom_filter": ["let me check"]},
+    )
+    folder = tmp_path / "proj"
+    write_jsonl(folder / "convo.jsonl", [
+        msg(f"u{i}", None, "ok let me check the logs please")
+        for i in range(3)
+    ])
+    resp = client.post(
+        "/api/projects/proj/conversations/convo/custom-filter/scan",
+        json={"min_length_chars": 6, "min_count": 3, "n_min": 1, "n_max": 3},
+    ).get_json()
+    # The exact phrase is in custom_filter, so any candidate containing it
+    # is filtered out (containment semantic).
+    assert not any("let me check" in c for c in resp["candidates"])
+
+
+def test_custom_filter_scan_rejects_bad_thresholds(client, tmp_path):
+    folder = tmp_path / "proj"
+    write_jsonl(folder / "convo.jsonl", [msg("1", None, "hi there")])
+    url = "/api/projects/proj/conversations/convo/custom-filter/scan"
+    assert client.post(url, json={"min_length_chars": 0, "min_count": 3}).status_code == 400
+    assert client.post(url, json={"min_length_chars": 8, "min_count": 1}).status_code == 400
+    assert client.post(url, json={"min_length_chars": 8, "min_count": 3, "n_min": 0, "n_max": 3}).status_code == 400
+    assert client.post(url, json={"min_length_chars": 8, "min_count": 3, "n_min": 5, "n_max": 3}).status_code == 400
+
+
+def test_custom_filter_scan_missing_convo_returns_404(client):
+    resp = client.post(
+        "/api/projects/nope/conversations/nope/custom-filter/scan",
+        json={"min_length_chars": 8, "min_count": 3, "n_min": 1, "n_max": 3},
+    )
+    assert resp.status_code == 404
+
+
+
+def test_word_list_defaults_includes_lowercase_user_text(client):
+    resp = client.get("/api/word-lists/defaults").get_json()
+    assert resp["lowercase_user_text"] is False
+
+
+def test_word_lists_round_trip_lowercase_user_text(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_lens._word_lists_path",
+        lambda: tmp_path / "wl.json",
+    )
+    saved = client.post(
+        "/api/word-lists",
+        json={"lowercase_user_text": True},
+    ).get_json()
+    assert saved["lowercase_user_text"] is True
+    again = client.get("/api/word-lists").get_json()
+    assert again["lowercase_user_text"] is True
+
+
+def test_word_lists_lowercase_user_text_rejects_non_bool(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_lens._word_lists_path",
+        lambda: tmp_path / "wl.json",
+    )
+    # Non-bool (e.g. the string "true") is coerced to False rather than
+    # accepted — matches the existing "invalid lists fall back to empty"
+    # posture.
+    saved = client.post(
+        "/api/word-lists",
+        json={"lowercase_user_text": "true"},
+    ).get_json()
+    assert saved["lowercase_user_text"] is False
+
+
+
+def test_word_list_defaults_includes_abbreviations(client):
+    resp = client.get("/api/word-lists/defaults").get_json()
+    assert resp["apply_abbreviations"] is False
+    assert isinstance(resp["abbreviations"], list)
+    assert len(resp["abbreviations"]) > 0
+    # Every default pair has from + to, from is non-blank.
+    for p in resp["abbreviations"]:
+        assert isinstance(p, dict)
+        assert isinstance(p["from"], str) and p["from"].strip()
+        assert isinstance(p["to"], str)
+    # Sanity check a couple of expected flips.
+    froms = [p["from"] for p in resp["abbreviations"]]
+    assert "w/" in froms
+    assert "i.e." in froms
+    assert "thank you" in froms
+    assert "ppl" in froms
+
+
+def test_word_lists_round_trip_abbreviations(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_lens._word_lists_path",
+        lambda: tmp_path / "wl.json",
+    )
+    saved = client.post(
+        "/api/word-lists",
+        json={
+            "abbreviations": [{"from": "imo", "to": "in my opinion"}],
+            "apply_abbreviations": True,
+        },
+    ).get_json()
+    assert saved["apply_abbreviations"] is True
+    assert saved["abbreviations"] == [{"from": "imo", "to": "in my opinion"}]
+    again = client.get("/api/word-lists").get_json()
+    assert again["apply_abbreviations"] is True
+    assert again["abbreviations"] == [{"from": "imo", "to": "in my opinion"}]
+
+
+def test_word_lists_abbreviations_drops_malformed_pairs(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_lens._word_lists_path",
+        lambda: tmp_path / "wl.json",
+    )
+    saved = client.post(
+        "/api/word-lists",
+        json={
+            "abbreviations": [
+                {"from": "valid", "to": "ok"},   # kept
+                {"from": "", "to": "blank"},       # dropped (blank from)
+                {"from": "missing_to"},             # dropped (no to)
+                "not-a-dict",                       # dropped
+                {"from": 42, "to": "num"},         # dropped (from not string)
+                {"from": "has-to", "to": ""},      # kept (empty to is fine)
+            ],
+        },
+    ).get_json()
+    assert saved["abbreviations"] == [
+        {"from": "valid", "to": "ok"},
+        {"from": "has-to", "to": ""},
+    ]
+
+
+
+def test_word_list_defaults_includes_custom_filter_enabled(client):
+    resp = client.get("/api/word-lists/defaults").get_json()
+    assert resp["custom_filter_enabled"] is False
+
+
+def test_word_lists_round_trip_custom_filter_enabled(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_lens._word_lists_path",
+        lambda: tmp_path / "wl.json",
+    )
+    saved = client.post(
+        "/api/word-lists",
+        json={"custom_filter_enabled": True},
+    ).get_json()
+    assert saved["custom_filter_enabled"] is True
+    again = client.get("/api/word-lists").get_json()
+    assert again["custom_filter_enabled"] is True
+
+
+
+def test_word_list_defaults_includes_collapse_punct_repeats(client):
+    resp = client.get("/api/word-lists/defaults").get_json()
+    assert resp["collapse_punct_repeats"] is False
+
+
+def test_word_lists_round_trip_collapse_punct_repeats(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "llm_lens._word_lists_path",
+        lambda: tmp_path / "wl.json",
+    )
+    saved = client.post(
+        "/api/word-lists",
+        json={"collapse_punct_repeats": True},
+    ).get_json()
+    assert saved["collapse_punct_repeats"] is True
+    again = client.get("/api/word-lists").get_json()
+    assert again["collapse_punct_repeats"] is True
+
+
 def _bash_assistant(uuid, parent, command, tid="b1"):
     return {
         "uuid": uuid,

@@ -339,3 +339,195 @@ def test_preview_css_exists(styles_css):
     assert ".preview-delta" in styles_css
     assert ".preview-inline" in styles_css
     assert ".preview-stacked" in styles_css
+
+
+
+@pytest.fixture(scope="module")
+def transforms_js():
+    return read(JS / "transforms.js")
+
+
+@pytest.fixture(scope="module")
+def pill_list_js():
+    return read(JS / "pill_list.js")
+
+
+@pytest.fixture(scope="module")
+def api_js():
+    return read(JS / "api.js")
+
+
+def test_word_list_kinds_includes_custom_filter(messages_js):
+    # The gate that decides whether a transform needs word lists must
+    # know about the new kind — otherwise the modal's Calculate-from-
+    # cache list never reaches the transform.
+    assert "remove_custom_filter" in messages_js
+    assert "WORD_LIST_KINDS" in messages_js
+
+
+def test_transform_labels_has_remove_custom_filter(messages_js):
+    assert "remove_custom_filter" in messages_js
+    assert "Remove custom filter" in messages_js
+
+
+def test_ensure_word_lists_fallback_includes_new_keys(messages_js):
+    # The fallback object (used when api.getWordLists() fails) must
+    # carry the new keys so downstream consumers don't crash.
+    assert "custom_filter" in messages_js
+    assert "whitelist" in messages_js
+
+
+def test_empty_custom_filter_guard_in_transform_paths(messages_js):
+    # Both single-message and bulk transform paths must guard against
+    # an empty custom_filter list — the alert points at Calculate from
+    # cache so the user knows where to go.
+    assert messages_js.count("Custom filter list is empty") >= 2
+
+
+def test_transforms_exports_filterByWhitelist(transforms_js):
+    assert "export function filterByWhitelist" in transforms_js
+
+
+def test_transforms_apply_wires_whitelist(transforms_js):
+    # The dispatch must filter every remove-* list against the whitelist
+    # before passing it into the strip functions.
+    assert "filterByWhitelist" in transforms_js
+    assert "remove_custom_filter" in transforms_js
+
+
+def test_pill_list_component_exports_mount(pill_list_js):
+    assert "export function mountPillList" in pill_list_js
+
+
+def test_pill_list_supports_backspace_and_enter(pill_list_js):
+    # Both deletion paths (× click, backspace on empty input) and both
+    # commit paths (Enter, + button) are part of the spec.
+    assert '"Backspace"' in pill_list_js
+    assert '"Enter"' in pill_list_js
+    assert "pill-remove" in pill_list_js
+    assert "pill-add-btn" in pill_list_js
+
+
+def test_api_has_scan_custom_filter(api_js):
+    assert "scanCustomFilter" in api_js
+    assert "/custom-filter/scan" in api_js
+    # Scan is now per-convo — URL includes folder + convo id placeholders.
+    assert "/api/projects/" in api_js and "/conversations/" in api_js
+
+
+def test_curate_modal_order_priming_first_custom_filter_last(messages_js):
+    # Modal order in openWordListsModal: Priming + Verbosity up top
+    # (those are the shipped-default, actually-useful ones), then
+    # Whitelist, then Custom filter last (experimental, de-emphasized).
+    idx_priming = messages_js.find("Priming language</strong>")
+    idx_verbosity = messages_js.find("Verbosity</strong>")
+    idx_whitelist = messages_js.find("Whitelist</strong>")
+    idx_cf = messages_js.find("Custom filter</strong>")
+    assert 0 < idx_priming < idx_verbosity < idx_whitelist < idx_cf
+
+
+def test_curate_modal_has_calculate_from_cache_button(messages_js):
+    assert 'data-calc="custom-filter"' in messages_js
+    assert "Calculate from cache" in messages_js
+    assert "cf-min-length" in messages_js
+    assert "cf-min-count" in messages_js
+
+
+def test_curate_modal_has_prune_whitelist_button(messages_js):
+    assert "data-prune-whitelist" in messages_js
+
+
+def test_pill_list_css_exists(styles_css):
+    assert ".pill-list" in styles_css
+    assert ".pill-remove" in styles_css
+    assert ".pill-input" in styles_css
+
+
+
+def test_priming_lowercase_user_text_checkbox_in_modal(messages_js):
+    # The checkbox must live inside the Priming language section — its
+    # effect is scoped to remove_priming on user-role text.
+    assert 'id="wl-lowercase-user-text"' in messages_js
+    assert "lowercase user-role text" in messages_js.lower()
+
+
+def test_ensure_word_lists_fallback_includes_lowercase_user_text(messages_js):
+    # If api.getWordLists() fails, the fallback object must carry the
+    # new key so downstream code doesn't crash.
+    assert "lowercase_user_text" in messages_js
+
+
+def test_apply_transform_accepts_lowercase_user_text_and_role(transforms_js):
+    assert "lowercase_user_text" in transforms_js
+    assert "role" in transforms_js
+
+
+
+def test_abbreviation_subsection_lives_under_verbosity(messages_js):
+    # Must appear inside the Verbosity section — the abbreviation
+    # substitution is gated behind that transform's checkbox.
+    idx_verbosity = messages_js.find("Verbosity</strong>")
+    idx_abbrev = messages_js.find("Abbreviation substitutions")
+    assert 0 < idx_verbosity < idx_abbrev
+
+
+def test_abbreviation_checkbox_in_modal(messages_js):
+    assert 'id="wl-apply-abbreviations"' in messages_js
+    assert "apply abbreviation substitutions" in messages_js.lower()
+
+
+def test_abbreviation_description_links_tokenizer_and_caveats(messages_js):
+    # User explicitly asked for a tokenizer link + caveats.
+    assert "claude-tokenizer.vercel.app" in messages_js or "tiktoken" in messages_js
+    assert "Caveats" in messages_js or "caveats" in messages_js
+
+
+def test_pill_pair_list_exported(pill_list_js):
+    assert "export function mountPillPairList" in pill_list_js
+
+
+def test_apply_transform_accepts_abbreviations_and_apply_flag(transforms_js):
+    assert "apply_abbreviations" in transforms_js
+    assert "applyAbbreviations" in transforms_js
+
+
+def test_ensure_word_lists_fallback_includes_abbreviations(messages_js):
+    assert "apply_abbreviations" in messages_js
+
+
+
+def test_custom_filter_enabled_checkbox_in_modal(messages_js):
+    assert 'id="wl-custom-filter-enabled"' in messages_js
+    assert "Show" in messages_js and "Remove custom filter" in messages_js
+
+
+def test_visible_transform_entries_gates_custom_filter(messages_js):
+    # The menu builder must filter remove_custom_filter out unless the
+    # custom_filter_enabled flag is on — keeps the split-button menu
+    # uncluttered for users who don't use the experimental feature.
+    assert "visibleTransformEntries" in messages_js
+    assert "custom_filter_enabled" in messages_js
+
+
+def test_ensure_word_lists_fallback_includes_custom_filter_enabled(messages_js):
+    # Fallback object must have the key so menu builders don't throw on
+    # boot when the API is unreachable.
+    assert "custom_filter_enabled: false" in messages_js or 'custom_filter_enabled":false' in messages_js
+
+
+
+def test_collapse_punct_checkbox_in_priming_section(messages_js):
+    # Lives inside the Priming section; same pattern as the lowercase
+    # checkbox. Off by default.
+    idx_priming = messages_js.find("Priming language</strong>")
+    idx_cb = messages_js.find('id="wl-collapse-punct"')
+    assert idx_priming > 0 and idx_cb > idx_priming
+    assert "collapse aggressive-repeat punctuation" in messages_js.lower()
+
+
+def test_transforms_exports_collapse_punct_repeats(transforms_js):
+    assert "export function collapsePunctRepeats" in transforms_js
+
+
+def test_ensure_word_lists_fallback_includes_collapse_punct_repeats(messages_js):
+    assert "collapse_punct_repeats: false" in messages_js or 'collapse_punct_repeats":false' in messages_js

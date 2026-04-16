@@ -22,7 +22,9 @@ import {
   downloadBlob,
 } from "../exports.js";
 
-const WORD_LIST_KINDS = new Set(["remove_swears", "remove_filler", "remove_verbosity", "remove_priming"]);
+import { mountPillList, mountPillPairList } from "../pill_list.js";
+
+const WORD_LIST_KINDS = new Set(["remove_swears", "remove_filler", "remove_verbosity", "remove_priming", "remove_custom_filter"]);
 
 function needsWordLists(kind) {
   return WORD_LIST_KINDS.has(kind);
@@ -33,7 +35,7 @@ async function ensureWordLists() {
   try {
     state.wordLists = await api.getWordLists();
   } catch {
-    state.wordLists = { swears: [], filler: [], verbosity: [] };
+    state.wordLists = { swears: [], filler: [], verbosity: [], custom_filter: [], whitelist: [], lowercase_user_text: false, abbreviations: [], apply_abbreviations: false, custom_filter_enabled: false, collapse_punct_repeats: false };
   }
   return state.wordLists;
 }
@@ -52,6 +54,10 @@ export async function show(folder, convoId) {
   renderBreadcrumb();
   hydrateConvoName(folder, convoId);
   hydrateConvoTags();
+
+  // Warm the word lists cache so synchronous menu builders can read
+  // flags like `custom_filter_enabled` without a round-trip.
+  ensureWordLists();
 
   app.innerHTML = '<div class="loading">Loading...</div>';
   state.msgData = await api.messages(folder, convoId, { limit: PAGE_MSGS });
@@ -642,7 +648,7 @@ export function openBulkTransformMenu(anchorEl) {
   const menu = document.createElement("div");
   menu.className = "transform-menu";
   menu.dataset.bulk = "1";
-  const items = Object.entries(TRANSFORM_LABELS)
+  const items = visibleTransformEntries()
     .map(([kind, label]) =>
       `<button class="btn btn-sm transform-menu-item" data-action="bulk-transform" data-kind="${kind}">${label}</button>`
     ).join("");
@@ -829,6 +835,7 @@ export const TRANSFORM_LABELS = {
   normalize_whitespace: "Normalize whitespace",
   remove_verbosity: "Remove verbosity",
   remove_priming: "Remove priming language",
+  remove_custom_filter: "Remove custom filter",
 };
 
 const TRANSFORM_CONFIRM = {
@@ -861,7 +868,29 @@ const TRANSFORM_CONFIRM = {
     <em>Curate word lists</em> if you want them gone too. Test for any
     candidate: remove it, and if the sentence still makes sense it was
     filler. Leaves <code>usage</code> and chain alone.`,
+  remove_custom_filter: `Strips phrases from your <strong>custom filter
+    list</strong> — repeated text you've derived from your own cache via
+    <em>Curate word lists → Calculate from cache</em>, plus anything
+    you've added by hand. Catches session-boundary boilerplate, repeated
+    scaffolding, and per-convo filler that the curated lists don't.
+    Matched case-insensitive exact substring. Every remove-* transform
+    honors the global <strong>whitelist</strong>, so entries containing
+    any whitelisted phrase are skipped. Leaves <code>usage</code> and
+    chain alone.`,
 };
+
+
+// Filters the transform menu to only show entries the user has opted into.
+// `remove_custom_filter` is hidden unless `custom_filter_enabled` is on in
+// the curation modal — the feature is experimental enough that we don't
+// want to clutter the split-button menu by default.
+function visibleTransformEntries() {
+  const enabled = state.wordLists?.custom_filter_enabled === true;
+  return Object.entries(TRANSFORM_LABELS).filter(([kind]) => {
+    if (kind === "remove_custom_filter" && !enabled) return false;
+    return true;
+  });
+}
 
 export async function transformMsg(uuid, kind = "scrub") {
   const body = TRANSFORM_CONFIRM[kind];
@@ -872,6 +901,11 @@ export async function transformMsg(uuid, kind = "scrub") {
   const m = (state.msgData?.main || []).find((x) => x.uuid === uuid);
   if (!m) return;
   const lists = needsWordLists(kind) ? await ensureWordLists() : {};
+
+  if (kind === "remove_custom_filter" && !(lists.custom_filter || []).length) {
+    alert("Custom filter list is empty. Open Curate word lists → Calculate from cache, or add entries manually.");
+    return;
+  }
 
   const doApply = async (newText) => {
     try {
@@ -887,7 +921,7 @@ export async function transformMsg(uuid, kind = "scrub") {
     const res = await showPreviewModal({
       kind,
       label: TRANSFORM_LABELS[kind],
-      candidates: [{ uuid, content: m.content || "" }],
+      candidates: [{ uuid, content: m.content || "", role: m.role }],
       opts: lists,
     });
     if (!res || !res.acceptedIds || res.acceptedIds.size === 0) return;
@@ -902,7 +936,7 @@ export async function transformMsg(uuid, kind = "scrub") {
   showConfirmModal({
     title: `${TRANSFORM_LABELS[kind]}?`,
     body,
-    onConfirm: () => doApply(applyTransform(kind, m.content || "", lists)),
+    onConfirm: () => doApply(applyTransform(kind, m.content || "", { ...lists, role: m.role })),
   });
 }
 
@@ -986,7 +1020,7 @@ export function openTransformMenu(uuid, anchorEl) {
   menu.dataset.uuid = uuid;
   const editItem =
     `<button class="btn btn-sm transform-menu-item" data-action="edit-msg" data-uuid="${uuid}">Edit (rewrite text)</button>`;
-  const items = Object.entries(TRANSFORM_LABELS)
+  const items = visibleTransformEntries()
     .map(([kind, label]) =>
       `<button class="btn btn-sm transform-menu-item" data-action="transform-msg" data-uuid="${uuid}" data-kind="${kind}">${label}</button>`
     ).join("");
@@ -1025,60 +1059,156 @@ export async function openWordListsModal() {
     return;
   }
 
-  // Back-compat for cached lists that predate the verbosity category.
+  // Back-compat for cached lists that predate later categories.
   current.verbosity = current.verbosity || [];
+  current.custom_filter = current.custom_filter || [];
+  current.whitelist = current.whitelist || [];
+  current.lowercase_user_text = current.lowercase_user_text === true;
+  current.abbreviations = Array.isArray(current.abbreviations) ? current.abbreviations : [];
+  current.apply_abbreviations = current.apply_abbreviations === true;
+  current.custom_filter_enabled = current.custom_filter_enabled === true;
+  current.collapse_punct_repeats = current.collapse_punct_repeats === true;
   defaults.verbosity = defaults.verbosity || [];
+  defaults.custom_filter = defaults.custom_filter || [];
+  defaults.whitelist = defaults.whitelist || [];
+  defaults.abbreviations = Array.isArray(defaults.abbreviations) ? defaults.abbreviations : [];
+
+  const folder = state.folder;
+  const convoId = state.convoId;
+  const msgTotal = state.msgData?.total ?? null;
+  const canScan = Boolean(folder && convoId);
 
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
   overlay.innerHTML = `
-    <div class="modal" style="max-width:720px">
+    <div class="modal wordlists-modal" style="max-width:720px; width:90vw">
       <h3>Curate word lists</h3>
       <p style="font-size:12px; color:var(--text3); margin:0 0 10px 0">
-        One entry per line. Empty list = category opt-out.
+        Each list is a set of entries matched case-insensitively. The
+        <strong>whitelist</strong> is global — entries containing any
+        whitelisted phrase are skipped by every remove-* transform.
       </p>
 
-      <details class="stats-section" open style="margin-bottom:8px">
-        <summary><strong>Verbosity</strong> <span style="color:var(--text3); font-weight:normal">(${current.verbosity.length} entries)</span></summary>
-        <div style="padding:8px 4px 4px">
-          <p style="font-size:12px; color:var(--text2); margin:0 0 6px 0">
-            Not about agent behavior — just token cost and readability.
-            Strips obviousness signalers ("obviously", "clearly", "of
-            course") and meta-commentary phrases ("that's a great
-            question", "at the end of the day"). Word-bounded,
-            case-insensitive. Default list is conservative; add sincerity
-            markers, intensifiers, or hedges yourself if you want them
-            gone too. Test for any candidate: remove it — if the sentence
-            still makes sense, it was filler.
-          </p>
-          <textarea id="wl-verbosity" rows="10" spellcheck="false" style="width:100%">${current.verbosity.join("\n")}</textarea>
-          <button class="btn btn-sm" data-reset="verbosity">Reset to defaults (${defaults.verbosity.length})</button>
-        </div>
-      </details>
+      <div class="modal-body wordlists-modal-body">
+        <details class="stats-section" open style="margin-bottom:8px">
+          <summary><strong>Priming language</strong> <span style="color:var(--text3); font-weight:normal" id="priming-count-badge">(${current.swears.length} swears + ${current.filler.length} drift phrases)</span></summary>
+          <div style="padding:8px 4px 4px">
+            <p style="font-size:12px; color:var(--text2); margin:0 0 8px 0">
+              Emotionally charged words and sycophancy in prior turns degrade
+              the next turn's output — see
+              <a href="https://dafmulder.substack.com/p/i-ran-1950-experiments-to-find-out" target="_blank" rel="noopener">Mulder's 1,950 experiments</a>
+              and
+              <a href="https://www.reddit.com/r/ClaudeAI/comments/1skmgef/emotional_priming_changes_claudes_code_more_than/" target="_blank" rel="noopener">community replication</a>
+              for the evidence base. Two sub-lists with different match
+              mechanisms; both are stripped in one pass when you hit
+              <em>Remove priming language</em>.
+            </p>
 
-      <details class="stats-section" open style="margin-bottom:8px">
-        <summary><strong>Priming language</strong> <span style="color:var(--text3); font-weight:normal">(${current.swears.length} swears + ${current.filler.length} drift phrases)</span></summary>
-        <div style="padding:8px 4px 4px">
-          <p style="font-size:12px; color:var(--text2); margin:0 0 8px 0">
-            Emotionally charged words and sycophancy in prior turns degrade
-            the next turn's output — see
-            <a href="https://dafmulder.substack.com/p/i-ran-1950-experiments-to-find-out" target="_blank" rel="noopener">Mulder's 1,950 experiments</a>
-            and
-            <a href="https://www.reddit.com/r/ClaudeAI/comments/1skmgef/emotional_priming_changes_claudes_code_more_than/" target="_blank" rel="noopener">community replication</a>
-            for the evidence base. Two sub-lists with different match
-            mechanisms; both are stripped in one pass when you hit
-            <em>Remove priming language</em>.
-          </p>
+            <label style="display:inline-flex; align-items:center; gap:6px; margin:0 0 10px 0; font-size:12px; color:var(--text2)">
+              <input type="checkbox" id="wl-lowercase-user-text" ${current.lowercase_user_text ? "checked" : ""}>
+              <span>Also lowercase user-role text on <em>Remove priming language</em> <span style="color:var(--text3)">— for capslock-rant reduction. Off by default. Only applies to messages with role=user, only during the combined <code>Remove priming language</code> action.</span></span>
+            </label>
 
-          <label style="display:block; margin-top:6px"><strong>Swears</strong> <span style="color:var(--text3); font-weight:normal">— word-bounded, case-insensitive. Append <code>*</code> to a stem for conjugations (<code>fuck*</code> → fuck/fucks/fucker/fucking); bare words match exactly so <code>ass</code> won't blow up <code>assistant</code>.</span></label>
-          <textarea id="wl-swears" rows="8" spellcheck="false" style="width:100%">${current.swears.join("\n")}</textarea>
-          <button class="btn btn-sm" data-reset="swears">Reset swears to defaults (${defaults.swears.length})</button>
+            <label style="display:inline-flex; align-items:center; gap:6px; margin:0 0 10px 0; font-size:12px; color:var(--text2)">
+              <input type="checkbox" id="wl-collapse-punct" ${current.collapse_punct_repeats ? "checked" : ""}>
+              <span>Also collapse aggressive-repeat punctuation on <em>Remove priming language</em> <span style="color:var(--text3)">— <code>!!!</code>/<code>???</code>/<code>.....</code> flatten to single marks (<code>.</code>-runs of 4+ flatten to the 3-dot ellipsis, preserving intentional <code>...</code>). Tone-reduction motivation, not token savings; minor token win only on very long runs. Off by default. Fence-aware: skips lines inside <code>\`\`\`</code> blocks.</span></span>
+            </label>
 
-          <label style="display:block; margin-top:10px"><strong>Drift phrases</strong> <span style="color:var(--text3); font-weight:normal">— sycophancy / meta-commentary ("You're absolutely right!", "Let me think step by step."). Exact substring match, case-insensitive.</span></label>
-          <textarea id="wl-filler" rows="8" spellcheck="false" style="width:100%">${current.filler.join("\n")}</textarea>
-          <button class="btn btn-sm" data-reset="filler">Reset drift phrases to defaults (${defaults.filler.length})</button>
-        </div>
-      </details>
+            <label style="display:block; margin-top:6px"><strong>Swears</strong> <span style="color:var(--text3); font-weight:normal">— word-bounded, case-insensitive. Append <code>*</code> to a stem for conjugations (<code>fuck*</code> → fuck/fucks/fucker/fucking); bare words match exactly so <code>ass</code> won't blow up <code>assistant</code>.</span></label>
+            <div id="wl-swears"></div>
+            <button class="btn btn-sm" data-reset="swears" style="margin-top:6px">Reset swears to defaults (${defaults.swears.length})</button>
+
+            <label style="display:block; margin-top:10px"><strong>Drift phrases</strong> <span style="color:var(--text3); font-weight:normal">— sycophancy / meta-commentary ("You're absolutely right!", "Let me think step by step."). Exact substring match, case-insensitive.</span></label>
+            <div id="wl-filler"></div>
+            <button class="btn btn-sm" data-reset="filler" style="margin-top:6px">Reset drift phrases to defaults (${defaults.filler.length})</button>
+          </div>
+        </details>
+
+        <details class="stats-section" open style="margin-bottom:8px">
+          <summary><strong>Verbosity</strong> <span style="color:var(--text3); font-weight:normal" id="verbosity-count-badge">(${current.verbosity.length} entries)</span></summary>
+          <div style="padding:8px 4px 4px">
+            <p style="font-size:12px; color:var(--text2); margin:0 0 6px 0">
+              Not about agent behavior — just token cost and readability.
+              Strips obviousness signalers ("obviously", "clearly", "of
+              course") and meta-commentary phrases ("that's a great
+              question", "at the end of the day"). Word-bounded,
+              case-insensitive. Default list is conservative; add sincerity
+              markers, intensifiers, or hedges yourself if you want them
+              gone too. Test for any candidate: remove it — if the sentence
+              still makes sense, it was filler.
+            </p>
+            <div id="wl-verbosity"></div>
+            <button class="btn btn-sm" data-reset="verbosity" style="margin-top:6px">Reset to defaults (${defaults.verbosity.length})</button>
+
+            <details class="stats-section" style="margin-top:12px">
+              <summary style="font-size:12px"><strong>Abbreviation substitutions</strong> <span style="color:var(--text3); font-weight:normal">(${current.abbreviations.length} pairs) — experimental</span></summary>
+              <div style="padding:8px 4px 4px">
+                <label style="display:inline-flex; align-items:flex-start; gap:6px; margin:0 0 10px 0; font-size:12px; color:var(--text2)">
+                  <input type="checkbox" id="wl-apply-abbreviations" ${current.apply_abbreviations ? "checked" : ""}>
+                  <span>Also apply abbreviation substitutions on <em>Remove verbosity</em> <span style="color:var(--text3)">— off by default. When on, each pair below is applied word-bounded and case-insensitively after the verbosity strip. Pairs whose <code>from</code> contains a whitelisted phrase are skipped.</span></span>
+                </label>
+                <p style="font-size:12px; color:var(--text2); margin:0 0 8px 0">
+                  Two groups of pairs: (1) token-savers that <em>de-abbreviate</em> shorthand that tokenizes worse than the spelled-out word
+                  (<code>i.e.</code>→<code>ie</code>, <code>w/</code>→<code>with</code>, <code>smth</code>→<code>something</code>, …) and (2) token-neutral
+                  substitutions that save characters on disk (<code>you</code>→<code>u</code>, <code>please</code>→<code>pls</code>, …). Verified
+                  empirically against OpenAI's
+                  <a href="https://github.com/openai/tiktoken" target="_blank" rel="noopener">tiktoken</a>
+                  (<code>o200k_base</code>); try a pair against Claude's actual tokenizer at
+                  <a href="https://claude-tokenizer.vercel.app/" target="_blank" rel="noopener">claude-tokenizer.vercel.app</a>.
+                </p>
+                <p style="font-size:11px; color:var(--text3); margin:0 0 8px 0">
+                  <strong>Caveats:</strong> Claude's BPE isn't publicly available; tiktoken is the closest public proxy and the <em>direction</em> (which rewrite saves) generally holds, but exact magnitudes can differ. Case-insensitive matching substitutes with the literal <code>to</code> — "You're" becomes "ur" (lowercase), which may look odd mid-sentence. Enabling this rewrites on-disk text; <code>usage</code> and the chain are still preserved.
+                </p>
+                <div id="wl-abbreviations"></div>
+                <button class="btn btn-sm" data-reset="abbreviations" style="margin-top:6px">Reset to defaults (${defaults.abbreviations.length})</button>
+              </div>
+            </details>
+          </div>
+        </details>
+
+        <details class="stats-section" style="margin-bottom:8px">
+          <summary><strong>Whitelist</strong> <span style="color:var(--text3); font-weight:normal" id="wl-count-badge">(${current.whitelist.length} entries, applies to all filters)</span></summary>
+          <div style="padding:8px 4px 4px">
+            <p style="font-size:12px; color:var(--text2); margin:0 0 8px 0">
+              Global "never scrub" list. Any entry in any remove-* list that
+              contains a whitelisted phrase (case-insensitive substring) is
+              skipped at transform time. Ships with a curated seed of SWE /
+              tool / code terms; edit freely.
+            </p>
+            <div id="wl-whitelist"></div>
+            <div style="display:flex; gap:6px; margin-top:6px; flex-wrap:wrap">
+              <button class="btn btn-sm" data-reset="whitelist">Reset to defaults (${defaults.whitelist.length})</button>
+              <button class="btn btn-sm" data-prune-whitelist>Prune other lists against whitelist</button>
+            </div>
+          </div>
+        </details>
+
+        <details class="stats-section" style="margin-bottom:8px">
+          <summary><strong>Custom filter</strong> <span style="color:var(--text3); font-weight:normal" id="cf-count-badge">(${current.custom_filter.length} entries) — experimental</span></summary>
+          <div style="padding:8px 4px 4px">
+            <p style="font-size:12px; color:var(--text2); margin:0 0 8px 0">
+              Scans this conversation for repeated phrases you might want
+              stripped. Usefulness depends heavily on the convo — short /
+              clean convos produce little signal. Candidates land in an
+              editable pill list that's saved globally. Click <code>×</code>
+              on a pill to move it to the whitelist.
+            </p>
+            <label style="display:inline-flex; align-items:flex-start; gap:6px; margin:0 0 10px 0; font-size:12px; color:var(--text2)">
+              <input type="checkbox" id="wl-custom-filter-enabled" ${current.custom_filter_enabled ? "checked" : ""}>
+              <span>Show <em>Remove custom filter</em> in the transform menu <span style="color:var(--text3)">— off by default. Flip on once you've curated entries worth applying across convos.</span></span>
+            </label>
+            <div class="cf-thresholds" style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:0 0 8px 0; font-size:12px; color:var(--text2)">
+              <label style="display:inline-flex; align-items:center; gap:4px">min words <input type="number" id="cf-n-min" value="1" min="1" max="10" style="width:48px"></label>
+              <label style="display:inline-flex; align-items:center; gap:4px">max words <input type="number" id="cf-n-max" value="3" min="1" max="10" style="width:48px"></label>
+              <label style="display:inline-flex; align-items:center; gap:4px">min length (chars) <input type="number" id="cf-min-length" value="6" min="1" style="width:56px"></label>
+              <label style="display:inline-flex; align-items:center; gap:4px">min occurrences <input type="number" id="cf-min-count" value="3" min="2" style="width:56px"></label>
+            </div>
+            <div style="font-size:12px; color:var(--text3); margin:0 0 8px 0" id="cf-scan-scope">${canScan ? `Scan this conversation${msgTotal != null ? ` (${msgTotal} message${msgTotal === 1 ? "" : "s"})` : ""}` : "Open a conversation to enable scanning"}</div>
+            <div id="wl-custom-filter"></div>
+            <button class="btn btn-sm" data-calc="custom-filter" style="margin-top:6px" ${canScan ? "" : "disabled"}>Calculate from this conversation</button>
+          </div>
+        </details>
+      </div>
 
       <div class="modal-actions">
         <button class="btn-cancel" data-modal-cancel>Cancel</button>
@@ -1087,33 +1217,162 @@ export async function openWordListsModal() {
     </div>`;
   document.body.appendChild(overlay);
 
-  const swearsTa = overlay.querySelector("#wl-swears");
-  const fillerTa = overlay.querySelector("#wl-filler");
-  const verbosityTa = overlay.querySelector("#wl-verbosity");
+  const whitelistMount = mountPillList(
+    overlay.querySelector("#wl-whitelist"),
+    { entries: current.whitelist, placeholder: "add phrase + Enter" },
+  );
+  const customFilterMount = mountPillList(
+    overlay.querySelector("#wl-custom-filter"),
+    {
+      entries: current.custom_filter,
+      placeholder: "add phrase + Enter (or Calculate from this conversation)",
+      onRemove: (entry) => whitelistMount.addEntry(entry),
+    },
+  );
+  const swearsMount = mountPillList(
+    overlay.querySelector("#wl-swears"),
+    { entries: current.swears, placeholder: "add word + Enter (*stem OK)" },
+  );
+  const fillerMount = mountPillList(
+    overlay.querySelector("#wl-filler"),
+    { entries: current.filler, placeholder: "add phrase + Enter" },
+  );
+  const verbosityMount = mountPillList(
+    overlay.querySelector("#wl-verbosity"),
+    { entries: current.verbosity, placeholder: "add word + Enter" },
+  );
+  const abbreviationsMount = mountPillPairList(
+    overlay.querySelector("#wl-abbreviations"),
+    { pairs: current.abbreviations, fromPlaceholder: "from", toPlaceholder: "to" },
+  );
+
+  const mounts = {
+    swears: swearsMount,
+    filler: fillerMount,
+    verbosity: verbosityMount,
+    custom_filter: customFilterMount,
+    whitelist: whitelistMount,
+    abbreviations: abbreviationsMount,
+  };
+
   const close = () => overlay.remove();
 
   overlay.addEventListener("click", async (e) => {
     if (e.target === overlay || e.target.matches("[data-modal-cancel]")) {
       close();
-    } else if (e.target.matches("[data-reset]")) {
+      return;
+    }
+    if (e.target.matches("[data-reset]")) {
       const which = e.target.dataset.reset;
-      if (which === "swears") swearsTa.value = defaults.swears.join("\n");
-      else if (which === "filler") fillerTa.value = defaults.filler.join("\n");
-      else if (which === "verbosity") verbosityTa.value = defaults.verbosity.join("\n");
-    } else if (e.target.matches("[data-modal-save]")) {
+      const container = overlay.querySelector(`#wl-${which.replace("_", "-")}`);
+      if (!container) return;
+      if (which === "abbreviations") {
+        mounts.abbreviations = mountPillPairList(container, {
+          pairs: defaults.abbreviations || [],
+          fromPlaceholder: "from",
+          toPlaceholder: "to",
+        });
+        return;
+      }
+      const newMount = mountPillList(container, {
+        entries: defaults[which] || [],
+        placeholder: container.querySelector(".pill-input")?.placeholder || "add + Enter",
+        onRemove: which === "custom_filter" ? (entry) => mounts.whitelist.addEntry(entry) : undefined,
+      });
+      mounts[which] = newMount;
+      return;
+    }
+    if (e.target.matches("[data-prune-whitelist]")) {
+      const wl = mounts.whitelist.getEntries().map((s) => s.toLowerCase()).filter(Boolean);
+      if (!wl.length) return;
+      let removed = 0;
+      for (const key of ["swears", "filler", "verbosity", "custom_filter"]) {
+        const current_entries = mounts[key].getEntries();
+        const kept = current_entries.filter((entry) => {
+          const lower = entry.toLowerCase();
+          return !wl.some((w) => lower.includes(w));
+        });
+        removed += current_entries.length - kept.length;
+        if (kept.length !== current_entries.length) {
+          const container = overlay.querySelector(`#wl-${key.replace("_", "-")}`);
+          if (container) {
+            mounts[key] = mountPillList(container, {
+              entries: kept,
+              placeholder: container.querySelector(".pill-input")?.placeholder || "add + Enter",
+              onRemove: key === "custom_filter" ? (entry) => mounts.whitelist.addEntry(entry) : undefined,
+            });
+          }
+        }
+      }
+      alert(`Pruned ${removed} entr${removed === 1 ? "y" : "ies"} matching the whitelist.`);
+      return;
+    }
+    if (e.target.matches("[data-calc='custom-filter']")) {
+      if (!canScan) {
+        alert("Open a conversation first to scan it.");
+        return;
+      }
+      const btn = e.target;
+      const scopeLabel = overlay.querySelector("#cf-scan-scope");
+      const min_length_chars = Math.max(1, parseInt(overlay.querySelector("#cf-min-length").value, 10) || 6);
+      const min_count = Math.max(2, parseInt(overlay.querySelector("#cf-min-count").value, 10) || 3);
+      const n_min_raw = parseInt(overlay.querySelector("#cf-n-min").value, 10) || 1;
+      const n_max_raw = parseInt(overlay.querySelector("#cf-n-max").value, 10) || 3;
+      const n_min = Math.max(1, Math.min(10, n_min_raw));
+      const n_max = Math.max(n_min, Math.min(10, n_max_raw));
+      if (mounts.custom_filter.getEntries().length > 0) {
+        if (!confirm("Replace current custom filter list with fresh scan results? Entries not in the whitelist will be lost.")) return;
+      }
+      const originalText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Scanning… 0s";
+      const t0 = performance.now();
+      const tick = setInterval(() => {
+        const s = Math.floor((performance.now() - t0) / 1000);
+        btn.textContent = `Scanning… ${s}s`;
+      }, 1000);
+      try {
+        const res = await api.scanCustomFilter(folder, convoId, { min_length_chars, min_count, n_min, n_max });
+        scopeLabel.textContent = `Derived from ${res.msg_count} message${res.msg_count === 1 ? "" : "s"} — ${(res.candidates || []).length} candidate${(res.candidates || []).length === 1 ? "" : "s"}`;
+        const container = overlay.querySelector("#wl-custom-filter");
+        mounts.custom_filter = mountPillList(container, {
+          entries: res.candidates || [],
+          placeholder: "add phrase + Enter (or Calculate from this conversation)",
+          onRemove: (entry) => mounts.whitelist.addEntry(entry),
+        });
+      } catch (err) {
+        alert(`Scan failed: ${err.message}`);
+      } finally {
+        clearInterval(tick);
+        btn.textContent = originalText;
+        btn.disabled = false;
+      }
+      return;
+    }
+    if (e.target.matches("[data-modal-save]")) {
+      const lowercaseCheckbox = overlay.querySelector("#wl-lowercase-user-text");
+      const applyAbbrevCheckbox = overlay.querySelector("#wl-apply-abbreviations");
+      const customFilterEnabledCheckbox = overlay.querySelector("#wl-custom-filter-enabled");
+      const collapsePunctCheckbox = overlay.querySelector("#wl-collapse-punct");
       const payload = {
-        swears: swearsTa.value.split("\n").map((s) => s.trim()).filter(Boolean),
-        filler: fillerTa.value.split("\n").map((s) => s.trim()).filter(Boolean),
-        verbosity: verbosityTa.value.split("\n").map((s) => s.trim()).filter(Boolean),
+        swears: mounts.swears.getEntries(),
+        filler: mounts.filler.getEntries(),
+        verbosity: mounts.verbosity.getEntries(),
+        custom_filter: mounts.custom_filter.getEntries(),
+        whitelist: mounts.whitelist.getEntries(),
+        lowercase_user_text: !!(lowercaseCheckbox && lowercaseCheckbox.checked),
+        abbreviations: mounts.abbreviations.getPairs(),
+        apply_abbreviations: !!(applyAbbrevCheckbox && applyAbbrevCheckbox.checked),
+        custom_filter_enabled: !!(customFilterEnabledCheckbox && customFilterEnabledCheckbox.checked),
+        collapse_punct_repeats: !!(collapsePunctCheckbox && collapsePunctCheckbox.checked),
       };
       try {
-        await api.saveWordLists(payload);
+        const saved = await api.saveWordLists(payload);
+        state.wordLists = saved || null;
       } catch (err) {
         alert(`Save failed: ${err.message}`);
         return;
       }
-      // Invalidate cached lists so the next transform fetches the fresh copy.
-      state.wordLists = null;
       close();
     }
   });
@@ -1126,13 +1385,18 @@ export async function bulkTransform(kind = "scrub") {
   const lists = needsWordLists(kind) ? await ensureWordLists() : {};
   const byId = new Map((state.msgData?.main || []).map((m) => [m.uuid, m]));
 
+  if (kind === "remove_custom_filter" && !(lists.custom_filter || []).length) {
+    alert("Custom filter list is empty. Open Curate word lists → Calculate from cache, or add entries manually.");
+    return;
+  }
+
   // accepted: Map<uuid, newText>
   let accepted;
   if (state.previewEnabled) {
     const candidates = ids
       .map((id) => byId.get(id))
       .filter(Boolean)
-      .map((m) => ({ uuid: m.uuid, content: m.content || "" }));
+      .map((m) => ({ uuid: m.uuid, content: m.content || "", role: m.role }));
     const res = await showPreviewModal({ kind, label, candidates, opts: lists });
     if (!res) return;
     if (res.empty) {
@@ -1151,7 +1415,7 @@ export async function bulkTransform(kind = "scrub") {
     for (const id of ids) {
       const m = byId.get(id);
       if (!m) continue;
-      accepted.set(id, applyTransform(kind, m.content || "", lists));
+      accepted.set(id, applyTransform(kind, m.content || "", { ...lists, role: m.role }));
     }
   }
 

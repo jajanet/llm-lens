@@ -1,5 +1,3 @@
-// All server calls live here.
-
 async function json(url, opts) {
   const r = await fetch(url, opts);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -108,7 +106,6 @@ export const api = {
       body: JSON.stringify({ text }),
     }),
 
-
   getWordLists: () =>
     json("/api/word-lists"),
 
@@ -121,6 +118,14 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
     }),
+
+  scanCustomFilter: (folder, convoId, { min_length_chars, min_count, n_min, n_max }) =>
+    json(`/api/projects/${folder}/conversations/${convoId}/custom-filter/scan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ min_length_chars, min_count, n_min, n_max }),
+    }),
+
 
   getDownloadFields: () =>
     json("/api/download-fields"),
@@ -141,33 +146,6 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ uuids }),
     }),
-
-  // ── Tags ──────────────────────────────────────────────────────────
-
-  getTags: (folder) =>
-    json(`/api/projects/${folder}/tags`),
-
-  setTagLabels: (folder, labels) =>
-    json(`/api/projects/${folder}/tags/labels`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ labels }),
-    }),
-
-  assignTags: (folder, convoId, tags) =>
-    json(`/api/projects/${folder}/tags/assign`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ convo_id: convoId, tags }),
-    }),
-
-  bulkAssignTag: (folder, ids, tag, add) =>
-    json(`/api/projects/${folder}/tags/bulk-assign`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids, tag, add }),
-    }),
-
 
   // ── Tags ──────────────────────────────────────────────────────────
 
