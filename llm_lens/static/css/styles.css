@@ -163,19 +163,20 @@ body.edit-mode .chat-msg .chat-check { display: block; }
 .chat-bubble .msg-actions-row .btn-del-msg { display: none; }
 body.edit-mode .chat-bubble .msg-actions-row .btn-del-msg { display: inline-flex; }
 
-/* Side panel */
-.convo-flex { display: flex; gap: 0; max-width: 1200px; margin: 0 auto; }
-.convo-flex > .chat-wrap { flex: 1; min-width: 0; }
-.convo-side {
-  width: 340px; flex-shrink: 0; border-left: 1px solid var(--border);
-  padding-left: 12px; margin-left: 12px; overflow-y: auto; max-height: calc(100vh - 140px);
+/* Agent-run markers + breadcrumb */
+.agent-link {
+  display: inline-flex; align-items: center; gap: 4px;
+  margin-left: 6px; font-size: 11px; color: var(--accent, #6ea8fe);
+  text-decoration: none; padding: 1px 5px; border-radius: 3px;
+  border: 1px solid transparent; cursor: pointer;
 }
-.convo-side.hidden { display: none; }
-.convo-side h3 { font-size: 12px; color: var(--text2); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
-
-.side-msg { font-size: 12px; padding: 4px 8px; margin-bottom: 2px; border-radius: 4px; word-break: break-word; }
-.side-msg.user { background: var(--user-bg); border-left: 2px solid var(--user-border); }
-.side-msg.assistant { background: var(--asst-bg); border-left: 2px solid var(--asst-border); }
+.agent-link:hover { background: var(--user-bg); border-color: var(--border); }
+.agent-src-tag {
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.4px;
+  color: var(--text2); padding: 0 3px; border: 1px solid var(--border);
+  border-radius: 2px; margin-left: 2px;
+}
+.bc-agent-name { color: var(--text2); }
 
 .thinking-block {
   background: var(--think-bg); border: 1px solid var(--border); border-radius: 4px;
@@ -187,6 +188,15 @@ body.edit-mode .chat-bubble .msg-actions-row .btn-del-msg { display: inline-flex
 .tool-badge {
   display: inline-block; background: var(--bg3); border: 1px solid var(--border);
   border-radius: 4px; padding: 1px 5px; font-size: 10px; color: var(--purple); margin: 1px 0;
+}
+/* Slash-command and system-event badges — distinct hues so they don't
+   blend into tool_use badges (same shape, different semantics). */
+.tool-badge-slash { color: var(--accent, #6ea8fe); }
+.tool-badge-slashout, .tool-badge-slasherr { color: var(--text2); font-style: italic; }
+.tool-badge-slasherr { color: #e66; }
+.tool-badge-queued { color: var(--text2); text-transform: lowercase; }
+.tool-badge-compacted, .tool-badge-away, .tool-badge-info, .tool-badge-scheduled, .tool-badge-system {
+  color: var(--text2); font-style: italic;
 }
 
 /* Selection action bar */
@@ -207,8 +217,12 @@ body.edit-mode .chat-bubble .msg-actions-row .btn-del-msg { display: inline-flex
 .sel-bar .split-btn > .btn.split-arrow { border-left-color: rgba(255,255,255,0.3); }
 
 .transform-menu {
-  background: var(--bg1); border: 1px solid var(--border);
-  border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  background: var(--bg);  /* --bg1 was never defined; menus rendered transparent */
+  background: color-mix(in srgb, var(--bg) 80%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--border);
+  border-radius: 6px; box-shadow: 0 6px 18px rgba(0,0,0,0.25);
   padding: 4px; z-index: 1000; display: flex; flex-direction: column;
   min-width: 220px;
 }
@@ -237,6 +251,18 @@ body.edit-mode .chat-bubble .msg-actions-row .btn-del-msg { display: inline-flex
   resize: vertical;
 }
 .word-lists-grid > div > .btn { margin-top: 6px; }
+
+.jsonl-fields-list {
+  display: flex; flex-direction: column; gap: 6px; margin: 12px 0 18px;
+}
+.jsonl-field-row {
+  display: flex; align-items: center; gap: 8px; font-size: 13px;
+}
+.jsonl-field-row input[disabled] { opacity: 0.5; }
+.jsonl-field-row code {
+  background: var(--bg2); padding: 1px 6px; border-radius: 3px;
+  font-size: 12px;
+}
 
 .tool-badge-bash + .bash-cmd-preview {
   display: inline-block; vertical-align: middle;
@@ -1030,3 +1056,137 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
 }
 .msg-edit-ta:focus { border-color: var(--accent); }
 .msg-edit-hint { font-size: 11px; color: var(--text3); margin-top: 4px; }
+
+/* Preview-before-apply modal. Reuses .modal shell; sized like the stats modal
+   so diffs have room, with a scrollable body for large transforms. */
+.modal.preview-modal {
+  max-width: 780px;
+  width: 90vw;
+  max-height: calc(100vh - 64px);
+}
+.modal.preview-modal h3.preview-title {
+  color: var(--heading);
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.preview-topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.preview-topbar-actions { display: flex; gap: 6px; }
+.preview-view-toggle { display: inline-flex; gap: 4px; }
+.modal-body.preview-body-scroll {
+  margin: 10px 0;
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.preview-row {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--bg);
+}
+.preview-check {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--text2); margin-bottom: 6px;
+  cursor: pointer; user-select: none;
+}
+.preview-check input { margin: 0; cursor: pointer; }
+.preview-delta {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 11px;
+  color: var(--text3);
+}
+.preview-body {
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+.preview-inline ins,
+.preview-before-block del,
+.preview-after-block ins {
+  text-decoration: none;
+  padding: 0 1px;
+  border-radius: 2px;
+}
+.preview-inline ins,
+.preview-after-block ins {
+  background: color-mix(in srgb, #2ea043 35%, transparent);
+  color: var(--heading);
+}
+.preview-inline del,
+.preview-before-block del {
+  background: color-mix(in srgb, var(--red) 30%, transparent);
+  color: var(--heading);
+  text-decoration: line-through;
+}
+.preview-stacked { display: flex; flex-direction: column; gap: 6px; }
+.preview-before-block,
+.preview-after-block {
+  padding: 6px 8px; border-radius: 4px; border: 1px solid var(--border);
+}
+.preview-before-block { border-left: 2px solid var(--red); }
+.preview-after-block { border-left: 2px solid #2ea043; }
+.preview-too-large {
+  display: flex; flex-direction: column; gap: 6px;
+  font-style: italic; color: var(--text2);
+}
+.modal-actions.preview-bottombar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.preview-bottom-commit { display: flex; gap: 8px; }
+.preview-skip-bottom { color: var(--text3); }
+.preview-skip-bottom.active,
+[data-preview-skip].active {
+  background: var(--bg3);
+  color: var(--text2);
+  cursor: default;
+}
+.preview-apply-all { background: var(--bg3); }
+
+/* Transform-menu toggle: the global .btn.active style paints accent-blue
+   with white text, which reads fine on toolbars but clashes inside a
+   transparent menu. Keep the checkbox glyph as the only state indicator. */
+.transform-menu .transform-menu-toggle,
+.transform-menu .transform-menu-toggle.active {
+  background: transparent;
+  color: var(--text);
+  border-color: transparent;
+}
+.transform-menu .transform-menu-toggle:hover,
+.transform-menu .transform-menu-toggle.active:hover {
+  background: var(--bg2);
+}
+
+/* Preview-modal checkbox replacing the old skip-next-time buttons. Label
+   click area covers the text so the checkbox feels bigger than it looks. */
+.preview-skip-check {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--text2);
+  cursor: pointer; user-select: none;
+}
+.preview-skip-check input { margin: 0; cursor: pointer; }
+
+/* Running net-delta between Cancel and Apply selected. Updates as rows are
+   checked/unchecked so the user can tell at a glance whether the current
+   selection is a net add or net removal. */
+.preview-net-delta {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 11px;
+  color: var(--text2);
+  padding: 0 6px;
+  white-space: nowrap;
+}
+.preview-net-delta.preview-net-empty { color: var(--text3); font-style: italic; }
+.modal-actions.preview-bottombar { justify-content: flex-end; }

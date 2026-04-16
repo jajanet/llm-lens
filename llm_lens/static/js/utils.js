@@ -836,6 +836,15 @@ function renderStatsCombined(s, opts) {
     if (f.archived) add(a.commands);
     return out;
   };
+  // Session-artifact counters (slash commands, queued drafts, compactions,
+  // …) aren't tombstoned across archive/delete states — they're either
+  // present in the current file or not. Pull straight from `s`.
+  const slashCommands = s.slash_commands || {};
+  const queuedCount = s.queued_count || 0;
+  const compactCount = s.compact_count || 0;
+  const awayCount = s.away_count || 0;
+  const infoCount = s.info_count || 0;
+  const scheduledCount = s.scheduled_count || 0;
   const eff = {
     input_tokens: sum("input_tokens"),
     output_tokens: sum("output_tokens"),
@@ -1043,6 +1052,33 @@ function renderStatsCombined(s, opts) {
         ${note}
         ${breakdownTable(cmdEntries, cmdTotal)}</details>`;
     }
+    // Slash commands + session events — previously invisible because the
+    // parser dropped these entry shapes. They don't carry their own
+    // `usage`, so they contribute nothing to tokens/cost; surfaced here
+    // purely as workflow signal (how often you /clear, how many queued
+    // drafts piled up, how many times the session compacted, …).
+    const slashEntries = Object.entries(slashCommands).sort((a, b) => b[1] - a[1]);
+    if (slashEntries.length) {
+      const slashTotal = slashEntries.reduce((n, [, c]) => n + c, 0);
+      const note2 = `<p class="stats-note" style="margin:4px 0 8px">
+        Slash commands typed at the prompt. Local to Claude Code — no API
+        cost of their own, but each one adds its text to the next assistant
+        turn's input.
+      </p>`;
+      html += `<details class="stats-section"><summary>Slash commands (${slashTotal})</summary>
+        ${note2}
+        ${breakdownTable(slashEntries, slashTotal)}</details>`;
+    }
+    const eventRows = [
+      ["Queued drafts", queuedCount],
+      ["Compactions", compactCount],
+      ["Away summaries", awayCount],
+      ["Info notices", infoCount],
+      ["Scheduled fires", scheduledCount],
+    ].filter(([, n]) => n > 0).map(([l, n]) => [l, String(n)]);
+    if (eventRows.length) {
+      html += `<details class="stats-section"><summary>Session events</summary>${makeTable(eventRows)}</details>`;
+    }
     html += `<details class="stats-section" open><summary>Session info</summary>${makeTable(sessionRows)}</details>`;
     html += deltaSection(s.archived_delta, "Archived content", "stats-section-archived");
     html += deltaSection(s.deleted_delta,  "Deleted content",  "stats-section-deleted");
@@ -1059,6 +1095,71 @@ function renderStatsCombined(s, opts) {
       const cmdTotal = cmdEntries.reduce((n, [, c]) => n + c, 0);
       html += `<details class="stats-section"><summary>Cost per Bash command (${cmdTotal} calls)</summary>
         ${costPerCallTable(cmdEntries, cmdTotal, costForCommand, "Command")}
+      </details>`;
+    }
+
+    // Cost estimates that can't come from `usage` directly — see footnotes.
+    // Thinking: Anthropic returns `output_tokens` as the sum of thinking +
+    // response; we prorate per-turn by character ratio. Compaction: the
+    // compactor call is not logged as its own turn; we estimate its output
+    // size from the injected summary's character length.
+    const thinkEstByModel = s.thinking_output_tokens_estimate || {};
+    const compactChars = s.compact_summary_chars || 0;
+    const primaryModel = s.last_model_for_context ||
+      (Object.keys(thinkEstByModel)[0]) ||
+      ((s.models || [])[0]);
+    const primaryPrice = primaryModel ? priceFor(primaryModel) : null;
+
+    // Primary model picked for the compact estimate (pricing, single rate).
+    const estRows = [];
+    let thinkTotalTokens = 0;
+    let thinkTotalCost = 0;
+    for (const [m, tokens] of Object.entries(thinkEstByModel)) {
+      thinkTotalTokens += tokens;
+      const p = priceFor(m);
+      if (p) thinkTotalCost += (tokens / 1_000_000) * p.output;
+    }
+    if (thinkTotalTokens > 0) {
+      const costLabel = thinkTotalCost > 0 ? ` · ${fmtCost(thinkTotalCost)}` : "";
+      estRows.push([
+        `Thinking output <sup>4</sup>`,
+        `~${fmtTokens(thinkTotalTokens)} tokens${costLabel}`,
+      ]);
+    }
+
+    let compactTokens = 0;
+    let compactCost = 0;
+    if (compactChars > 0) {
+      compactTokens = Math.round(compactChars / 4);  // rough chars-per-token
+      if (primaryPrice) compactCost = (compactTokens / 1_000_000) * primaryPrice.output;
+      const costLabel = compactCost > 0 ? ` · ${fmtCost(compactCost)}` : "";
+      estRows.push([
+        `Compaction output <sup>5</sup>`,
+        `~${fmtTokens(compactTokens)} tokens${costLabel}`,
+      ]);
+    }
+
+    if (estRows.length) {
+      const footnotes = `
+        <p class="stats-note" style="margin:8px 0 0">
+          <sup>4</sup> Thinking is billed inside <code>output_tokens</code>
+          (no separate field in <code>usage</code>). We prorate each turn by
+          the ratio of thinking-block characters to total text characters —
+          approximate, not exact. Already included in the Tokens totals
+          above; shown here as breakdown only.
+        </p>
+        <p class="stats-note" style="margin:4px 0 0">
+          <sup>5</sup> Compaction doesn't appear as its own assistant turn
+          in the JSONL — Anthropic runs it out of band. We estimate the
+          compactor's <em>output</em> size from the injected summary
+          message's character length (÷4 chars/token). Priced at the
+          session's primary model (<code>${esc(primaryModel || "?")}</code>)
+          output rate. <em>Not</em> included in the totals above — it's
+          additional spend the session file doesn't record.
+        </p>`;
+      html += `<details class="stats-section" open><summary>Cost estimates</summary>
+        ${makeTable(estRows)}
+        ${footnotes}
       </details>`;
     }
   }

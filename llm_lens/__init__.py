@@ -28,7 +28,7 @@ def _mtime_iso(mtime: float) -> str:
     """
     return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, send_file
 
 from . import peek_cache
 from . import tag_store
@@ -154,7 +154,21 @@ _STATS_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens",
                "thinking_count", "git_branch", "per_model", "commands",
                "tool_turn_tokens", "command_turn_tokens",
                "last_context_input_tokens", "last_context_cache_creation_tokens",
-               "last_context_cache_read_tokens", "last_model_for_context")
+               "last_context_cache_read_tokens", "last_model_for_context",
+               # Session-artifact counters. Tracked alongside tool / thinking
+               # stats but derived from non-assistant entries, so they never
+               # contribute to token totals — useful for "workflow" breakdowns
+               # (how often you /clear, how many queued drafts, etc.) without
+               # affecting cost attribution.
+               "slash_commands", "queued_count", "compact_count",
+               "away_count", "info_count", "scheduled_count",
+               # Cost-estimation inputs. Thinking tokens are bundled into
+               # Anthropic's `output_tokens` — no separate field, so we
+               # prorate per turn by text character ratio. Compaction
+               # summaries aren't logged as their own API call in the
+               # JSONL; we estimate output cost from the summary message's
+               # character length.
+               "thinking_output_tokens_estimate", "compact_summary_chars")
 
 
 # Tokens that wrap another command and shouldn't be counted themselves
@@ -216,15 +230,22 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
     each `tool_use` block in a turn gets an equal slice of the turn's
     `usage` (turn_cost / num_blocks_in_turn). For tool-level the slice is
     keyed by tool name; for command-level (Bash only) the slice is keyed
-    by the extracted command name. Summing across tools (or across
-    commands within Bash's slice) equals the actual turn cost — so
-    avg-cost-per-call (share / call_count) doesn't double-count.
+    by the extracted command name.
 
     `last_context_*` fields snapshot the final main-thread assistant
     turn's usage — the model's view of the conversation at that point,
     which is what determines how close we are to compaction. Sidechains
     (Task-subagent turns) are skipped because their usage reflects the
     subagent's context, not the main conversation's.
+
+    Session-artifact counters (`slash_commands`, `queued_count`,
+    `compact_count`, `away_count`, `info_count`, `scheduled_count`) come
+    from non-assistant entries and don't affect token/cost totals. They
+    power the "session events" breakdown in the stats modal.
+
+    Thinking / compaction cost estimates (`thinking_output_tokens_estimate`
+    is per model, `compact_summary_chars` is scalar) support the estimate
+    rows in the cost tab. See their comments in the loop for methodology.
     """
     input_tokens = output_tokens = cache_read = cache_creation = 0
     models = []
@@ -239,11 +260,33 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
     last_ctx_in = last_ctx_cc = last_ctx_cr = 0
     last_ctx_model = ""
 
+    slash_commands: dict = {}
+    queued_count = 0
+    compact_count = 0
+    away_count = 0
+    info_count = 0
+    scheduled_count = 0
+
+    thinking_output_tokens_estimate: dict = {}  # model -> int
+    compact_summary_chars = 0
+    pending_compact = False  # next non-meta user message is the summary
+
     def _ttt_bucket(d: dict, name: str):
         return d.setdefault(name, {
             "input_tokens": 0.0, "output_tokens": 0.0,
             "cache_read_tokens": 0.0, "cache_creation_tokens": 0.0,
         })
+
+    def _text_len_of(content):
+        if isinstance(content, str):
+            return len(content)
+        if isinstance(content, list):
+            n = 0
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    n += len(b.get("text") or "")
+            return n
+        return 0
 
     try:
         with open(filepath_str, "r") as fh:
@@ -258,8 +301,44 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
                 if git_branch is None and entry.get("gitBranch"):
                     git_branch = entry["gitBranch"]
 
+                t = entry.get("type")
+                st = entry.get("subtype")
+                if t == "queue-operation":
+                    queued_count += 1
+                elif t == "system":
+                    if st == "local_command":
+                        m = _CMD_NAME_RE.search(entry.get("content") or "")
+                        if m:
+                            n = m.group(1).strip()
+                            slash_commands[n] = slash_commands.get(n, 0) + 1
+                    elif st == "compact_boundary":
+                        compact_count += 1
+                        pending_compact = True
+                    elif st == "away_summary":
+                        away_count += 1
+                    elif st == "informational":
+                        info_count += 1
+                    elif st == "scheduled_task_fire":
+                        scheduled_count += 1
+
                 msg = entry.get("message") or {}
-                if msg.get("role") != "assistant":
+                if isinstance(msg.get("content"), str):
+                    for m in _CMD_NAME_RE.finditer(msg["content"]):
+                        n = m.group(1).strip()
+                        slash_commands[n] = slash_commands.get(n, 0) + 1
+
+                role = msg.get("role")
+
+                # Compaction estimate: the injected summary shows up as the
+                # first non-meta user message after a compact_boundary. Its
+                # character length is the best proxy we have for the
+                # compaction's output size — Anthropic doesn't log the
+                # compaction API call itself in the JSONL.
+                if pending_compact and role == "user" and not entry.get("isMeta"):
+                    compact_summary_chars += _text_len_of(msg.get("content"))
+                    pending_compact = False
+
+                if role != "assistant":
                     continue
 
                 model = msg.get("model")
@@ -290,26 +369,22 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
                 pm["cache_read_tokens"] += cr_t
                 pm["cache_creation_tokens"] += cc_t
 
-                # Snapshot the last main-thread turn's context usage.
-                # Sidechains (Task subagents) have their own usage that
-                # doesn't reflect the main convo's state.
                 if not entry.get("isSidechain"):
                     last_ctx_in = in_t
                     last_ctx_cc = cc_t
                     last_ctx_cr = cr_t
                     last_ctx_model = mkey
 
-                # First pass: tally tool_use / thinking, extract Bash command
-                # names, and remember (tool_name, command_name?) per block so
-                # the second pass can split the turn's cost across them.
-                tool_block_entries = []  # (tool_name, command_name | None)
+                tool_block_entries = []
+                thinking_chars_turn = 0
+                text_chars_turn = 0
                 content = msg.get("content")
                 if isinstance(content, list):
                     for block in content:
                         if not isinstance(block, dict):
                             continue
-                        t = block.get("type")
-                        if t == "tool_use":
+                        bt = block.get("type")
+                        if bt == "tool_use":
                             name = block.get("name") or "?"
                             tool_uses[name] = tool_uses.get(name, 0) + 1
                             pm["tool_uses"][name] = pm["tool_uses"].get(name, 0) + 1
@@ -321,15 +396,33 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
                                     commands[cname] = commands.get(cname, 0) + 1
                                     pm["commands"][cname] = pm["commands"].get(cname, 0) + 1
                             tool_block_entries.append((name, cname))
-                        elif t == "thinking":
+                        elif bt == "thinking":
                             thinking_count += 1
                             pm["thinking_count"] += 1
+                            thinking_chars_turn += len(block.get("thinking") or "")
+                        elif bt == "text":
+                            text_chars_turn += len(block.get("text") or "")
 
-                # Second pass: each block gets 1/N of the turn's tokens.
-                # Tool share goes to tool_turn_tokens[name]; if the block
-                # has a command name (Bash only), the same share also goes
-                # to command_turn_tokens[cname]. Sum across tools = turn
-                # cost; sum across commands within Bash = Bash's share.
+                # Thinking prorate: turns with any thinking block attribute
+                # `output_tokens - (text_chars / 4)` to thinking. Anthropic
+                # often redacts thinking content (stores signature only, no
+                # text) so we can't use thinking_chars as a signal. Visible
+                # text length divided by the standard English chars/token
+                # ratio gives the response side; the residual is thinking.
+                # Clamped to [0, out_t] to guard against short-response
+                # overshoot. Superscript note in the modal explains this.
+                has_thinking_block = any(
+                    isinstance(b, dict) and b.get("type") == "thinking"
+                    for b in (content if isinstance(content, list) else [])
+                )
+                if has_thinking_block and out_t:
+                    response_tokens_est = text_chars_turn // 4
+                    est = max(0, min(out_t, out_t - response_tokens_est))
+                    if est > 0:
+                        thinking_output_tokens_estimate[mkey] = (
+                            thinking_output_tokens_estimate.get(mkey, 0) + est
+                        )
+
                 n_blocks = len(tool_block_entries)
                 if n_blocks:
                     share_in = in_t / n_blocks
@@ -374,6 +467,14 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
         "last_context_cache_creation_tokens": last_ctx_cc,
         "last_context_cache_read_tokens": last_ctx_cr,
         "last_model_for_context": last_ctx_model,
+        "slash_commands": slash_commands,
+        "queued_count": queued_count,
+        "compact_count": compact_count,
+        "away_count": away_count,
+        "info_count": info_count,
+        "scheduled_count": scheduled_count,
+        "thinking_output_tokens_estimate": thinking_output_tokens_estimate,
+        "compact_summary_chars": compact_summary_chars,
     }
 
 
@@ -547,12 +648,180 @@ def _stats(filepath, stat) -> dict:
     return out
 
 
+_AGENT_FILENAME_RE = re.compile(r"^agent-(?:(.+)-)?([0-9a-f]{8,})$")
+
+
+_CMD_NAME_RE = re.compile(r"<command-name>\s*([^<\s]+)\s*</command-name>", re.IGNORECASE)
+_CMD_WRAP_RE = re.compile(
+    r"<command-(?:message|args|contents)\b[^>]*>[\s\S]*?</command-(?:message|args|contents)>\s*",
+    re.IGNORECASE,
+)
+_STDOUT_RE = re.compile(r"<local-command-stdout>([\s\S]*?)</local-command-stdout>", re.IGNORECASE)
+_STDERR_RE = re.compile(r"<local-command-stderr>([\s\S]*?)</local-command-stderr>", re.IGNORECASE)
+
+
+def _collapse_command_wrappers(s: str) -> str:
+    """Rewrite Claude Code's XML-ish slash-command wrappers into inline
+    badge markers the frontend renders as pills.
+
+      <command-name>/btw</command-name>…<command-args></command-args>
+        → [Slash: /btw]
+      <local-command-stdout>Set model…</local-command-stdout>
+        → [SlashOut] Set model…
+      <local-command-stderr>oops</local-command-stderr>
+        → [SlashErr] oops
+
+    Any unmatched trailing <command-message>/<command-args>/<command-contents>
+    wrappers are stripped so they don't leak through as raw XML.
+    """
+    out = _CMD_NAME_RE.sub(lambda m: f"[Slash: {m.group(1).strip()}]", s)
+    out = _CMD_WRAP_RE.sub("", out)
+    out = _STDOUT_RE.sub(
+        lambda m: "[SlashOut]" + ((" " + m.group(1).strip()) if m.group(1).strip() else ""),
+        out,
+    )
+    out = _STDERR_RE.sub(
+        lambda m: "[SlashErr]" + ((" " + m.group(1).strip()) if m.group(1).strip() else ""),
+        out,
+    )
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
+
+def _format_entry_message(entry):
+    """Convert a raw JSONL entry to a display message dict, or None to skip.
+
+    Shared between parent-convo parsing and subagent-run parsing — the entry
+    shape is identical, only the filter (parentToolUseID vs. not) differs at
+    the call site.
+
+    Handles three envelope shapes:
+      1. Normal user/assistant turns: `entry.message.{role,content}`.
+      2. Subagent progress events: `entry.type == "progress"` wraps a real
+         message at `entry.data.message` (uuid/timestamp stay on the outer).
+      3. Slash-command / queue / system events: top-level `entry.content`
+         with no `message` object. Normalized into a pseudo-message with a
+         prefix marker that the frontend renders as a badge.
+    """
+    if entry.get("type") == "file-history-snapshot":
+        return None
+    if entry.get("type") == "progress":
+        inner = (entry.get("data") or {}).get("message") or {}
+        if inner:
+            entry = {
+                **entry,
+                "type": inner.get("type", "progress"),
+                "message": inner.get("message") or {},
+            }
+
+    # Normalize "envelope 3" entries into a pseudo-message. Assigns a
+    # prefix marker by subtype so the frontend can render the right badge
+    # (see `_collapse_command_wrappers` and the processContent regex).
+    if "message" not in entry and isinstance(entry.get("content"), str):
+        t = entry.get("type")
+        st = entry.get("subtype")
+        prefix = ""
+        role = "system"
+        if t == "queue-operation":
+            role, prefix = "user", "[Queued] "
+        elif t == "system":
+            if st == "local_command":
+                role, prefix = "system", ""  # content already carries <command-name>
+            elif st == "away_summary":
+                role, prefix = "system", "[Away] "
+            elif st == "compact_boundary":
+                role, prefix = "system", "[Compacted] "
+            elif st == "informational":
+                role, prefix = "system", "[Info] "
+            elif st == "scheduled_task_fire":
+                role, prefix = "system", "[Scheduled] "
+            else:
+                role, prefix = "system", "[System] "
+        else:
+            # Unknown shape — skip rather than render as garbage.
+            return None
+        entry = {**entry, "message": {"role": role, "content": prefix + entry["content"]}}
+
+    message_obj = entry.get("message", {}) or {}
+    role = message_obj.get("role", entry.get("type", "unknown"))
+    content = message_obj.get("content", "")
+    ts = entry.get("timestamp")
+    uid = entry.get("uuid")
+    model = message_obj.get("model")
+    usage = message_obj.get("usage")
+    is_meta = entry.get("isMeta", False)
+
+    tool_commands = []
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            t = block.get("type")
+            if t == "text":
+                parts.append(block.get("text", ""))
+            elif t == "tool_use":
+                name = block.get("name", "?")
+                tid = block.get("id", "")
+                parts.append(f"[Tool: {name}:{tid}]")
+                if name == "Bash":
+                    cmd = (block.get("input") or {}).get("command", "")
+                    if cmd:
+                        tool_commands.append({"id": tid, "command": cmd})
+            elif t == "tool_result":
+                parts.append("[Tool Result]")
+            elif t == "thinking":
+                th = block.get("thinking", "")
+                if th:
+                    parts.append(f"<thinking>{th}</thinking>")
+        content = "\n".join(parts)
+
+    if isinstance(content, str):
+        content = _collapse_command_wrappers(content)
+
+    if is_meta:
+        return None
+    if role == "assistant" and not content:
+        return None
+
+    msg = {"uuid": uid, "role": role, "content": content if isinstance(content, str) else str(content), "timestamp": ts}
+    if tool_commands:
+        msg["commands"] = tool_commands
+    if model:
+        msg["model"] = model
+    if isinstance(usage, dict) and usage:
+        msg["usage"] = usage
+    return msg
+
+
+def _dedup_by_uuid(msgs):
+    # Drop duplicate uuids (happens when /resume appends replay entries).
+    # Keep first occurrence so chronological order and parent links stay
+    # stable. Content-based dedup is wrong: tool messages like "[Tool Result]"
+    # repeat legitimately.
+    seen = set()
+    out = []
+    for m in msgs:
+        uid = m.get("uuid")
+        if uid is not None:
+            if uid in seen:
+                continue
+            seen.add(uid)
+        out.append(m)
+    return out
+
+
 @lru_cache(maxsize=128)
 def _parse_messages_cached(filepath_str: str, mtime: float, size: int):
-    """Cached full message parse."""
+    """Cached full message parse of a parent conversation .jsonl.
+
+    Agent (sidechain) runs no longer live inline here — Claude Code writes
+    them to sibling `<convo_id>/subagents/agent-*.jsonl` files, loaded via
+    `_agent_runs_for_convo`. Any stray `isSidechain: true` entries (old
+    inline format, not observed in current data) are skipped silently.
+    """
     filepath = Path(filepath_str)
     main = []
-    side = []
     with open(filepath, "r") as f:
         for line in f:
             line = line.strip()
@@ -562,72 +831,256 @@ def _parse_messages_cached(filepath_str: str, mtime: float, size: int):
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if entry.get("type") == "file-history-snapshot":
+            if entry.get("isSidechain"):
                 continue
-
-            role = entry.get("message", {}).get("role", entry.get("type", "unknown"))
-            content = entry.get("message", {}).get("content", "")
-            ts = entry.get("timestamp")
-            uid = entry.get("uuid")
-            is_meta = entry.get("isMeta", False)
-            is_sidechain = entry.get("isSidechain", False)
-
-            tool_commands = []  # bash-only for now: {id, command}
-            if isinstance(content, list):
-                parts = []
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    t = block.get("type")
-                    if t == "text":
-                        parts.append(block.get("text", ""))
-                    elif t == "tool_use":
-                        name = block.get("name", "?")
-                        tid = block.get("id", "")
-                        # Embed the id in the marker so the frontend can
-                        # correlate a Bash badge with its command entry
-                        # from `tool_commands` (see below).
-                        parts.append(f"[Tool: {name}:{tid}]")
-                        if name == "Bash":
-                            cmd = (block.get("input") or {}).get("command", "")
-                            if cmd:
-                                tool_commands.append({"id": tid, "command": cmd})
-                    elif t == "tool_result":
-                        parts.append("[Tool Result]")
-                    elif t == "thinking":
-                        th = block.get("thinking", "")
-                        if th:
-                            parts.append(f"<thinking>{th}</thinking>")
-                content = "\n".join(parts)
-
-            if is_meta:
+            msg = _format_entry_message(entry)
+            if msg is None:
                 continue
-            if role == "assistant" and not content:
+            main.append(msg)
+    return _dedup_by_uuid(main)
+
+
+def _subagents_dir(folder: str, convo_id: str) -> Path:
+    return CLAUDE_PROJECTS_DIR / folder / convo_id / "subagents"
+
+
+@lru_cache(maxsize=128)
+def _inline_agent_runs_from_parent(filepath_str: str, mtime: float, size: int):
+    """Extract old-format inline agent runs from a parent .jsonl.
+
+    A run = a cluster of entries with `isSidechain: true`, linked by
+    `parentUuid`. Anchor = first non-sidechain ancestor (the main message
+    the cluster branched from). Cached on (path, mtime, size).
+    """
+    filepath = Path(filepath_str)
+    entries = []
+    by_uuid = {}
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            entries.append(entry)
+            if entry.get("uuid"):
+                by_uuid[entry["uuid"]] = entry
 
-            msg = {"uuid": uid, "role": role, "content": content if isinstance(content, str) else str(content), "timestamp": ts}
-            if tool_commands:
-                msg["commands"] = tool_commands
-            (side if is_sidechain else main).append(msg)
-
-    def dedup(msgs):
-        # Drop duplicate uuids (can happen when Claude Code /resume appends
-        # replay entries). Keep the first occurrence so chronological order
-        # and parent links stay stable. Content-based dedup was wrong: tool
-        # messages like "[Tool Result]" repeat legitimately and must not
-        # collapse.
+    def anchor_for(entry):
+        cur = entry.get("parentUuid")
         seen = set()
-        out = []
-        for m in msgs:
-            uid = m.get("uuid")
-            if uid is not None:
-                if uid in seen:
-                    continue
-                seen.add(uid)
-            out.append(m)
-        return out
+        while cur and cur in by_uuid and by_uuid[cur].get("isSidechain"):
+            if cur in seen:
+                break
+            seen.add(cur)
+            cur = by_uuid[cur].get("parentUuid")
+        return cur
 
-    return dedup(main), dedup(side)
+    runs = {}
+    for e in entries:
+        if not e.get("isSidechain"):
+            continue
+        anchor = anchor_for(e) or "__root__"
+        ts = e.get("timestamp")
+        r = runs.get(anchor)
+        if r is None:
+            r = {
+                "run_id": f"inline:{anchor}",
+                "name": "agent",
+                "source": "inline",
+                "source_file": str(filepath),
+                "anchor_uuid": anchor,
+                "message_count": 0,
+                "first_ts": ts,
+            }
+            runs[anchor] = r
+        r["message_count"] += 1
+        if ts and (r["first_ts"] is None or ts < r["first_ts"]):
+            r["first_ts"] = ts
+    return list(runs.values())
+
+
+def _agent_runs_for_convo(folder: str, convo_id: str):
+    """Discover subagent runs spawned by a parent conversation.
+
+    Two source formats are unified under one "agent run" concept:
+
+    * **New (subagents dir)** — Claude Code writes each run as its own file
+      at `<project>/<convo_id>/subagents/agent-[<name>-]<hash>.jsonl`. One
+      file = one run (the whole file's formatted entries are its transcript).
+      The `<hash>` in the filename is the run's stable id. The parent's
+      anchor is the `Agent`/`Task`-named `tool_use` block whose id appears
+      as a `parentToolUseID` on one of the run's entries — used by the UI
+      to attach a `→ <name>` marker to the right parent message. Files
+      without any Agent-anchored ptu are still runs (standalone / passive
+      agents); they surface in the subagents list but have no inline marker.
+      Non-Agent `parentToolUseID` values (Read/Write/Edit/etc.) are audit-
+      trail noise and are intentionally ignored for anchoring.
+      `source = "subagent"`.
+
+    * **Old (inline)** — historically Claude Code wrote sidechain entries
+      directly into the parent .jsonl with `isSidechain: true`. Each
+      contiguous cluster (walked via `parentUuid`) is one run, anchored on
+      the closest non-sidechain ancestor. `source = "inline"`. Run id =
+      `inline:<anchor_uuid>`.
+
+    Returns: {run_id: run_dict}. All runs share: run_id, name, source,
+    message_count, first_ts. Subagent runs additionally carry
+    `anchor_tool_use_id` (or None). Inline runs carry `anchor_uuid`. The
+    loader also stores `source_file` for internal use.
+    """
+    runs = {}
+
+    # Parent tool_use_id -> tool name, so we can filter ptus to only the
+    # ones that represent an actual subagent invocation (Agent / Task).
+    parent_path = _convo_path(folder, convo_id)
+    tool_names = {}
+    if parent_path and parent_path.exists():
+        with open(parent_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = entry.get("message") or {}
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        tool_names[b.get("id")] = b.get("name")
+
+        # Old-format: inline clusters in the parent file.
+        stat = parent_path.stat()
+        for r in _inline_agent_runs_from_parent(str(parent_path), stat.st_mtime, stat.st_size):
+            runs[r["run_id"]] = r
+
+    # New-format: one run per file in <convo_id>/subagents/.
+    subdir = _subagents_dir(folder, convo_id)
+    if subdir.is_dir():
+        for fp in sorted(subdir.glob("agent-*.jsonl")):
+            m = _AGENT_FILENAME_RE.match(fp.stem)
+            name = m.group(1) if (m and m.group(1)) else "agent"
+            run_hash = m.group(2) if m else fp.stem
+            try:
+                message_count = 0
+                first_ts = None
+                anchor_tool_use_id = None
+                with open(fp, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        ts = entry.get("timestamp")
+                        # Walk the file once: count formatted messages, track
+                        # earliest timestamp, and pick up the first Agent/Task
+                        # ptu we see as the parent-side anchor.
+                        if _format_entry_message(entry) is not None:
+                            message_count += 1
+                            if ts and (first_ts is None or ts < first_ts):
+                                first_ts = ts
+                        ptu = entry.get("parentToolUseID")
+                        if (
+                            anchor_tool_use_id is None
+                            and ptu
+                            and tool_names.get(ptu) in ("Agent", "Task")
+                        ):
+                            anchor_tool_use_id = ptu
+                runs[run_hash] = {
+                    "run_id": run_hash,
+                    "name": name,
+                    "source": "subagent",
+                    "source_file": str(fp),
+                    "anchor_tool_use_id": anchor_tool_use_id,
+                    "message_count": message_count,
+                    "first_ts": first_ts,
+                }
+            except OSError:
+                continue
+
+    return runs
+
+
+def _load_agent_run_messages(run):
+    """Load and format messages for a single agent run, dispatched by source."""
+    if run.get("source") == "inline":
+        return _load_inline_run_messages(run)
+    return _load_subagent_run_messages(run)
+
+
+def _load_subagent_run_messages(run):
+    """New-format loader: return every formatted message in the subagent
+    file. `parentToolUseID` isn't used for filtering (one file = one run);
+    it only anchors the parent-side UI marker, computed elsewhere."""
+    messages = []
+    fp = Path(run["source_file"])
+    with open(fp, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = _format_entry_message(entry)
+            if msg is None:
+                continue
+            messages.append(msg)
+    return _dedup_by_uuid(messages)
+
+
+def _load_inline_run_messages(run):
+    """Old-format loader: pull isSidechain:true entries from the parent file
+    whose root (closest non-sidechain ancestor via parentUuid chain) matches
+    this run's anchor_uuid."""
+    fp = Path(run["source_file"])
+    anchor = run["anchor_uuid"]
+    entries = []
+    by_uuid = {}
+    with open(fp, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            entries.append(entry)
+            if entry.get("uuid"):
+                by_uuid[entry["uuid"]] = entry
+
+    def anchor_for(entry):
+        cur = entry.get("parentUuid")
+        seen = set()
+        while cur and cur in by_uuid and by_uuid[cur].get("isSidechain"):
+            if cur in seen:
+                break
+            seen.add(cur)
+            cur = by_uuid[cur].get("parentUuid")
+        return cur or "__root__"
+
+    messages = []
+    for e in entries:
+        if not e.get("isSidechain"):
+            continue
+        if anchor_for(e) != anchor:
+            continue
+        msg = _format_entry_message(e)
+        if msg is None:
+            continue
+        messages.append(msg)
+    return _dedup_by_uuid(messages)
 
 
 def _convo_files(project_dir: Path):
@@ -646,6 +1099,7 @@ def _invalidate_cache_for(filepath: Path):
     """After a mutation, clear caches that might hold stale data."""
     _peek_jsonl_cached.cache_clear()
     _parse_messages_cached.cache_clear()
+    _inline_agent_runs_from_parent.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1243,6 +1697,7 @@ def api_refresh_cache(folder):
     _peek_jsonl_cached.cache_clear()
     _custom_title_cached.cache_clear()
     _parse_messages_cached.cache_clear()
+    _inline_agent_runs_from_parent.cache_clear()
     return jsonify({"ok": True})
 
 
@@ -1359,7 +1814,7 @@ def api_conversation(folder, convo_id):
     offset_arg = request.args.get("offset")
 
     stat = filepath.stat()
-    main, side = _parse_messages_cached(str(filepath), stat.st_mtime, stat.st_size)
+    main = _parse_messages_cached(str(filepath), stat.st_mtime, stat.st_size)
 
     total_main = len(main)
     # Default to the most recent page (chat-style), so long conversations
@@ -1370,13 +1825,78 @@ def api_conversation(folder, convo_id):
         page_start = max(0, min(int(offset_arg), total_main))
     page_main = main[page_start:page_start + limit]
 
+    runs = _agent_runs_for_convo(folder, convo_id)
+    agent_runs = []
+    for r in runs.values():
+        out = {
+            "run_id": r["run_id"],
+            "name": r["name"],
+            "source": r["source"],
+            "message_count": r["message_count"],
+            "first_ts": r["first_ts"],
+        }
+        # Anchor fields are format-specific: subagent runs point to a parent
+        # Task/Agent tool_use_id (may be None for standalone subagents);
+        # inline runs point to the main-message uuid their cluster branched
+        # from. The frontend uses whichever is present to place the marker.
+        if "anchor_tool_use_id" in r:
+            out["anchor_tool_use_id"] = r["anchor_tool_use_id"]
+        if "anchor_uuid" in r:
+            out["anchor_uuid"] = r["anchor_uuid"]
+        agent_runs.append(out)
+    agent_runs.sort(key=lambda r: r["first_ts"] or "")
+
     return jsonify({
         "main": page_main,
-        "sidechain": side,
         "total": total_main,
         "offset": page_start,
         "limit": limit,
+        "agent_runs": agent_runs,
     })
+
+
+
+@app.route("/api/projects/<folder>/conversations/<convo_id>/agent/<run_id>")
+def api_agent_run(folder, convo_id, run_id):
+    """Messages for one agent run.
+
+    `run_id` is the filename `<hash>` for subagent runs, or `inline:<uuid>`
+    for legacy inline clusters. Returns the same shape as `api_conversation`
+    so the frontend reuses its renderer; offset/limit aren't wired (runs
+    are small enough to ship whole).
+    """
+    runs = _agent_runs_for_convo(folder, convo_id)
+    run = runs.get(run_id)
+    if not run:
+        return jsonify({"error": "Agent run not found"}), 404
+    messages = _load_agent_run_messages(run)
+    return jsonify({
+        "main": messages,
+        "total": len(messages),
+        "offset": 0,
+        "limit": len(messages),
+        "agent_name": run["name"],
+        "run_id": run_id,
+        "parent_convo_id": convo_id,
+    })
+
+
+@app.route("/api/projects/<folder>/conversations/<convo_id>/raw")
+def api_conversation_raw(folder, convo_id):
+    """Return the unmodified source .jsonl as an attachment.
+
+    Preserves all fields the parser strips (parentUuid, sessionId, cwd,
+    message.id, usage, toolUseResult, etc.) so the download round-trips.
+    """
+    filepath = _convo_path(folder, convo_id)
+    if not filepath:
+        return jsonify({"error": "Conversation not found"}), 404
+    return send_file(
+        filepath,
+        mimetype="application/x-ndjson",
+        as_attachment=True,
+        download_name=f"{convo_id}.jsonl",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1846,6 +2366,30 @@ _DEFAULT_FILLER = [
 ]
 
 
+# Verbosity signalers — separate motivation from swears/filler. These
+# don't change agent behavior; they just cost tokens and obscure meaning.
+# Default list is conservative: obviousness signalers and meta-commentary
+# phrases that are near-always filler. Users can opt into sincerity
+# markers, intensifiers, and hedges via the curation modal.
+# Matched word-bounded, case-insensitive (same mechanism as swears, minus
+# the `*` stem syntax — verbosity entries are literal words/phrases).
+_DEFAULT_VERBOSITY = [
+    # Obviousness signalers — assert agreement rather than earn it
+    "needless to say",
+    "of course",
+    "obviously",
+    "clearly",
+    "evidently",
+    # Meta-commentary / throat-clearing phrases
+    "that's a great question",
+    "that is a great question",
+    "what I'd say is",
+    "what I'm saying is",
+    "at the end of the day",
+    "when all is said and done",
+]
+
+
 def _word_lists_path() -> Path:
     return Path.home() / ".cache" / "llm-lens" / "word_lists.json"
 
@@ -1865,6 +2409,7 @@ def _load_word_lists() -> dict:
     return {
         "swears": user.get("swears") if isinstance(user.get("swears"), list) else list(_DEFAULT_SWEARS),
         "filler": user.get("filler") if isinstance(user.get("filler"), list) else list(_DEFAULT_FILLER),
+        "verbosity": user.get("verbosity") if isinstance(user.get("verbosity"), list) else list(_DEFAULT_VERBOSITY),
     }
 
 
@@ -1874,7 +2419,58 @@ def _save_word_lists(data: dict) -> dict:
     cleaned = {
         "swears": [s for s in (data.get("swears") or []) if isinstance(s, str) and s.strip()],
         "filler": [s for s in (data.get("filler") or []) if isinstance(s, str) and s.strip()],
+        "verbosity": [s for s in (data.get("verbosity") or []) if isinstance(s, str) and s.strip()],
     }
+    path.write_text(json.dumps(cleaned, indent=2))
+    return cleaned
+
+
+_DEFAULT_DOWNLOAD_FIELDS = {
+    "uuid": True,
+    "role": True,
+    "content": True,
+    "timestamp": True,
+    "commands": False,
+    "model": False,
+    "usage": False,
+}
+# role + content are structurally required for a message to be meaningful;
+# the frontend disables these checkboxes so they're always included.
+_REQUIRED_DOWNLOAD_FIELDS = ("role", "content")
+_ALL_DOWNLOAD_FIELDS = tuple(_DEFAULT_DOWNLOAD_FIELDS.keys())
+
+
+def _download_fields_path() -> Path:
+    return Path.home() / ".cache" / "llm-lens" / "download_fields.json"
+
+
+def _load_download_fields() -> dict:
+    """Return the effective on/off state for each exportable field."""
+    path = _download_fields_path()
+    user = {}
+    if path.exists():
+        try:
+            user = json.loads(path.read_text()) or {}
+        except (OSError, json.JSONDecodeError):
+            user = {}
+    out = {}
+    for k in _ALL_DOWNLOAD_FIELDS:
+        if k in _REQUIRED_DOWNLOAD_FIELDS:
+            out[k] = True
+        else:
+            out[k] = bool(user[k]) if isinstance(user.get(k), bool) else _DEFAULT_DOWNLOAD_FIELDS[k]
+    return out
+
+
+def _save_download_fields(data: dict) -> dict:
+    path = _download_fields_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cleaned = {}
+    for k in _ALL_DOWNLOAD_FIELDS:
+        if k in _REQUIRED_DOWNLOAD_FIELDS:
+            cleaned[k] = True
+        else:
+            cleaned[k] = bool(data.get(k)) if isinstance(data.get(k), bool) else _DEFAULT_DOWNLOAD_FIELDS[k]
     path.write_text(json.dumps(cleaned, indent=2))
     return cleaned
 
@@ -1937,17 +2533,18 @@ def api_edit_message(folder, convo_id, msg_uuid):
 
 @app.route("/api/word-lists", methods=["GET"])
 def api_get_word_lists():
-    """Return the effective swears + filler lists. Defaults shipped in
-    code are used for any key the user hasn't customized."""
+    """Return the effective swears + filler + verbosity lists. Defaults
+    shipped in code are used for any key the user hasn't customized."""
     return jsonify(_load_word_lists())
 
 
 @app.route("/api/word-lists", methods=["POST"])
 def api_save_word_lists():
     """Persist user-curated lists. Body shape:
-        {"swears": [...], "filler": [...]}
+        {"swears": [...], "filler": [...], "verbosity": [...]}
     Each list fully replaces the default for that key — pass an empty
-    list to disable a category entirely.
+    list to disable a category entirely. Missing keys fall back to the
+    shipped defaults on subsequent loads.
     """
     payload = request.get_json(silent=True) or {}
     saved = _save_word_lists(payload)
@@ -1961,7 +2558,27 @@ def api_get_word_list_defaults():
     return jsonify({
         "swears": list(_DEFAULT_SWEARS),
         "filler": list(_DEFAULT_FILLER),
+        "verbosity": list(_DEFAULT_VERBOSITY),
     })
+
+
+@app.route("/api/download-fields", methods=["GET"])
+def api_get_download_fields():
+    """Return the effective JSONL download field map.
+
+    Keys cover every field the exporter can emit. `role` and `content` are
+    always true (frontend disables those checkboxes — a message without them
+    isn't useful to export)."""
+    return jsonify(_load_download_fields())
+
+
+@app.route("/api/download-fields", methods=["POST"])
+def api_save_download_fields():
+    """Persist the user's JSONL download field selection. Body shape:
+        {"uuid": bool, "role": bool, ...}
+    Unknown keys are ignored; required keys are forced true."""
+    payload = request.get_json(silent=True) or {}
+    return jsonify(_save_download_fields(payload))
 
 
 @app.route("/api/projects/<folder>/conversations/<convo_id>/extract", methods=["POST"])

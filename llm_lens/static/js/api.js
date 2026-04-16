@@ -22,6 +22,9 @@ export const api = {
     return json(`/api/projects/${folder}/conversations/${convoId}?${params}`);
   },
 
+  agentRun: (folder, convoId, toolUseId) =>
+    json(`/api/projects/${folder}/conversations/${convoId}/agent/${encodeURIComponent(toolUseId)}`),
+
   deleteProject: (folder) =>
     json(`/api/projects/${folder}`, { method: "DELETE" }),
 
@@ -118,6 +121,19 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
     }),
+
+  getDownloadFields: () =>
+    json("/api/download-fields"),
+
+  saveDownloadFields: (data) =>
+    json("/api/download-fields", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+
+  rawConversationUrl: (folder, convoId) =>
+    `/api/projects/${encodeURIComponent(folder)}/conversations/${encodeURIComponent(convoId)}/raw`,
 
   extractMessages: (folder, convoId, uuids) =>
     json(`/api/projects/${folder}/conversations/${convoId}/extract`, {

@@ -12,8 +12,17 @@ const bc = document.getElementById("breadcrumb");
 const PAGE_MSGS = 60;
 
 import { applyTransform } from "../transforms.js";
+import { showPreviewModal } from "../preview.js";
+import {
+  EXPORT_FIELDS,
+  REQUIRED_EXPORT_FIELDS,
+  ensureDownloadFields,
+  serializeAsText,
+  serializeAsJsonl,
+  downloadBlob,
+} from "../exports.js";
 
-const WORD_LIST_KINDS = new Set(["remove_swears", "remove_filler"]);
+const WORD_LIST_KINDS = new Set(["remove_swears", "remove_filler", "remove_verbosity", "remove_priming"]);
 
 function needsWordLists(kind) {
   return WORD_LIST_KINDS.has(kind);
@@ -24,7 +33,7 @@ async function ensureWordLists() {
   try {
     state.wordLists = await api.getWordLists();
   } catch {
-    state.wordLists = { swears: [], filler: [] };
+    state.wordLists = { swears: [], filler: [], verbosity: [] };
   }
   return state.wordLists;
 }
@@ -33,6 +42,7 @@ export async function show(folder, convoId) {
   state.view = "messages";
   state.folder = folder;
   state.convoId = convoId;
+  state.agentRunId = null;
   state.convoName = null;
   state.msgSelected.clear();
   state.msgSearch = "";
@@ -47,6 +57,36 @@ export async function show(folder, convoId) {
   state.msgData = await api.messages(folder, convoId, { limit: PAGE_MSGS });
   state.msgOffset = state.msgData.offset;
   state.msgTotal = state.msgData.total;
+  render();
+}
+
+
+export async function showAgent(folder, convoId, toolUseId) {
+  // Agent-run view: scoped to messages of one subagent run within a parent
+  // conversation. Loads from /agent/<tool_use_id> which returns the same
+  // shape as api_conversation, so the existing render path just works.
+  state.view = "messages";
+  state.folder = folder;
+  state.convoId = convoId;
+  state.agentRunId = toolUseId;
+  state.msgSelected.clear();
+  state.msgSearch = "";
+  state.search = "";
+
+  await resolvePath(folder);
+  renderBreadcrumb();
+  hydrateConvoName(folder, convoId);
+
+  app.innerHTML = '<div class="loading">Loading agent run…</div>';
+  try {
+    state.msgData = await api.agentRun(folder, convoId, toolUseId);
+  } catch (e) {
+    app.innerHTML = '<div class="error">Agent run not found.</div>';
+    return;
+  }
+  state.msgOffset = 0;
+  state.msgTotal = state.msgData.total;
+  renderBreadcrumb();
   render();
 }
 
@@ -94,10 +134,24 @@ function renderBreadcrumb() {
       tagsHtml = `<span class="bc-tags">${pills}${addBtn}</span>`;
     }
   }
+
+  // Agent segment: the parent-convo name becomes clickable, and a new leaf
+  // shows "Agent: <name>". Tag pills hide in agent view since they're
+  // parent-convo concerns, not per-run.
+  let convoSeg;
+  if (state.agentRunId) {
+    convoSeg =
+      `<a data-action="nav-convo">${esc(display)}</a>${copyBtn} /` +
+      ` <span class="bc-agent-name">Agent: ${esc(state.msgData?.agent_name || "agent")}</span>`;
+    tagsHtml = "";
+  } else {
+    convoSeg = `<span class="bc-convo-name">${esc(display)}</span>${copyBtn}${tagsHtml}`;
+  }
+
   bc.innerHTML = `
     <a data-action="nav-projects">Projects</a> /
     <a data-action="nav-folder" data-folder="${escAttr(state.folder)}">${esc(state.path)}</a> /
-    <span class="bc-convo-name">${esc(display)}</span>${copyBtn}${tagsHtml}
+    ${convoSeg}
   `;
 }
 
@@ -172,13 +226,18 @@ export async function pickConvoTag(tagIndex) {
 }
 
 function renderToolbar() {
-  const side = state.msgData?.sidechain || [];
   let extra = "";
-  if (state.msgOffset > 0) {
+  // "Earlier" only applies to parent-convo paging; agent runs are loaded
+  // whole by the /agent/<run_id> endpoint.
+  if (!state.agentRunId && state.msgOffset > 0) {
     extra += `<button class="btn" data-action="load-earlier-msgs">Earlier (${state.msgOffset})</button> `;
   }
-  if (side.length > 0) {
-    extra += `<button class="btn ${state.showSide ? "active" : ""}" data-action="toggle-side">Side (${side.length})</button> `;
+  // Agent-run index — comprehensive list (anchored + standalone). Anchored
+  // runs also have inline `→` markers in the transcript; this button is
+  // the only way to reach standalone ones.
+  const runs = (!state.agentRunId && state.msgData?.agent_runs) || [];
+  if (runs.length > 0) {
+    extra += `<button class="btn" data-action="open-agents-menu" title="List all subagents spawned by this conversation">Subagents (${runs.length})</button> `;
   }
   extra += `<button class="btn ${state.showWhitespace ? "active" : ""}" data-action="toggle-whitespace" title="Show invisible characters: spaces as · and tabs as →">Whitespace</button>`;
   configureToolbar({
@@ -193,11 +252,10 @@ export function render() {
   renderToolbar();
 
   const main = state.msgData?.main || [];
-  const side = state.msgData?.sidechain || [];
   const q = state.msgSearch.toLowerCase();
   const filtered = q ? main.filter((m) => (m.content || "").toLowerCase().includes(q)) : main;
 
-  let h = '<div class="convo-flex"><div class="chat-wrap">';
+  let h = '<div class="chat-wrap">';
   if (state.editMode && filtered.length > 0) {
     const selectable = filtered.filter((m) => !!m.uuid);
     const allSelected = selectable.length > 0 &&
@@ -208,23 +266,11 @@ export function render() {
   h += renderChatMessages(filtered, q);
   h += "</div>";
 
-  if (side.length > 0) {
-    h += `<div class="convo-side ${state.showSide ? "" : "hidden"}"><h3>Side conversations</h3>`;
-    for (const m of side) {
-      const role = m.role === "user" ? "user" : "assistant";
-      const c = processContent(m.content || "");
-      if (c.html) h += `<div class="side-msg ${role}"><div class="msg-content">${c.html}</div></div>`;
-    }
-    h += "</div>";
-  }
-  h += "</div>";
-
   if (state.editMode && state.msgSelected.size > 0) {
     h += `
       <div class="sel-bar">
         <span>${state.msgSelected.size} selected</span>
-        <button class="btn" data-action="copy-selected">Copy</button>
-        <button class="btn" data-action="save-selected" title="Non-destructive: creates a new conversation, leaves this one intact. Preferred for curation.">Save to new convo</button>
+        <button class="btn" data-action="open-export-menu" title="Copy, download, or extract the selected messages.">Export/Extract ▾</button>
         <span class="split-btn">
           <button class="btn" data-action="bulk-transform" data-kind="scrub" title="Scrub text on selected prose-only messages. Non-prose messages are skipped.">Scrub</button>
           <button class="btn split-arrow" data-action="open-bulk-transform-menu" title="More text transforms">▾</button>
@@ -242,6 +288,19 @@ export function render() {
 function processContent(raw, commands) {
   const cmdById = {};
   for (const c of commands || []) cmdById[c.id] = c.command;
+
+  // New-format agent runs surface a `→ <agent-name>` link next to their
+  // parent-side anchor — the Agent/Task `tool_use` block they spawned
+  // from. `anchor_tool_use_id` may be null for standalone subagents; those
+  // runs only appear in the toolbar list, not inline. Multiple runs may
+  // share an anchor (one Agent invocation fans out to several subagents),
+  // so we collect them as a list per id, not a single entry.
+  const runsByAnchorToolUseId = {};
+  for (const r of (state.msgData?.agent_runs || [])) {
+    if (r.source === "subagent" && r.anchor_tool_use_id) {
+      (runsByAnchorToolUseId[r.anchor_tool_use_id] ||= []).push(r);
+    }
+  }
 
   const thinkingBlocks = [];
   let c = raw.replace(/<thinking>([\s\S]*?)<\/thinking>/g, (_, inner) => {
@@ -274,6 +333,10 @@ function processContent(raw, commands) {
     } else {
       badge = `<span class="tool-badge">${esc(name)}</span>`;
     }
+    const anchored = tid ? (runsByAnchorToolUseId[tid] || []) : [];
+    for (const run of anchored) {
+      badge += ` <a class="agent-link" data-action="open-agent" data-run-id="${escAttr(run.run_id)}" title="Open subagent transcript (${run.message_count} message${run.message_count === 1 ? "" : "s"})">→ ${esc(run.name)}</a>`;
+    }
     toolBadges.push(badge);
     toolNames.push(name);
     return ph;
@@ -282,6 +345,36 @@ function processContent(raw, commands) {
     const ph = `__TOOL_${toolBadges.length}__`;
     toolBadges.push('<span class="tool-badge">Result</span>');
     toolNames.push("Result");
+    return ph;
+  });
+
+  // System / slash-command / queue-operation markers emitted by the backend
+  // for entries that previously didn't surface (top-level `content`, no
+  // `message` object). Each becomes a small pill in the transcript.
+  //   [Slash: /btw]       → ⎇ /btw
+  //   [SlashOut] text     → stdout pill + text flows after
+  //   [SlashErr] text     → stderr pill + text flows after
+  //   [Queued] text       → queued pill + text flows after
+  //   [Compacted] text    → compacted marker
+  //   [Away] text         → away-summary marker
+  //   [Info] text         → info marker
+  //   [Scheduled] text    → scheduled-task marker
+  c = c.replace(/\[(Slash|SlashOut|SlashErr|Queued|Compacted|Away|Info|Scheduled|System)(?::\s*([^\]]+))?\]/g, (_, kind, payload) => {
+    const ph = `__TOOL_${toolBadges.length}__`;
+    const labels = {
+      Slash: payload || "/",
+      SlashOut: "stdout",
+      SlashErr: "stderr",
+      Queued: "queued",
+      Compacted: "compacted",
+      Away: "away summary",
+      Info: "info",
+      Scheduled: "scheduled",
+      System: "system",
+    };
+    const cls = `tool-badge tool-badge-${kind.toLowerCase()}`;
+    toolBadges.push(`<span class="${cls}">${esc(labels[kind])}</span>`);
+    toolNames.push(kind);
     return ph;
   });
 
@@ -424,7 +517,21 @@ function renderSingleMsg(p, compact) {
   const metaHtml = compact
     ? ""
     : `<div class="chat-meta"><span class="role-lbl">${role}</span><span>${ts}</span></div>`;
-  return `<div class="chat-msg ${role}${compact ? " compact" : ""}">${checkHtml}<div class="${bubbleCls}"${bubbleUuidAttr}>${actionsHtml}${metaHtml}<div class="msg-content">${c}</div></div></div>`;
+
+  // Inline agent-run marker: old-format clusters have no Task tool_use to
+  // attach to, so we anchor on the main message whose uuid matches the
+  // cluster's anchor_uuid. A small "legacy" tag flags the format.
+  let agentInline = "";
+  if (m.uuid && state.msgData?.agent_runs) {
+    const matches = state.msgData.agent_runs.filter(
+      (r) => r.source === "inline" && r.anchor_uuid === m.uuid
+    );
+    for (const r of matches) {
+      agentInline += ` <a class="agent-link agent-link-inline" data-action="open-agent" data-run-id="${escAttr(r.run_id)}" title="Open inline agent transcript (${r.message_count} message${r.message_count === 1 ? "" : "s"})">→ ${esc(r.name)} <span class="agent-src-tag">legacy</span></a>`;
+    }
+  }
+
+  return `<div class="chat-msg ${role}${compact ? " compact" : ""}">${checkHtml}<div class="${bubbleCls}"${bubbleUuidAttr}>${actionsHtml}${metaHtml}<div class="msg-content">${c}${agentInline}</div></div></div>`;
 }
 
 function renderToolGroup(items, groupId, expanded) {
@@ -457,15 +564,51 @@ export async function loadEarlier() {
   render();
 }
 
-export function toggleSide() {
-  state.showSide = !state.showSide;
+export function toggleWhitespace() {
+  state.showWhitespace = !state.showWhitespace;
   render();
 }
 
 
-export function toggleWhitespace() {
-  state.showWhitespace = !state.showWhitespace;
-  render();
+export function openAgentsMenu(anchorEl) {
+  // Toggle: re-click closes. Also close any other transform-style menus.
+  const existing = document.querySelector(".transform-menu[data-agents='1']");
+  if (existing) { existing.remove(); return; }
+  document.querySelectorAll(".transform-menu").forEach((el) => el.remove());
+
+  const runs = state.msgData?.agent_runs || [];
+  if (runs.length === 0) return;
+
+  const menu = document.createElement("div");
+  menu.className = "transform-menu";
+  menu.dataset.agents = "1";
+  // Sort: anchored subagents first (they have an inline marker too), then
+  // standalone, then inline-legacy. Within each group, order by first_ts.
+  const rank = (r) => r.source === "subagent" && r.anchor_tool_use_id ? 0
+                   : r.source === "subagent" ? 1
+                   : 2;
+  const sorted = [...runs].sort((a, b) => rank(a) - rank(b) || (a.first_ts || "").localeCompare(b.first_ts || ""));
+  menu.innerHTML = sorted.map((r) => {
+    const srcLabel = r.source === "inline" ? "legacy"
+                   : r.anchor_tool_use_id ? "" : "standalone";
+    const tag = srcLabel ? ` <span class="agent-src-tag">${srcLabel}</span>` : "";
+    return `<button class="btn btn-sm transform-menu-item" data-action="open-agent" data-run-id="${escAttr(r.run_id)}" title="${esc(r.name)} — ${r.message_count} message${r.message_count === 1 ? "" : "s"}">${esc(r.name)} <span class="agent-src-tag">${r.message_count}</span>${tag}</button>`;
+  }).join("");
+
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.position = "absolute";
+  menu.style.left = `${rect.left + window.scrollX}px`;
+  menu.style.top = `${rect.bottom + window.scrollY + 2}px`;
+  document.body.appendChild(menu);
+  setTimeout(() => {
+    const handler = (ev) => {
+      if (!menu.contains(ev.target) && ev.target !== anchorEl) {
+        menu.remove();
+        document.removeEventListener("click", handler, true);
+      }
+    };
+    document.addEventListener("click", handler, true);
+  }, 0);
 }
 
 export function toggleMsgSel(uuid) {
@@ -503,14 +646,21 @@ export function openBulkTransformMenu(anchorEl) {
     .map(([kind, label]) =>
       `<button class="btn btn-sm transform-menu-item" data-action="bulk-transform" data-kind="${kind}">${label}</button>`
     ).join("");
+  const previewOn = state.previewEnabled;
+  const toggleLabel = previewOn ? "Turn off preview edits" : "Turn on preview edits";
   menu.innerHTML = items +
     `<div class="transform-menu-sep"></div>` +
+    `<button class="btn btn-sm transform-menu-item transform-menu-toggle" data-action="toggle-preview" title="Show a review modal before applying any edit. Toggle any time from this menu or from inside the preview modal.">${toggleLabel}</button>` +
     `<button class="btn btn-sm transform-menu-item" data-action="open-word-lists">Curate word lists…</button>`;
   const rect = anchorEl.getBoundingClientRect();
   menu.style.position = "absolute";
-  menu.style.top = `${rect.bottom + window.scrollY + 2}px`;
+  // Surface above the anchor — sel-bar is at viewport bottom, a
+  // downward-opening menu gets clipped by the page edge.
   menu.style.left = `${rect.left + window.scrollX}px`;
+  menu.style.visibility = "hidden";
   document.body.appendChild(menu);
+  menu.style.top = `${rect.top + window.scrollY - menu.offsetHeight - 2}px`;
+  menu.style.visibility = "";
   setTimeout(() => {
     const handler = (ev) => {
       if (!menu.contains(ev.target)) {
@@ -520,6 +670,109 @@ export function openBulkTransformMenu(anchorEl) {
     };
     document.addEventListener("click", handler, true);
   }, 0);
+}
+
+
+export function openExportMenu(anchorEl) {
+  const existing = document.querySelector(".transform-menu[data-export='1']");
+  if (existing) {
+    existing.remove();
+    return;
+  }
+  // Close any other open transform menus
+  document.querySelectorAll(".transform-menu").forEach((el) => el.remove());
+
+  const menu = document.createElement("div");
+  menu.className = "transform-menu";
+  menu.dataset.export = "1";
+  menu.innerHTML = [
+    `<button class="btn btn-sm transform-menu-item" data-action="copy-selected" title="Copy selected messages as plain text (Role: body, blank line between).">Copy plain to clipboard</button>`,
+    `<button class="btn btn-sm transform-menu-item" data-action="copy-selected-jsonl" title="Copy selected messages as JSONL using the current JSONL fields.">Copy JSONL to clipboard</button>`,
+    `<button class="btn btn-sm transform-menu-item" data-action="download-selected-jsonl" title="Download selected messages as a .jsonl file using the current JSONL fields.">Download JSONL</button>`,
+    `<div class="transform-menu-sep"></div>`,
+    `<button class="btn btn-sm transform-menu-item" data-action="save-selected" title="Writes a NEW .jsonl on disk: a fresh conversation containing only the selected messages. parentUuid chain is remapped and orphan tool blocks are stripped.">Extract to new conversation</button>`,
+    `<div class="transform-menu-sep"></div>`,
+    `<button class="btn btn-sm transform-menu-item" data-action="open-jsonl-fields" title="Pick which fields are included in JSONL exports (Copy JSONL / Download JSONL).">JSONL fields…</button>`,
+  ].join("");
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.position = "absolute";
+  // Anchor to the top of the button and render ABOVE it — the sel-bar sits
+  // at the bottom of the viewport, so a downward-opening menu gets clipped.
+  menu.style.left = `${rect.left + window.scrollX}px`;
+  menu.style.visibility = "hidden";
+  document.body.appendChild(menu);
+  menu.style.top = `${rect.top + window.scrollY - menu.offsetHeight - 2}px`;
+  menu.style.visibility = "";
+  setTimeout(() => {
+    const handler = (ev) => {
+      if (!menu.contains(ev.target)) {
+        menu.remove();
+        document.removeEventListener("click", handler, true);
+      }
+    };
+    document.addEventListener("click", handler, true);
+  }, 0);
+}
+
+export async function openJsonlFieldsModal() {
+  let current;
+  try {
+    current = await ensureDownloadFields();
+  } catch (e) {
+    alert(`Couldn't load JSONL fields: ${e.message}`);
+    return;
+  }
+
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const fieldRows = EXPORT_FIELDS.map((f) => {
+    const required = REQUIRED_EXPORT_FIELDS.includes(f);
+    const checked = required || current[f] ? "checked" : "";
+    const disabled = required ? "disabled" : "";
+    const hint = required ? " <span style=\"color:var(--text3); font-weight:normal\">(required)</span>" : "";
+    return `<label class="jsonl-field-row"><input type="checkbox" data-field="${f}" ${checked} ${disabled}> <code>${f}</code>${hint}</label>`;
+  }).join("");
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>JSONL fields</h3>
+      <p style="font-size:13px; color:var(--text2)">
+        Which fields to include when exporting messages as JSONL
+        (Copy JSONL / Download JSONL). <code>role</code> and
+        <code>content</code> are always included. For the full unmodified
+        source file, use <em>Download raw convo</em> in the page toolbar.
+      </p>
+      <div class="jsonl-fields-list">${fieldRows}</div>
+      <div class="modal-actions">
+        <button class="btn btn-sm" data-select-all>Select all</button>
+        <span style="flex:1"></span>
+        <button class="btn-cancel" data-modal-cancel>Cancel</button>
+        <button class="btn-confirm-delete" data-modal-save>Save</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const close = () => overlay.remove();
+  overlay.addEventListener("click", async (e) => {
+    if (e.target === overlay || e.target.matches("[data-modal-cancel]")) {
+      close();
+    } else if (e.target.matches("[data-select-all]")) {
+      overlay.querySelectorAll("input[type=checkbox][data-field]").forEach((cb) => {
+        if (!cb.disabled) cb.checked = true;
+      });
+    } else if (e.target.matches("[data-modal-save]")) {
+      const payload = {};
+      overlay.querySelectorAll("input[type=checkbox][data-field]").forEach((cb) => {
+        payload[cb.dataset.field] = cb.checked;
+      });
+      try {
+        state.downloadFields = await api.saveDownloadFields(payload);
+      } catch (err) {
+        alert(`Save failed: ${err.message}`);
+        return;
+      }
+      close();
+    }
+  });
 }
 
 
@@ -574,8 +827,8 @@ export function deleteMsg(uuid) {
 export const TRANSFORM_LABELS = {
   scrub: "Scrub (replace text with \".\")",
   normalize_whitespace: "Normalize whitespace",
-  remove_swears: "Remove swears",
-  remove_filler: "Remove filler / drift phrases",
+  remove_verbosity: "Remove verbosity",
+  remove_priming: "Remove priming language",
 };
 
 const TRANSFORM_CONFIRM = {
@@ -587,16 +840,27 @@ const TRANSFORM_CONFIRM = {
   normalize_whitespace: `Collapses runs of spaces/tabs into a single space
     and 3+ consecutive newlines into a double newline. Leaves
     <code>usage</code> and chain alone. Prose-only messages.`,
-  remove_swears: `Strips swear words listed in your word list from the
-    message text. Matches are word-bounded — bare "ass" won't blow up
-    "assistant". Stems with a trailing <code>*</code> (e.g.
-    <code>fuck*</code>) catch a closed list of conjugations
-    (fuck/fucks/fucker/fucking/...). Use <em>Curate word lists</em> to
-    edit. Leaves <code>usage</code> and chain alone.`,
-  remove_filler: `Removes sycophancy / drift phrases (e.g. "You're absolutely
-    right!", "Let me think step by step.") from the message text. Phrases
-    are matched exactly, case-insensitive. Use <em>Curate word lists</em>
-    to edit. Leaves <code>usage</code> and chain alone.`,
+  remove_priming: `Strips priming language from the message — words and
+    phrases in prior turns that degrade the next turn's output. Two
+    sub-lists applied in sequence: <strong>swears</strong> (emotionally
+    charged words, word-bounded, <code>*</code> stem syntax for
+    conjugations) and <strong>drift phrases</strong> (sycophancy /
+    meta-commentary like "You're absolutely right!", matched exactly
+    case-insensitive). Evidence base:
+    <a href="https://dafmulder.substack.com/p/i-ran-1950-experiments-to-find-out" target="_blank" rel="noopener">Mulder's 1,950 experiments</a>
+    and
+    <a href="https://www.reddit.com/r/ClaudeAI/comments/1skmgef/emotional_priming_changes_claudes_code_more_than/" target="_blank" rel="noopener">community replication</a>.
+    Use <em>Curate word lists</em> to edit either sub-list. Leaves
+    <code>usage</code> and chain alone.`,
+  remove_verbosity: `Separate from priming — this doesn't change agent
+    behavior, it just reclaims tokens. Strips obviousness signalers
+    ("obviously", "clearly", "of course") and meta-commentary phrases
+    ("that's a great question", "at the end of the day") matched
+    word-bounded, case-insensitive. Default list is conservative; add
+    sincerity markers, intensifiers, or hedges via
+    <em>Curate word lists</em> if you want them gone too. Test for any
+    candidate: remove it, and if the sentence still makes sense it was
+    filler. Leaves <code>usage</code> and chain alone.`,
 };
 
 export async function transformMsg(uuid, kind = "scrub") {
@@ -605,22 +869,40 @@ export async function transformMsg(uuid, kind = "scrub") {
     alert(`Unknown transform: ${kind}`);
     return;
   }
+  const m = (state.msgData?.main || []).find((x) => x.uuid === uuid);
+  if (!m) return;
+  const lists = needsWordLists(kind) ? await ensureWordLists() : {};
+
+  const doApply = async (newText) => {
+    try {
+      await api.editMessage(state.folder, state.convoId, uuid, newText);
+    } catch (e) {
+      alert(`Transform failed: ${e.message}`);
+      return;
+    }
+    show(state.folder, state.convoId);
+  };
+
+  if (state.previewEnabled) {
+    const res = await showPreviewModal({
+      kind,
+      label: TRANSFORM_LABELS[kind],
+      candidates: [{ uuid, content: m.content || "" }],
+      opts: lists,
+    });
+    if (!res || !res.acceptedIds || res.acceptedIds.size === 0) return;
+    const entry = res.byId.get(uuid);
+    if (!entry) return;
+    await doApply(entry.after);
+    return;
+  }
+
+  // Preview disabled — fall back to the original confirmation flow so a
+  // destructive one-shot isn't applied without any prompt.
   showConfirmModal({
     title: `${TRANSFORM_LABELS[kind]}?`,
     body,
-    onConfirm: async () => {
-      const m = (state.msgData?.main || []).find((x) => x.uuid === uuid);
-      if (!m) return;
-      const lists = needsWordLists(kind) ? await ensureWordLists() : {};
-      const newText = applyTransform(kind, m.content || "", lists);
-      try {
-        await api.editMessage(state.folder, state.convoId, uuid, newText);
-      } catch (e) {
-        alert(`Transform failed: ${e.message}`);
-        return;
-      }
-      show(state.folder, state.convoId);
-    },
+    onConfirm: () => doApply(applyTransform(kind, m.content || "", lists)),
   });
 }
 
@@ -708,8 +990,11 @@ export function openTransformMenu(uuid, anchorEl) {
     .map(([kind, label]) =>
       `<button class="btn btn-sm transform-menu-item" data-action="transform-msg" data-uuid="${uuid}" data-kind="${kind}">${label}</button>`
     ).join("");
+  const previewOn = state.previewEnabled;
+  const toggleLabel = previewOn ? "Turn off preview edits" : "Turn on preview edits";
   menu.innerHTML = editItem + items +
     `<div class="transform-menu-sep"></div>` +
+    `<button class="btn btn-sm transform-menu-item transform-menu-toggle" data-action="toggle-preview" title="Show a review modal before applying any edit. Toggle any time from this menu or from inside the preview modal.">${toggleLabel}</button>` +
     `<button class="btn btn-sm transform-menu-item" data-action="open-word-lists">Curate word lists…</button>`;
   const rect = anchorEl.getBoundingClientRect();
   menu.style.position = "absolute";
@@ -740,31 +1025,61 @@ export async function openWordListsModal() {
     return;
   }
 
+  // Back-compat for cached lists that predate the verbosity category.
+  current.verbosity = current.verbosity || [];
+  defaults.verbosity = defaults.verbosity || [];
+
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
   overlay.innerHTML = `
-    <div class="modal modal-wide">
+    <div class="modal" style="max-width:720px">
       <h3>Curate word lists</h3>
-      <p style="font-size:13px; color:var(--text2)">
-        Edit the lists used by <em>Remove swears</em> and <em>Remove filler</em>.
-        One entry per line. For swears, append <code>*</code> to a stem to
-        catch conjugations safely (e.g. <code>fuck*</code> matches
-        fuck/fucks/fucker/fucking). Bare words match exactly with word
-        boundaries — <code>ass</code> won't blow up <code>assistant</code>.
-        Phrases are matched as exact substrings, case-insensitive.
+      <p style="font-size:12px; color:var(--text3); margin:0 0 10px 0">
+        One entry per line. Empty list = category opt-out.
       </p>
-      <div class="word-lists-grid">
-        <div>
-          <label><strong>Swear words</strong> <span style="color:var(--text3); font-weight:normal">(${current.swears.length} entries)</span></label>
-          <textarea id="wl-swears" rows="14" spellcheck="false">${current.swears.join("\n")}</textarea>
-          <button class="btn btn-sm" data-reset="swears">Reset to defaults (${defaults.swears.length})</button>
+
+      <details class="stats-section" open style="margin-bottom:8px">
+        <summary><strong>Verbosity</strong> <span style="color:var(--text3); font-weight:normal">(${current.verbosity.length} entries)</span></summary>
+        <div style="padding:8px 4px 4px">
+          <p style="font-size:12px; color:var(--text2); margin:0 0 6px 0">
+            Not about agent behavior — just token cost and readability.
+            Strips obviousness signalers ("obviously", "clearly", "of
+            course") and meta-commentary phrases ("that's a great
+            question", "at the end of the day"). Word-bounded,
+            case-insensitive. Default list is conservative; add sincerity
+            markers, intensifiers, or hedges yourself if you want them
+            gone too. Test for any candidate: remove it — if the sentence
+            still makes sense, it was filler.
+          </p>
+          <textarea id="wl-verbosity" rows="10" spellcheck="false" style="width:100%">${current.verbosity.join("\n")}</textarea>
+          <button class="btn btn-sm" data-reset="verbosity">Reset to defaults (${defaults.verbosity.length})</button>
         </div>
-        <div>
-          <label><strong>Filler / drift phrases</strong> <span style="color:var(--text3); font-weight:normal">(${current.filler.length} entries)</span></label>
-          <textarea id="wl-filler" rows="14" spellcheck="false">${current.filler.join("\n")}</textarea>
-          <button class="btn btn-sm" data-reset="filler">Reset to defaults (${defaults.filler.length})</button>
+      </details>
+
+      <details class="stats-section" open style="margin-bottom:8px">
+        <summary><strong>Priming language</strong> <span style="color:var(--text3); font-weight:normal">(${current.swears.length} swears + ${current.filler.length} drift phrases)</span></summary>
+        <div style="padding:8px 4px 4px">
+          <p style="font-size:12px; color:var(--text2); margin:0 0 8px 0">
+            Emotionally charged words and sycophancy in prior turns degrade
+            the next turn's output — see
+            <a href="https://dafmulder.substack.com/p/i-ran-1950-experiments-to-find-out" target="_blank" rel="noopener">Mulder's 1,950 experiments</a>
+            and
+            <a href="https://www.reddit.com/r/ClaudeAI/comments/1skmgef/emotional_priming_changes_claudes_code_more_than/" target="_blank" rel="noopener">community replication</a>
+            for the evidence base. Two sub-lists with different match
+            mechanisms; both are stripped in one pass when you hit
+            <em>Remove priming language</em>.
+          </p>
+
+          <label style="display:block; margin-top:6px"><strong>Swears</strong> <span style="color:var(--text3); font-weight:normal">— word-bounded, case-insensitive. Append <code>*</code> to a stem for conjugations (<code>fuck*</code> → fuck/fucks/fucker/fucking); bare words match exactly so <code>ass</code> won't blow up <code>assistant</code>.</span></label>
+          <textarea id="wl-swears" rows="8" spellcheck="false" style="width:100%">${current.swears.join("\n")}</textarea>
+          <button class="btn btn-sm" data-reset="swears">Reset swears to defaults (${defaults.swears.length})</button>
+
+          <label style="display:block; margin-top:10px"><strong>Drift phrases</strong> <span style="color:var(--text3); font-weight:normal">— sycophancy / meta-commentary ("You're absolutely right!", "Let me think step by step."). Exact substring match, case-insensitive.</span></label>
+          <textarea id="wl-filler" rows="8" spellcheck="false" style="width:100%">${current.filler.join("\n")}</textarea>
+          <button class="btn btn-sm" data-reset="filler">Reset drift phrases to defaults (${defaults.filler.length})</button>
         </div>
-      </div>
+      </details>
+
       <div class="modal-actions">
         <button class="btn-cancel" data-modal-cancel>Cancel</button>
         <button class="btn-confirm-delete" data-modal-save>Save</button>
@@ -774,6 +1089,7 @@ export async function openWordListsModal() {
 
   const swearsTa = overlay.querySelector("#wl-swears");
   const fillerTa = overlay.querySelector("#wl-filler");
+  const verbosityTa = overlay.querySelector("#wl-verbosity");
   const close = () => overlay.remove();
 
   overlay.addEventListener("click", async (e) => {
@@ -783,10 +1099,12 @@ export async function openWordListsModal() {
       const which = e.target.dataset.reset;
       if (which === "swears") swearsTa.value = defaults.swears.join("\n");
       else if (which === "filler") fillerTa.value = defaults.filler.join("\n");
+      else if (which === "verbosity") verbosityTa.value = defaults.verbosity.join("\n");
     } else if (e.target.matches("[data-modal-save]")) {
       const payload = {
         swears: swearsTa.value.split("\n").map((s) => s.trim()).filter(Boolean),
         filler: fillerTa.value.split("\n").map((s) => s.trim()).filter(Boolean),
+        verbosity: verbosityTa.value.split("\n").map((s) => s.trim()).filter(Boolean),
       };
       try {
         await api.saveWordLists(payload);
@@ -805,14 +1123,40 @@ export async function bulkTransform(kind = "scrub") {
   const ids = Array.from(state.msgSelected);
   if (!ids.length) return;
   const label = TRANSFORM_LABELS[kind] || kind;
-  if (!confirm(`${label} for ${ids.length} selected message(s)? Non-prose messages will be skipped.`)) return;
   const lists = needsWordLists(kind) ? await ensureWordLists() : {};
   const byId = new Map((state.msgData?.main || []).map((m) => [m.uuid, m]));
+
+  // accepted: Map<uuid, newText>
+  let accepted;
+  if (state.previewEnabled) {
+    const candidates = ids
+      .map((id) => byId.get(id))
+      .filter(Boolean)
+      .map((m) => ({ uuid: m.uuid, content: m.content || "" }));
+    const res = await showPreviewModal({ kind, label, candidates, opts: lists });
+    if (!res) return;
+    if (res.empty) {
+      alert(`${label}: nothing would change for the selected messages.`);
+      return;
+    }
+    accepted = new Map();
+    for (const id of res.acceptedIds) {
+      const entry = res.byId.get(id);
+      if (entry) accepted.set(id, entry.after);
+    }
+    if (accepted.size === 0) return;
+  } else {
+    if (!confirm(`${label} for ${ids.length} selected message(s)? Non-prose messages will be skipped.`)) return;
+    accepted = new Map();
+    for (const id of ids) {
+      const m = byId.get(id);
+      if (!m) continue;
+      accepted.set(id, applyTransform(kind, m.content || "", lists));
+    }
+  }
+
   let ok = 0, skipped = 0, errored = 0;
-  for (const id of ids) {
-    const m = byId.get(id);
-    if (!m) { errored++; continue; }
-    const newText = applyTransform(kind, m.content || "", lists);
+  for (const [id, newText] of accepted) {
     try {
       await api.editMessage(state.folder, state.convoId, id, newText);
       ok++;
@@ -829,20 +1173,43 @@ export async function bulkTransform(kind = "scrub") {
 
 export async function copySelected() {
   const main = state.msgData?.main || [];
-  const texts = main
-    .filter((m) => state.msgSelected.has(m.uuid))
-    .map((m) => {
-      const label = m.role === "user" ? "User" : "Assistant";
-      const body = (m.content || "")
-        .replace(/<[^>]+>/g, "")
-        .replace(/\[Tool: [^\]]+\]/g, "")
-        .replace(/\[Tool Result\]/g, "")
-        .trim();
-      return `${label}: ${body}`;
-    });
-  await navigator.clipboard.writeText(texts.join("\n\n"));
+  const selected = main.filter((m) => state.msgSelected.has(m.uuid));
+  const text = serializeAsText(selected);
+  await navigator.clipboard.writeText(text);
   state.msgSelected.clear();
   render();
+}
+
+export async function copySelectedJsonl() {
+  const main = state.msgData?.main || [];
+  const selected = main.filter((m) => state.msgSelected.has(m.uuid));
+  const fields = await ensureDownloadFields();
+  const jsonl = serializeAsJsonl(selected, fields);
+  await navigator.clipboard.writeText(jsonl);
+  state.msgSelected.clear();
+  render();
+}
+
+export async function downloadSelectedJsonl() {
+  const main = state.msgData?.main || [];
+  const selected = main.filter((m) => state.msgSelected.has(m.uuid));
+  if (!selected.length) return;
+  const fields = await ensureDownloadFields();
+  const jsonl = serializeAsJsonl(selected, fields);
+  const base = (state.convoId || "conversation").slice(0, 8);
+  downloadBlob(jsonl, "application/x-ndjson", `${base}_selection.jsonl`);
+  state.msgSelected.clear();
+  render();
+}
+
+export function downloadRawConvo() {
+  if (!state.folder || !state.convoId) return;
+  const a = document.createElement("a");
+  a.href = api.rawConversationUrl(state.folder, state.convoId);
+  a.download = `${state.convoId}.jsonl`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 export async function saveSelected() {

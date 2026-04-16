@@ -1,6 +1,6 @@
 // App entry point. Wires up routing, theme, and the delegated click handler.
 
-import { state, setTheme, setFilter, setMode } from "./state.js";
+import { state, setTheme, setFilter, setMode, setPreviewEnabled } from "./state.js";
 import { defineRoute, initRouter, navigate } from "./router.js";
 import { api } from "./api.js";
 import { updateEditButton } from "./toolbar.js";
@@ -35,6 +35,8 @@ function toggleEditMode() {
     state.msgSelected.clear();
     state.selected.clear();
   }
+  // Refresh header-button visibility (download-raw-convo is gated on edit mode).
+  updateEditButton();
   if (state.view === "messages") Messages.render();
   else if (state.view === "conversations") Conversations.render();
 }
@@ -56,6 +58,15 @@ defineRoute(/^\/p\/([^/]+)\/c\/([^/]+)$/, async (folder, convoId) => {
   updateEditButton();
 });
 
+defineRoute(/^\/p\/([^/]+)\/c\/([^/]+)\/a\/([^/]+)$/, async (folder, convoId, toolUseId) => {
+  await Messages.showAgent(
+    decodeURIComponent(folder),
+    decodeURIComponent(convoId),
+    decodeURIComponent(toolUseId),
+  );
+  updateEditButton();
+});
+
 // --- Delegated click handler ---
 // All interactive elements are marked with data-action="...".
 // This keeps view HTML free of inline handlers and avoids global functions.
@@ -64,6 +75,7 @@ const actions = {
   // Navigation
   "nav-projects":     () => navigate("/"),
   "nav-folder":       (_e, el) => navigate(`/p/${encodeURIComponent(el.dataset.folder)}`),
+  "nav-convo":        (_e, el) => navigate(`/p/${encodeURIComponent(state.folder)}/c/${encodeURIComponent(state.convoId)}`),
   "open-project":     (_e, el) => Projects.openProject(el.dataset.folder, el.dataset.path),
   "open-convo":       (_e, el) => Conversations.openConvo(el.dataset.id),
 
@@ -122,13 +134,13 @@ const actions = {
 
   // Messages view
   "load-earlier-msgs":()       => Messages.loadEarlier(),
+  "open-agent":       (_e, el) => navigate(`/p/${encodeURIComponent(state.folder)}/c/${encodeURIComponent(state.convoId)}/a/${encodeURIComponent(el.dataset.runId)}`),
+  "open-agents-menu": (_e, el) => Messages.openAgentsMenu(el),
   "open-stats-modal": ()       => {
     if (state.view === "conversations") Conversations.showStats();
     else Messages.showStats();
   },
   "toggle-tool-group":(_e, el) => Messages.toggleToolGroup(el.dataset.groupId),
-  "toggle-side":      ()       => Messages.toggleSide(),
-
   "toggle-whitespace": ()      => Messages.toggleWhitespace(),
   "toggle-msg-sel":   (_e, el) => Messages.toggleMsgSel(el.dataset.uuid),
   "copy-msg":         (_e, el) => Messages.copyMsg(el.dataset.uuid),
@@ -145,6 +157,15 @@ const actions = {
   "toggle-all-msgs":  (_e, el) => Messages.toggleAllMsgs(),
 
   "open-word-lists":  ()       => Messages.openWordListsModal(),
+  "toggle-preview":   (_e, el) => {
+    // Flip the global preview setting in place. The menu stays open so the
+    // user can still pick a transform; the item's label updates to reflect
+    // the new state. Also exposed via the checkbox at the top of the
+    // preview modal itself.
+    const on = !state.previewEnabled;
+    setPreviewEnabled(on);
+    el.textContent = on ? "Turn off preview edits" : "Turn on preview edits";
+  },
 
   "reveal-secret":    (_e, el) => Messages.revealSecret(el),
 
@@ -168,9 +189,14 @@ const actions = {
     });
   },
   "copy-selected":    ()       => Messages.copySelected(),
+  "copy-selected-jsonl":   ()       => Messages.copySelectedJsonl(),
+  "download-selected-jsonl":()      => Messages.downloadSelectedJsonl(),
   "save-selected":    ()       => Messages.saveSelected(),
   "delete-selected":  ()       => Messages.deleteSelected(),
   "clear-selection":  ()       => Messages.clearSelection(),
+  "open-export-menu": (_e, el) => Messages.openExportMenu(el),
+  "open-jsonl-fields":()       => Messages.openJsonlFieldsModal(),
+  "download-raw-convo":()      => Messages.downloadRawConvo(),
   "set-stats-view":   (_e, el) => {
     const modal = el.closest(".modal");
     if (!modal) return;

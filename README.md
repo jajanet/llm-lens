@@ -22,10 +22,13 @@ This is the lever that's easy to miss. Anything you remove from a conversation s
 - **Edit** — rewrite a prose message's text in place; `usage`, UUIDs, and the resume chain stay intact. For fine-tuned customization. Prose-only: tool/thinking blocks are locked.
 - **Scrub** — redact a message's text to `.`. Original `usage` is preserved (historical accuracy), but on resume the scrubbed content is what gets sent.
 - **Normalize whitespace** — collapse runs of spaces/tabs and 3+ newlines.
-- **Strip agent-priming language.** Two curated lists for the two flavors, both stored at `~/.cache/llm-lens/word_lists.json` and editable in-app:
-  - **Swears** — emotionally charged words that prime an agent toward worse output. Word-bounded, with a `*` stem syntax for safe conjugation matching (`fuck*` catches fuck/fucks/fucker/fucking; `ass` stays exact so `assistant` survives).
-  - **Filler / drift phrases** — sycophancy and meta-commentary that nudge the agent off task: "You're absolutely right!", "Let me think step by step.", "I apologize for the confusion.", etc. Same mechanism, different register.
+- **Strip verbosity.** Doesn't change agent behavior — just reclaims tokens and sharpens meaning. Default list is conservative (obviousness signalers like "obviously", "clearly", "of course", plus meta-commentary phrases like "that's a great question", "at the end of the day"). Add sincerity markers, intensifiers, or hedges via *Curate word lists* if you want them gone too. Test for any candidate: remove it and see if the sentence loses meaning. If not, it's filler.
+- **Strip priming language.** Emotionally charged words and sycophancy in prior turns degrade the next turn's output — see Mulder's ["I ran 1950 experiments"](https://dafmulder.substack.com/p/i-ran-1950-experiments-to-find-out) and a [community replication on r/ClaudeAI](https://www.reddit.com/r/ClaudeAI/comments/1skmgef/emotional_priming_changes_claudes_code_more_than/) for the evidence base. Two sub-lists stripped in one pass: **swears** (word-bounded, with a `*` stem syntax for safe conjugations — `fuck*` catches fuck/fucks/fucker/fucking; bare `ass` stays exact so `assistant` survives) and **drift phrases** (sycophancy / meta-commentary like "You're absolutely right!", "Let me think step by step." — matched exactly, case-insensitive).
+
+  Both lists live at `~/.cache/llm-lens/word_lists.json` and are editable in-app.
+- **Preview before apply** — bulk and per-message transforms (scrub, normalize, priming / drift / verbosity cleanup) route through a review modal by default: diff per message with `+N/-M` deltas, uncheck any row you don't want, then **Apply selected**. Toggle from the transform menu or from inside the modal.
 - **Extract** a pruned subset into a new conversation, leaving the original untouched.
+- **Export** — pull selected turns out as plain text or JSONL (choose which fields via **JSONL fields…** in the Export/Extract menu), or download the entire raw `.jsonl` for an external pipeline (fine-tuning, evals, diffing). Raw download is verbatim and preserves fields the parser drops (`parentUuid`, `sessionId`, `message.id`, `toolUseResult`, etc.).
 
 ### 3. Context Window Awareness
 
@@ -75,11 +78,19 @@ Select the messages to redact. Scrub. The chain, UUIDs, and token counts stay in
 
 ### Cut agent-priming language across a session
 
-Open the Messages view. Edit mode → Select all → split-button `▾` → **Remove swears** or **Remove filler / drift phrases**. Both are doing the same job — stripping language that degrades the next turn's output, whether by emotional priming (swears) or sycophancy-induced drift (filler). Curate either list via **Curate word lists…** (stored at `~/.cache/llm-lens/word_lists.json`).
+Open the Messages view. Edit mode → Select all → split-button `▾` → **Remove verbosity** or **Remove priming language**. Verbosity is about token cost and clarity. Priming combines two sub-lists (swears + drift phrases) and targets agent behavior — emotional priming and sycophancy-induced drift both degrade the next turn's output. Curate either list via **Curate word lists…** (stored at `~/.cache/llm-lens/word_lists.json`).
 
 ### Audit shell activity in a session
 
 Open a conversation's stats modal → **Bash commands** section. See the frequency-ranked list of what was run. For specific calls, scroll the Messages view: each Bash badge is expandable inline and shows the full command (with sensitive-pattern masking on by default).
+
+### Inspect what a subagent actually did
+
+When an agent delegates work via the Task tool, the parent convo only sees a tool_use/tool_result pair — the subagent's real back-and-forth (its own prompts, tool calls, responses) lives in a separate file. In the Messages view, the Task badge gets a `→ <agent-name>` link; click it to open that subagent's full transcript as its own conversation view (breadcrumb: parent → agent). Useful when the parent's summary hides a pile of cost or a tool call you didn't know happened. Legacy inline sidechains show the same link on the main message they branched from, tagged `legacy`.
+
+### Grab a subset for fine-tuning or evals
+
+Open the Messages view → Edit → select the turns you want. Click **Export/Extract ▾** → **JSONL fields…** first if you need non-default fields (model, usage, timestamp, etc.; role + content are always on), then use **Download JSONL** or **Copy JSONL to clipboard**. For a verbatim dump that round-trips back into Claude Code, use **Download raw convo** in the header — preserves `parentUuid` chain, `sessionId`, `message.id`, tool block linkage, and all the other fields the parser flattens out.
 
 ### Slice the overview by tag
 
@@ -94,7 +105,9 @@ This tool is **non-destructive by default**. Every editing action has a preservi
 | Hide a conversation | **Archive** (moves to `~/.cache/llm-lens/archive/`, reversible) |
 | Remove messages | **Extract to new convo** (leaves original intact) |
 | Edit a message | **Scrub** text, keeping usage and chain |
+| Apply a transform (scrub / normalize / swears / filler) | **Preview** first — review the diff per message, uncheck any you don't want, Apply selected |
 | Try a risky edit | **Duplicate first**, edit the copy |
+| Preserve a conversation off-tool | **Download raw convo** (verbatim `.jsonl`, re-importable) |
 
 Destructive actions (delete-convo, delete-message, in-place normalize/scrub) rewrite files on disk. Claude Code's `/resume` replay semantics aren't publicly documented, so any in-place edit is best-effort — the tool re-links `parentUuid` chains and strips orphan `tool_use`/`tool_result` blocks to stay resume-safe, but we can't guarantee it against invariants we can't see. If resume-ability of a specific conversation matters to you, duplicate before editing.
 
@@ -106,7 +119,7 @@ Three views, each paginated + sortable + searchable:
 
 - **Projects** — one entry per `~/.claude/projects/*` subdirectory. Convo count, total size, preview, aggregate stats.
 - **Conversations** — all `.jsonl` sessions in a project. Toggle active/archived. Card view shows inline stats. Delete/archive/duplicate per-row.
-- **Messages** — chat view. Tool calls and results render as inline badges; Bash badges expand to show the actual command with sensitive-string masking. Thinking blocks collapsed by default. Toggle to render whitespace (`·` for spaces, `→` for tabs) when you care about exact text. Edit mode surfaces per-message Copy / Scrub (split-button with transform variants: scrub / normalize whitespace / remove swears / remove filler) / Delete, plus a bulk action bar with select-all when messages are selected.
+- **Messages** — chat view. Tool calls and results render as inline badges; Bash badges expand to show the actual command with sensitive-string masking. Task tool badges (and legacy inline sidechain anchors) get a `→ <agent-name>` link that drills into the subagent's own transcript without leaving the parent convo's context. Thinking blocks collapsed by default. Toggle to render whitespace (`·` for spaces, `→` for tabs) when you care about exact text. Edit mode surfaces per-message Copy / Scrub (split-button with transform variants: scrub / normalize whitespace / remove verbosity / remove priming language) / Delete, a **Download raw convo** button in the header (whole-file verbatim download), and a bulk action bar with select-all when messages are selected: **Export/Extract ▾** menu (Copy plain / Copy JSONL / Download JSONL / Extract to new conversation / JSONL fields…), **Scrub ▾** split, and Delete.
 
 **Overview chart** on Projects and Conversations views: activity over day/week/month buckets, with modes for message count, tokens, or USD cost. Aggregate totals and cost estimates for the selected window.
 
@@ -173,8 +186,10 @@ LLM_LENS_DEBUG=1 llm-lens-web
 - **Tags.** Stored in `~/.cache/llm-lens/tags.json` — separate from `sessions.json` so a `peek_cache.hard_clear()` doesn't wipe them. Same lock + debounce-flush pattern as `peek_cache`, plus an `atexit.register(flush)` so abrupt shutdowns still persist. Per-folder shape: `{labels: [{name, color}, ...], assignments: {convo_id: [tag_idx, ...]}}`. Overview/stats endpoints accept an optional `tags` filter that intersects against `assignments` server-side; tombstones are skipped under tag filtering since deleted convos no longer have assignments.
 - **Archive.** `rename` to `~/.cache/llm-lens/archive/<folder>/`, mtime preserved so time-bucketed stats don't shift.
 - **Duplicate.** New file UUID *and* rewritten `sessionId`/`uuid`/`parentUuid` inside so `/resume` doesn't collide with the parent. Sidecar `<new-id>.dup.json` records the shared-prefix stats so aggregation subtracts them while the parent still exists.
-- **Word lists.** User-curated at `~/.cache/llm-lens/word_lists.json` (`{swears, filler}`). Empty list = opt-out (not "fall back to defaults"). Defaults shipped in code and exposed via `GET /api/word-lists/defaults`.
+- **Word lists.** User-curated at `~/.cache/llm-lens/word_lists.json` (`{swears, filler, verbosity}`). Empty list = opt-out (not "fall back to defaults"). Defaults shipped in code and exposed via `GET /api/word-lists/defaults`. `swears` + `filler` back behavior-priming cleanup (priming family); `verbosity` is a separate family targeting token cost, not behavior.
+- **JSONL export fields.** Per-user at `~/.cache/llm-lens/download_fields.json`. Keys cover every field the exporter can emit (`uuid`, `role`, `content`, `timestamp`, `commands`, `model`, `usage`); `role` and `content` are always true regardless of payload. The modal's checkboxes render them `disabled` and the server re-forces them on save. For fields the parser drops (`parentUuid`, `sessionId`, `message.id`, `toolUseResult`, …), use the raw-convo download instead.
 - **Bash command extraction.** `_extract_command_name(cmd)` parses each Bash `tool_use`'s `input.command`, strips wrappers (`sudo`, `env VAR=…`, `bash -c '…'` recurses into the inner script) and pipeline tail, returns the first real command. Aggregated per-conversation as `stats.commands: {name: count}`. Tool-use markers in parsed messages are now `[Tool: Bash:<tool_use_id>]` so the frontend can correlate a badge with the command attached to the message via the `commands: [{id, command}]` field.
+- **Agent (subagent) runs.** Claude Code writes each spawned subagent's transcript to its own file at `<convo_id>/subagents/agent-[<name>-]<hash>.jsonl` — a sibling of the parent `<convo_id>.jsonl`. **One file = one run.** `run_id` is the trailing `<hash>`. Messages inside are wrapped in a `type: "progress"` envelope with the real payload at `data.message`; `_format_entry_message` unwraps it so the same rendering code handles parent and agent entries. The run's parent-side anchor is the first `parentToolUseID` value in the file that matches a parent `tool_use` block named `Agent` or `Task` — that's where the inline `→ <agent-name>` marker attaches. Other `parentToolUseID` values pointing at ordinary tools (Read/Write/Edit/etc.) are audit-trail bookkeeping and are intentionally ignored for anchoring. Files with no Agent/Task-named ptu are still valid runs; they surface only in the Subagents toolbar list. Old sessions used an inline format — `isSidechain: true` entries in the parent file — still supported: clusters are grouped by their closest non-sidechain ancestor and surfaced with `source: "inline"`, run id `inline:<anchor_uuid>`. Both formats appear in one unified `agent_runs` list.
 - **Secret masking.** Frontend-only. `SECRET_PATTERNS` in `views/messages.js` matches well-known credential shapes (Anthropic/OpenAI/GitHub/Slack/AWS/Google keys, `Bearer …`, `*_KEY=`/`*_SECRET=`/`*_PASSWORD=` env-style, URL-embedded passwords). Matches render as `[sensitive]` chips with the original in `data-secret`; `revealSecret(el)` swaps the chip for the raw text on click. Conservative — high-entropy strings without a known prefix won't match.
 - **Mutations.** Plain filesystem ops: `unlink`, `rename`, `shutil.copy2`, line-filtered rewrites. No database.
 
@@ -190,14 +205,16 @@ LLM_LENS_DEBUG=1 llm-lens-web
 | `POST` | `/api/projects/:folder/stats` | Aggregate stats for a project |
 | `POST` | `/api/projects/:folder/names` | Bulk custom-title fetch |
 | `POST` | `/api/projects/:folder/refresh-cache` | Re-scan + flush sidecar |
-| `GET` | `/api/projects/:folder/conversations/:id` | Paginated messages |
+| `GET` | `/api/projects/:folder/conversations/:id` | Paginated messages. Response also carries `agent_runs: [{tool_use_id, name, source, message_count, first_ts, anchor_uuid?}]` — one per subagent run spawned by the convo, usable to decorate Task badges in the UI. |
+| `GET` | `/api/projects/:folder/conversations/:id/agent/:tool_use_id` | Messages for a single subagent run. Same envelope as the messages endpoint, plus `agent_name` / `parent_convo_id`. |
+| `GET` | `/api/projects/:folder/conversations/:id/raw` | Source `.jsonl` as attachment (verbatim) |
 | `GET` | `/api/projects/:folder/conversations/:id/stats` | Stats for one conversation |
 | `DELETE` | `/api/projects/:folder/conversations/:id` | Delete (stats tombstoned) |
 | `POST` | `/api/projects/:folder/conversations/:id/archive` | Archive |
 | `POST` | `/api/projects/:folder/conversations/:id/unarchive` | Unarchive |
 | `POST` | `/api/projects/:folder/conversations/:id/duplicate` | Duplicate (rewrites IDs, writes sidecar) |
 | `DELETE` | `/api/projects/:folder/conversations/:id/messages/:uuid` | Delete one message |
-| `POST` | `/api/projects/:folder/conversations/:id/messages/:uuid/scrub` | Transform one message. Body: `{kind: "scrub"\|"normalize_whitespace"\|"remove_swears"\|"remove_filler"}` |
+| `POST` | `/api/projects/:folder/conversations/:id/messages/:uuid/edit` | Replace a prose-only message's text in place. Body: `{text}`. Transforms (scrub / normalize_whitespace / remove_swears / remove_filler / remove_verbosity) are applied client-side from the Messages view — this endpoint just persists the result. |
 | `POST` | `/api/projects/:folder/conversations/:id/extract` | New convo from selected UUIDs |
 | `POST` | `/api/projects/:folder/conversations/bulk-delete` | Bulk delete |
 | `POST` | `/api/projects/:folder/conversations/bulk-archive` | Bulk archive |
@@ -207,9 +224,11 @@ LLM_LENS_DEBUG=1 llm-lens-web
 | `PUT` | `/api/projects/:folder/tags/labels` | Replace label definitions (max 5; `{labels: [{name, color}, ...]}`) |
 | `POST` | `/api/projects/:folder/tags/assign` | Set tags for one conversation (`{convo_id, tags: [idx,...]}`) |
 | `POST` | `/api/projects/:folder/tags/bulk-assign` | Add or remove a single tag across many (`{ids, tag, add: bool}`) |
-| `GET` | `/api/word-lists` | Effective swears + filler lists |
+| `GET` | `/api/word-lists` | Effective swears + filler + verbosity lists |
 | `POST` | `/api/word-lists` | Persist user-curated lists |
 | `GET` | `/api/word-lists/defaults` | Shipped defaults |
+| `GET` | `/api/download-fields` | Effective JSONL export field prefs (`role`/`content` always true) |
+| `POST` | `/api/download-fields` | Persist user's JSONL field selection |
 
 All mutations invalidate the sidecar cache for affected files and return `{"ok": true}` on success.
 
@@ -226,6 +245,7 @@ Claude-specific surface is small:
 
 - `CLAUDE_PROJECTS_DIR` — discovery path
 - `_peek_jsonl_cached` / `_parse_messages_cached` — JSONL shape (`message.role`, content blocks, `isSidechain`, `isMeta`, `file-history-snapshot`, `uuid`, `cwd`, `timestamp`)
+- `_agent_runs_for_convo` / `_inline_agent_runs_from_parent` — subagent layout (`<convo_id>/subagents/agent-*.jsonl`, `parentToolUseID` keying, the `type: "progress"` wrapper) plus the legacy inline-sidechain fallback
 - Mutation endpoints — line-level JSONL ops
 
 When adding a second provider:

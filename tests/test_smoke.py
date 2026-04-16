@@ -573,3 +573,82 @@ def test_smoke_404s_on_missing_resources(client, tmp_path):
     assert client.post(
         "/api/projects/nope/conversations/none/duplicate"
     ).status_code == 404
+
+
+def test_smoke_raw_endpoint_returns_file_with_attachment_headers(client, tmp_path):
+    """Download raw convo button hits this endpoint. Needs to be an
+    attachment (so the browser saves instead of rendering) and carry the
+    exact on-disk bytes."""
+    make_convo(tmp_path, folder="proj", convo="c", n_assistant=2)
+    src = (tmp_path / "proj" / "c.jsonl").read_bytes()
+
+    resp = client.get("/api/projects/proj/conversations/c/raw")
+    assert resp.status_code == 200
+    assert resp.mimetype == "application/x-ndjson"
+    assert "attachment" in resp.headers.get("Content-Disposition", "")
+    assert "c.jsonl" in resp.headers.get("Content-Disposition", "")
+    assert resp.data == src
+
+
+def test_smoke_raw_endpoint_404_on_missing(client, tmp_path):
+    make_convo(tmp_path, folder="proj", convo="c")
+    assert client.get("/api/projects/proj/conversations/gone/raw").status_code == 404
+    assert client.get("/api/projects/ghost/conversations/c/raw").status_code == 404
+
+
+def test_smoke_model_and_usage_exposed_on_assistant_messages(client, tmp_path, monkeypatch):
+    """make_convo writes assistant_msg with model + usage; both should
+    survive the parser and reach the messages endpoint, since JSONL
+    export reads from there."""
+    make_convo(tmp_path, folder="proj", convo="c", n_assistant=1)
+    data = client.get("/api/projects/proj/conversations/c?limit=10").get_json()
+    asst = next(m for m in data["main"] if m["role"] == "assistant")
+    assert asst.get("model") == "claude-test"
+    assert isinstance(asst.get("usage"), dict)
+    assert asst["usage"].get("input_tokens") == 10
+    assert asst["usage"].get("output_tokens") == 5
+
+
+@pytest.fixture
+def client_isolated_download_fields(tmp_path, monkeypatch):
+    """Scope `download_fields.json` to the temp dir so real user prefs at
+    ~/.cache/llm-lens/download_fields.json aren't touched."""
+    monkeypatch.setattr(llm_lens, "CLAUDE_PROJECTS_DIR", tmp_path)
+    monkeypatch.setattr(
+        llm_lens, "_download_fields_path",
+        lambda: tmp_path / "download_fields.json",
+    )
+    llm_lens._peek_jsonl_cached.cache_clear()
+    llm_lens._parse_messages_cached.cache_clear()
+    llm_lens.app.config["TESTING"] = True
+    return llm_lens.app.test_client()
+
+
+def test_smoke_download_fields_get_post_roundtrip(client_isolated_download_fields):
+    """Mirror of word-lists smoke: fresh GET returns defaults (with
+    role+content forced on); POST persists; subsequent GET reflects."""
+    initial = client_isolated_download_fields.get("/api/download-fields").get_json()
+    assert initial["role"] is True and initial["content"] is True
+    # Defaults ship uuid+timestamp on, optional-richer fields off.
+    assert initial["uuid"] is True and initial["timestamp"] is True
+    assert initial["commands"] is False and initial["model"] is False
+
+    saved = client_isolated_download_fields.post(
+        "/api/download-fields",
+        json={"uuid": False, "timestamp": False, "model": True, "usage": True,
+              "commands": True},
+    ).get_json()
+    assert saved["uuid"] is False
+    assert saved["model"] is True and saved["usage"] is True
+    # Required fields forced on even though we didn't send them.
+    assert saved["role"] is True and saved["content"] is True
+
+    again = client_isolated_download_fields.get("/api/download-fields").get_json()
+    assert again == saved
+
+
+def test_smoke_download_fields_empty_post_preserves_required(client_isolated_download_fields):
+    resp = client_isolated_download_fields.post("/api/download-fields", json={})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["role"] is True and data["content"] is True

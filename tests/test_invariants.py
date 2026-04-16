@@ -64,7 +64,7 @@ def snapshot(uuid):
 # ---------------------------------------------------------------------------
 
 def test_parser_count_excludes_snapshots_and_meta(client, tmp_path):
-    """N=5, k=1 (snapshot), m=1 (isMeta) → main+side = 3.
+    """N=5, k=1 (snapshot), m=1 (isMeta) → main = 3.
 
     NOTE: the parser runs a dedup pass keyed on content (__init__.py:120),
     so the invariant N-k-m only holds when every real message has distinct
@@ -83,17 +83,16 @@ def test_parser_count_excludes_snapshots_and_meta(client, tmp_path):
     assert resp.status_code == 200
     data = resp.get_json()
 
-    # direct invariant check: len(main)+len(side) == N - k - m
-    assert len(data["main"]) + len(data["sidechain"]) == 3
-    assert data["total"] == 3  # main-only sanity (no sidechain in this fixture)
+    assert len(data["main"]) == 3
+    assert data["total"] == 3
     main_uuids = [m["uuid"] for m in data["main"]]
-    side_uuids = [m["uuid"] for m in data["sidechain"]]
-    assert "s1" not in main_uuids and "s1" not in side_uuids
-    assert "c" not in main_uuids and "c" not in side_uuids
+    assert "s1" not in main_uuids
+    assert "c" not in main_uuids
+    assert data["agent_runs"] == []
 
 
 def test_parser_count_multiple_snapshots_and_meta(client, tmp_path):
-    """N=8, k=3 snapshots, m=2 isMeta → main+side == 3."""
+    """N=8, k=3 snapshots, m=2 isMeta → main == 3."""
     path = tmp_path / "proj" / "c.jsonl"
     write_jsonl(path, [
         snapshot("s0"),
@@ -106,26 +105,28 @@ def test_parser_count_multiple_snapshots_and_meta(client, tmp_path):
         msg("e", "d", "real-3"),
     ])
     data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
-    assert len(data["main"]) + len(data["sidechain"]) == 3          # 8 - 3 - 2
+    assert len(data["main"]) == 3          # 8 - 3 - 2          # 8 - 3 - 2
 
 
-def test_parser_count_includes_sidechain(client, tmp_path):
-    """N=6, k=1, m=1 → 4 real messages; 1 is sidechain → main=3, side=1.
-    total tracks main only, but main+side must equal N-k-m."""
+def test_parser_drops_inline_sidechain_from_main(client, tmp_path):
+    """Inline `isSidechain: true` entries are kept out of `main` (they
+    surface via `agent_runs` / the agent endpoint instead, covered by the
+    inline-agent-run tests further down)."""
     path = tmp_path / "proj" / "c.jsonl"
     write_jsonl(path, [
         msg("a", None, "main-1"),
         snapshot("s0"),                                              # k=1
         msg("b", "a", "main-2"),
-        {**msg("sc", "b", "side-only"), "isSidechain": True},        # sidechain
+        {**msg("sc", "b", "side-only"), "isSidechain": True},        # routed to agent_runs
         msg("mx", "b", "meta", is_meta=True),                        # m=1
         msg("c", "b", "main-3"),
     ])
     data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
 
-    assert len(data["main"]) + len(data["sidechain"]) == 4           # N - k - m
-    assert data["total"] == 3                                        # main only
-    assert len(data["sidechain"]) == 1
+    main_uuids = [m["uuid"] for m in data["main"]]
+    assert main_uuids == ["a", "b", "c"]
+    assert "sc" not in main_uuids
+    assert data["total"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -202,27 +203,24 @@ def test_parser_uuid_roundtrip(client, tmp_path):
 
     data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
     returned = [m["uuid"] for m in data["main"]]
-    side_uuids = [m["uuid"] for m in data["sidechain"]]
 
     # complete set check — catches both missing and unexpected UUIDs
     assert set(returned) == {"a", "b", "d"}
     assert len(returned) == 3      # length + set equality ⇒ no duplicates
     assert "snap1" not in returned
     assert "c" not in returned
-    # filtered entries must not leak into sidechain either
-    assert "snap1" not in side_uuids
-    assert "c" not in side_uuids
-    # role must survive the round-trip — the parser routes (side if
-    # is_sidechain else main) and could silently swap/drop role.
+    # role must survive the round-trip
     by_uuid = {m["uuid"]: m for m in data["main"]}
     assert by_uuid["a"]["role"] == "user"
     assert by_uuid["b"]["role"] == "user"
     assert by_uuid["d"]["role"] == "user"
 
 
-def test_parser_uuid_roundtrip_includes_sidechain(client, tmp_path):
-    """Every non-filtered uuid appears exactly once across main ∪ sidechain,
-    and the two lists are disjoint (a uuid can't be in both)."""
+def test_parser_uuid_roundtrip_excludes_inline_sidechain(client, tmp_path):
+    """Every non-filtered uuid appears exactly once in `main`. Inline
+    `isSidechain: true` entries are dropped outright (not routed elsewhere)
+    — the replacement story for agent runs is the separate subagents/ files
+    tested below."""
     path = tmp_path / "proj" / "c.jsonl"
     write_jsonl(path, [
         msg("a", None, "first"),
@@ -235,16 +233,13 @@ def test_parser_uuid_roundtrip_includes_sidechain(client, tmp_path):
 
     data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
     main_uuids = [m["uuid"] for m in data["main"]]
-    side_uuids = [m["uuid"] for m in data["sidechain"]]
-    all_returned = main_uuids + side_uuids
 
-    expected = {"a", "b", "d", "e"}           # snap1 (k=1) and c (m=1) filtered
-    assert set(all_returned) == expected
-    assert len(all_returned) == len(set(all_returned)), \
-        "uuid appears in both main and sidechain"
-    assert set(main_uuids).isdisjoint(set(side_uuids))
-    assert "snap1" not in all_returned
-    assert "c" not in all_returned
+    # snap1 (snapshot), c (isMeta), d (isSidechain) are all filtered out.
+    assert set(main_uuids) == {"a", "b", "e"}
+    assert len(main_uuids) == len(set(main_uuids)), "dup uuid in main"
+    assert "snap1" not in main_uuids
+    assert "c" not in main_uuids
+    assert "d" not in main_uuids
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +746,9 @@ def test_parser_dedups_repeated_uuids(client, tmp_path):
 # Sidechain placement
 # ---------------------------------------------------------------------------
 
-def test_sidechain_entry_lands_in_sidechain_not_main(client, tmp_path):
+def test_inline_sidechain_entry_dropped_from_main(client, tmp_path):
+    """Inline sidechain entries are skipped in `main`. Order and content
+    of real main entries is preserved around them."""
     path = tmp_path / "proj" / "c.jsonl"
     write_jsonl(path, [
         msg("a", None, "main-1"),
@@ -761,11 +758,383 @@ def test_sidechain_entry_lands_in_sidechain_not_main(client, tmp_path):
 
     data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
     main_uuids = [m["uuid"] for m in data["main"]]
-    side_uuids = [m["uuid"] for m in data["sidechain"]]
 
-    assert "d" in side_uuids
     assert "d" not in main_uuids
     assert main_uuids == ["a", "b"]
+
+
+
+# ---------------------------------------------------------------------------
+# Agent runs (subagents/ files)
+# ---------------------------------------------------------------------------
+
+def _agent_entry(uuid, parent, text, *, parent_tool_use_id, role="assistant"):
+    # Timestamp bucket derived from hash so entries within one fixture sort
+    # stably without requiring callers to pass hex-only uuids.
+    bucket = abs(hash((uuid, text))) % 60
+    entry = {
+        "uuid": uuid,
+        "parentUuid": parent,
+        "type": role,
+        "isSidechain": True,
+        "timestamp": f"2026-04-16T00:00:{bucket:02d}.000Z",
+        "message": {"role": role, "content": [{"type": "text", "text": text}]},
+    }
+    if parent_tool_use_id is not None:
+        entry["parentToolUseID"] = parent_tool_use_id
+    return entry
+
+
+def test_agent_runs_discovered_from_subagents_dir(client, tmp_path):
+    """api_conversation lists one agent_run per subagent .jsonl file.
+    Name is parsed from the filename token between 'agent-' and the
+    trailing hex hash. run_id = the hash itself."""
+    parent = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(parent, [msg("a", None, "main-1")])
+
+    sub = tmp_path / "proj" / "c" / "subagents" / "agent-aside_question-88f7f4fbad621fbe.jsonl"
+    write_jsonl(sub, [
+        _agent_entry("a1", None, "sub-1", parent_tool_use_id="toolu_ABC"),
+        _agent_entry("a2", "a1", "sub-2", parent_tool_use_id="toolu_ABC"),
+    ])
+
+    data = client.get("/api/projects/proj/conversations/c").get_json()
+    assert len(data["agent_runs"]) == 1
+    run = data["agent_runs"][0]
+    assert run["run_id"] == "88f7f4fbad621fbe"
+    assert run["name"] == "aside_question"
+    assert run["message_count"] == 2
+    assert run["source"] == "subagent"
+
+
+def test_subagent_run_anchors_to_parent_agent_tool_use(client, tmp_path):
+    """If any entry in a subagent file carries a `parentToolUseID` that
+    matches a parent tool_use named `Agent` or `Task`, that id becomes the
+    run's `anchor_tool_use_id` (where the inline `→` marker attaches).
+    Non-Agent ptus (Read/Write/Edit/etc.) are audit-trail noise — they
+    must NOT become anchors."""
+    parent = tmp_path / "proj" / "c.jsonl"
+    # Parent assistant message with two tool_use blocks: one Agent, one Read.
+    agent_msg = {
+        "uuid": "asst-1", "parentUuid": None, "type": "assistant",
+        "isMeta": False,
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "toolu_AGENT", "name": "Agent", "input": {}},
+                {"type": "tool_use", "id": "toolu_READ",  "name": "Read",  "input": {}},
+            ],
+        },
+    }
+    write_jsonl(parent, [msg("u1", None, "what's up?"), agent_msg])
+
+    sub = tmp_path / "proj" / "c" / "subagents" / "agent-worker-abcdef01.jsonl"
+    write_jsonl(sub, [
+        # One entry keyed on the Agent ptu, one on the (noise) Read ptu.
+        _agent_entry("a1", None, "real agent output", parent_tool_use_id="toolu_AGENT"),
+        _agent_entry("a2", "a1", "spurious progress",   parent_tool_use_id="toolu_READ"),
+    ])
+
+    data = client.get("/api/projects/proj/conversations/c").get_json()
+    assert len(data["agent_runs"]) == 1
+    run = data["agent_runs"][0]
+    assert run["anchor_tool_use_id"] == "toolu_AGENT"
+    assert run["message_count"] == 2  # full file transcript, not ptu-filtered
+
+
+def test_subagent_run_without_agent_ptu_is_standalone(client, tmp_path):
+    """Files with zero Agent/Task-named ptus are still valid runs — they
+    just have no parent-side anchor (show in the subagents list only)."""
+    parent = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(parent, [msg("u1", None, "main")])
+
+    sub = tmp_path / "proj" / "c" / "subagents" / "agent-observer-cafebabe.jsonl"
+    write_jsonl(sub, [
+        _agent_entry("a1", None, "standalone-1", parent_tool_use_id=None),
+        _agent_entry("a2", "a1", "standalone-2", parent_tool_use_id=None),
+    ])
+
+    data = client.get("/api/projects/proj/conversations/c").get_json()
+    assert len(data["agent_runs"]) == 1
+    run = data["agent_runs"][0]
+    assert run["anchor_tool_use_id"] is None
+    assert run["run_id"] == "cafebabe"
+
+
+def test_agent_run_endpoint_returns_whole_file_transcript(client, tmp_path):
+    """The agent endpoint returns every formatted entry in the subagent
+    file (no ptu filtering). Routed by run_id = filename hash."""
+    parent = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(parent, [msg("a", None, "main-1")])
+
+    sub = tmp_path / "proj" / "c" / "subagents" / "agent-researcher-deadbeef01.jsonl"
+    write_jsonl(sub, [
+        _agent_entry("a1", None, "entry-one", parent_tool_use_id="toolu_X"),
+        _agent_entry("a2", "a1", "entry-two", parent_tool_use_id="toolu_X"),
+        _agent_entry("b1", None, "entry-three", parent_tool_use_id="toolu_Y"),
+    ])
+
+    resp = client.get("/api/projects/proj/conversations/c/agent/deadbeef01")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["agent_name"] == "researcher"
+    assert data["run_id"] == "deadbeef01"
+    assert data["parent_convo_id"] == "c"
+    contents = [m["content"] for m in data["main"]]
+    # Whole-file transcript: all three entries surface, regardless of ptu.
+    assert contents == ["entry-one", "entry-two", "entry-three"]
+
+
+def test_agent_run_endpoint_404_for_unknown_run_id(client, tmp_path):
+    parent = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(parent, [msg("a", None, "main-1")])
+
+    resp = client.get("/api/projects/proj/conversations/c/agent/no_such_run")
+    assert resp.status_code == 404
+
+
+def test_agent_run_name_defaults_to_agent_when_filename_has_no_name_token(client, tmp_path):
+    parent = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(parent, [msg("a", None, "main-1")])
+
+    # Pattern: `agent-<hex>` with no name token between.
+    sub = tmp_path / "proj" / "c" / "subagents" / "agent-a6ea9ea898b34a9c.jsonl"
+    write_jsonl(sub, [
+        _agent_entry("a1", None, "hi", parent_tool_use_id=None),
+    ])
+
+    data = client.get("/api/projects/proj/conversations/c").get_json()
+    assert data["agent_runs"][0]["name"] == "agent"
+    assert data["agent_runs"][0]["run_id"] == "a6ea9ea898b34a9c"
+
+
+
+def test_inline_agent_run_discovered_from_parent_file(client, tmp_path):
+    """Old format: a contiguous cluster of `isSidechain: true` entries in
+    the parent .jsonl surfaces as one agent_run with source="inline" and a
+    synthetic `inline:<anchor_uuid>` run_id. Anchor = parentUuid of the
+    cluster's root."""
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [
+        msg("a", None, "main-1"),
+        msg("b", "a", "main-2-with-Task-call"),
+        {**msg("s1", "b", "agent says hi"), "isSidechain": True},
+        {**msg("s2", "s1", "agent thinks"),  "isSidechain": True},
+        {**msg("s3", "s2", "agent done"),    "isSidechain": True},
+        msg("c", "b", "main-3-after-agent"),
+    ])
+
+    data = client.get("/api/projects/proj/conversations/c").get_json()
+    assert len(data["agent_runs"]) == 1
+    run = data["agent_runs"][0]
+    assert run["source"] == "inline"
+    assert run["run_id"] == "inline:b"           # cluster's non-sidechain ancestor
+    assert run["anchor_uuid"] == "b"
+    assert run["message_count"] == 3
+    assert run["name"] == "agent"
+
+
+def test_inline_agent_run_endpoint_returns_only_clusters_messages(client, tmp_path):
+    """Two separate inline clusters rooted at different main messages must
+    not bleed into each other's runs."""
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [
+        msg("a", None, "main-1"),
+        {**msg("s1", "a", "cluster-A-msg-1"), "isSidechain": True},
+        {**msg("s2", "s1", "cluster-A-msg-2"), "isSidechain": True},
+        msg("b", "a", "main-2"),
+        {**msg("t1", "b", "cluster-B-msg-1"), "isSidechain": True},
+    ])
+
+    data = client.get("/api/projects/proj/conversations/c").get_json()
+    run_ids = {r["run_id"] for r in data["agent_runs"]}
+    assert run_ids == {"inline:a", "inline:b"}
+
+    # Fetch cluster A — must contain only its two entries.
+    resp = client.get("/api/projects/proj/conversations/c/agent/inline:a")
+    assert resp.status_code == 200
+    contents = [m["content"] for m in resp.get_json()["main"]]
+    assert "cluster-A-msg-1" in contents
+    assert "cluster-A-msg-2" in contents
+    assert "cluster-B-msg-1" not in contents
+
+
+def test_inline_and_subagent_runs_coexist_in_same_convo(client, tmp_path):
+    """Both sources surface together in agent_runs with distinct ids and
+    `source` tags so the UI can mark them differently."""
+    parent = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(parent, [
+        msg("a", None, "main-1"),
+        {**msg("s1", "a", "old-format-agent"), "isSidechain": True},
+    ])
+    sub = tmp_path / "proj" / "c" / "subagents" / "agent-worker-beef0001.jsonl"
+    write_jsonl(sub, [
+        _agent_entry("x1", None, "new-format-agent", parent_tool_use_id=None),
+    ])
+
+    data = client.get("/api/projects/proj/conversations/c").get_json()
+    by_id = {r["run_id"]: r for r in data["agent_runs"]}
+    assert "inline:a" in by_id and by_id["inline:a"]["source"] == "inline"
+    assert "beef0001" in by_id and by_id["beef0001"]["source"] == "subagent"
+
+
+
+# ---------------------------------------------------------------------------
+# System-event badges (slash commands, queued drafts, compactions, …)
+# ---------------------------------------------------------------------------
+
+def _top_level_content_entry(type_, subtype, text, uuid="u1"):
+    """An entry in Claude Code's 'envelope 3' shape: top-level `content`
+    string, no `message` object. Used for slash commands, queue-operations,
+    and system meta events."""
+    e = {"uuid": uuid, "type": type_, "content": text, "isMeta": False}
+    if subtype is not None:
+        e["subtype"] = subtype
+    return e
+
+
+def test_slash_command_entry_rendered_as_marker(client, tmp_path):
+    """A `system / local_command` entry carries `<command-name>` XML; the
+    formatter rewrites it to `[Slash: /btw]` so the frontend renders a pill."""
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [
+        msg("a", None, "main-1"),
+        _top_level_content_entry(
+            "system", "local_command",
+            "<command-name>/btw</command-name>\n    <command-message>btw</command-message>\n    <command-args></command-args>",
+            uuid="cmd1",
+        ),
+    ])
+    data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
+    by_uuid = {m["uuid"]: m for m in data["main"]}
+    assert "cmd1" in by_uuid
+    assert by_uuid["cmd1"]["role"] == "system"
+    assert by_uuid["cmd1"]["content"] == "[Slash: /btw]"
+
+
+def test_local_command_stdout_collapsed_into_marker(client, tmp_path):
+    """`<local-command-stdout>…</local-command-stdout>` in a regular user
+    message collapses to `[SlashOut] <text>`."""
+    path = tmp_path / "proj" / "c.jsonl"
+    stdout_entry = {
+        "uuid": "out1", "parentUuid": None, "type": "user", "isMeta": False,
+        "message": {"role": "user", "content": "<local-command-stdout>Set model to Opus</local-command-stdout>"},
+    }
+    write_jsonl(path, [msg("a", None, "hello"), stdout_entry])
+    data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
+    by_uuid = {m["uuid"]: m for m in data["main"]}
+    assert by_uuid["out1"]["content"] == "[SlashOut] Set model to Opus"
+
+
+def test_queue_operation_entry_rendered_as_queued_badge(client, tmp_path):
+    """Queued drafts (user text typed while auto-mode is busy) surface as
+    user-role messages with a `[Queued]` prefix so a badge shows before the
+    text."""
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [
+        msg("a", None, "main-1"),
+        _top_level_content_entry("queue-operation", None, "retry with more context", uuid="q1"),
+    ])
+    data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
+    by_uuid = {m["uuid"]: m for m in data["main"]}
+    assert by_uuid["q1"]["role"] == "user"
+    assert by_uuid["q1"]["content"].startswith("[Queued] ")
+    assert "retry with more context" in by_uuid["q1"]["content"]
+
+
+def test_compact_and_away_boundaries_get_system_badges(client, tmp_path):
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [
+        msg("a", None, "main-1"),
+        _top_level_content_entry("system", "compact_boundary", "Conversation compacted", uuid="c1"),
+        _top_level_content_entry("system", "away_summary", "Auto mode built X", uuid="aw1"),
+        _top_level_content_entry("system", "informational", "Auto mode tip", uuid="inf1"),
+        _top_level_content_entry("system", "scheduled_task_fire", "Firing at 10am", uuid="s1"),
+    ])
+    data = client.get("/api/projects/proj/conversations/c?limit=100").get_json()
+    by_uuid = {m["uuid"]: m for m in data["main"]}
+    assert by_uuid["c1"]["content"].startswith("[Compacted] ")
+    assert by_uuid["aw1"]["content"].startswith("[Away] ")
+    assert by_uuid["inf1"]["content"].startswith("[Info] ")
+    assert by_uuid["s1"]["content"].startswith("[Scheduled] ")
+
+
+
+def test_stats_counts_slash_commands_and_session_events(client, tmp_path):
+    """The per-convo stats endpoint exposes slash-command frequency and
+    event counts (queued / compacted / etc.) — powers the Session events
+    section of the stats modal without touching token totals."""
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [
+        msg("a", None, "hello"),
+        # Two /btw invocations + one /clear in the envelope-3 shape.
+        _top_level_content_entry("system", "local_command",
+            "<command-name>/btw</command-name><command-args></command-args>", uuid="s1"),
+        _top_level_content_entry("system", "local_command",
+            "<command-name>/btw</command-name><command-args></command-args>", uuid="s2"),
+        _top_level_content_entry("system", "local_command",
+            "<command-name>/clear</command-name>", uuid="s3"),
+        _top_level_content_entry("queue-operation", None, "queued text 1", uuid="q1"),
+        _top_level_content_entry("queue-operation", None, "queued text 2", uuid="q2"),
+        _top_level_content_entry("system", "compact_boundary", "Conversation compacted", uuid="c1"),
+    ])
+    resp = client.get("/api/projects/proj/conversations/c/stats")
+    assert resp.status_code == 200
+    s = resp.get_json()
+    assert s["slash_commands"] == {"/btw": 2, "/clear": 1}
+    assert s["queued_count"] == 2
+    assert s["compact_count"] == 1
+    # Token totals must be zero — these entries don't carry `usage`.
+    assert s["input_tokens"] == 0
+    assert s["output_tokens"] == 0
+
+
+
+def test_stats_thinking_prorate_and_compact_estimate(client, tmp_path):
+    """Thinking estimate = `output_tokens - text_chars / 4` for each turn
+    that contains a thinking block. This survives redacted-thinking turns
+    (where the `thinking` field is empty and only a signature is stored)
+    because we derive the response side from visible text, not thinking
+    chars. `compact_summary_chars` sums the injected summary messages."""
+    path = tmp_path / "proj" / "c.jsonl"
+    # Turn 1: 100 output_tokens, text = 80 chars → response_est = 20,
+    # thinking_est = 80. Redacted thinking (empty content).
+    t1 = {
+        "uuid": "t1", "parentUuid": None, "type": "assistant", "isMeta": False,
+        "message": {
+            "role": "assistant", "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 10, "output_tokens": 100},
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sig1"},
+                {"type": "text", "text": "y" * 80},
+            ],
+        },
+    }
+    # Turn 2: 200 output_tokens, text = 200 chars → response_est = 50,
+    # thinking_est = 150. Non-redacted thinking (content present, ignored).
+    t2 = {
+        "uuid": "t2", "parentUuid": "t1", "type": "assistant", "isMeta": False,
+        "message": {
+            "role": "assistant", "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 20, "output_tokens": 200},
+            "content": [
+                {"type": "thinking", "thinking": "x" * 999},
+                {"type": "text", "text": "y" * 200},
+            ],
+        },
+    }
+    # A compaction: boundary + the injected summary as the next user msg.
+    cb = _top_level_content_entry("system", "compact_boundary", "Conversation compacted", uuid="cb")
+    summary_text = "S" * 4000
+    summary = {
+        "uuid": "sum1", "parentUuid": None, "type": "user", "isMeta": False,
+        "message": {"role": "user", "content": summary_text},
+    }
+    write_jsonl(path, [t1, t2, cb, summary])
+
+    s = client.get("/api/projects/proj/conversations/c/stats").get_json()
+    assert s["thinking_output_tokens_estimate"] == {"claude-opus-4-7": 230}  # 80 + 150
+    assert s["compact_summary_chars"] == 4000
 
 
 # ---------------------------------------------------------------------------
@@ -786,7 +1155,7 @@ def test_empty_conversation_returns_empty_lists(client, tmp_path):
     data = resp.get_json()
 
     assert data["main"] == []
-    assert data["sidechain"] == []
+    assert data["agent_runs"] == []
     assert data["total"] == 0
 
 
@@ -799,7 +1168,7 @@ def test_completely_empty_file(client, tmp_path):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data["main"] == []
-    assert data["sidechain"] == []
+    assert data["agent_runs"] == []
     assert data["total"] == 0
     assert data["offset"] == 0
 
@@ -1362,3 +1731,206 @@ def test_extract_nonexistent_uuids_returns_400_or_empty(client, tmp_path):
         ).get_json()
         assert new["main"] == []
         assert new["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Enriched parse payload: model + usage on assistant entries
+# ---------------------------------------------------------------------------
+
+def test_parsed_payload_surfaces_model_and_usage_for_assistant(client, tmp_path):
+    """_parse_messages_cached now forwards the raw message's `model` and
+    `usage` fields so the export/stats paths can emit them without
+    re-reading the source file."""
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [
+        {
+            "uuid": "u1",
+            "parentUuid": None,
+            "type": "user",
+            "isMeta": False,
+            "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        },
+        {
+            "uuid": "a1",
+            "parentUuid": "u1",
+            "type": "assistant",
+            "isMeta": False,
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-7",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "content": [{"type": "text", "text": "hello"}],
+            },
+        },
+    ])
+    resp = client.get("/api/projects/proj/conversations/c?limit=50")
+    assert resp.status_code == 200
+    main = resp.get_json()["main"]
+    by_role = {m["role"]: m for m in main}
+    assert "assistant" in by_role
+    assert by_role["assistant"].get("model") == "claude-opus-4-7"
+    assert by_role["assistant"].get("usage") == {"input_tokens": 10, "output_tokens": 5}
+    # User entry should not sprout a synthetic model/usage.
+    assert "model" not in by_role["user"]
+    assert "usage" not in by_role["user"]
+
+
+# ---------------------------------------------------------------------------
+# Raw conversation endpoint
+# ---------------------------------------------------------------------------
+
+def test_raw_endpoint_returns_unmodified_source_bytes(client, tmp_path):
+    path = tmp_path / "proj" / "c.jsonl"
+    entries = [
+        {"uuid": "u1", "parentUuid": None, "sessionId": "s1",
+         "type": "user", "isMeta": False,
+         "message": {"role": "user", "content": [{"type": "text", "text": "raw"}]}},
+        {"type": "file-history-snapshot", "uuid": "snap"},
+    ]
+    write_jsonl(path, entries)
+    on_disk = path.read_bytes()
+    resp = client.get("/api/projects/proj/conversations/c/raw")
+    assert resp.status_code == 200
+    assert resp.mimetype == "application/x-ndjson"
+    assert "attachment" in resp.headers.get("Content-Disposition", "")
+    assert "c.jsonl" in resp.headers.get("Content-Disposition", "")
+    # File-history snapshots and any other bytes the parser drops must still
+    # appear in the raw download.
+    assert resp.data == on_disk
+    assert b"file-history-snapshot" in resp.data
+
+
+def test_raw_endpoint_404_on_missing(client, tmp_path):
+    resp = client.get("/api/projects/proj/conversations/missing/raw")
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Download field preferences
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def client_isolated_download_fields(tmp_path, monkeypatch):
+    monkeypatch.setattr(llm_lens, "CLAUDE_PROJECTS_DIR", tmp_path)
+    monkeypatch.setattr(
+        llm_lens, "_download_fields_path",
+        lambda: tmp_path / "download_fields.json",
+    )
+    llm_lens._peek_jsonl_cached.cache_clear()
+    llm_lens._parse_messages_cached.cache_clear()
+    llm_lens.app.config["TESTING"] = True
+    return llm_lens.app.test_client()
+
+
+def test_download_fields_defaults(client_isolated_download_fields):
+    """Fresh install returns the shipped defaults; role+content are always
+    true."""
+    resp = client_isolated_download_fields.get("/api/download-fields")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["role"] is True
+    assert data["content"] is True
+    assert data["uuid"] is True
+    assert data["timestamp"] is True
+    assert data["commands"] is False
+    assert data["model"] is False
+    assert data["usage"] is False
+
+
+def test_download_fields_round_trip_ignores_required_off(client_isolated_download_fields):
+    """Client can toggle optional fields; required fields stay forced on
+    even if the payload says otherwise."""
+    resp = client_isolated_download_fields.post(
+        "/api/download-fields",
+        json={"role": False, "content": False, "model": True, "usage": True,
+              "uuid": False, "timestamp": False, "commands": True},
+    )
+    assert resp.status_code == 200
+    saved = resp.get_json()
+    assert saved["role"] is True
+    assert saved["content"] is True
+    assert saved["model"] is True
+    assert saved["usage"] is True
+    assert saved["uuid"] is False
+    assert saved["timestamp"] is False
+    assert saved["commands"] is True
+
+    # Re-fetching must return the same values.
+    again = client_isolated_download_fields.get("/api/download-fields").get_json()
+    assert again == saved
+
+
+def test_download_fields_unknown_keys_ignored(client_isolated_download_fields):
+    resp = client_isolated_download_fields.post(
+        "/api/download-fields",
+        json={"garbage": True, "role": True},
+    )
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert "garbage" not in data
+
+
+# ---------------------------------------------------------------------------
+# _load_download_fields robustness — file-level, not round-tripping through
+# the API. Covers the "stale JSON blob" and "partial keys" cases the HTTP
+# tests can't easily construct.
+# ---------------------------------------------------------------------------
+
+def test_load_download_fields_falls_back_on_malformed_json(tmp_path, monkeypatch):
+    """If ~/.cache/llm-lens/download_fields.json gets corrupted (truncated,
+    half-written, edited by hand), the loader must not crash — users would
+    silently lose export functionality."""
+    path = tmp_path / "download_fields.json"
+    path.write_text("{this is not json")
+    monkeypatch.setattr(llm_lens, "_download_fields_path", lambda: path)
+    out = llm_lens._load_download_fields()
+    # Every expected key present and role/content still forced on.
+    for k in ("uuid", "role", "content", "timestamp", "commands", "model", "usage"):
+        assert k in out
+    assert out["role"] is True and out["content"] is True
+
+
+def test_load_download_fields_partial_file_merges_with_defaults(tmp_path, monkeypatch):
+    """Older versions / partial writes may only know about a subset of
+    keys. Missing keys must fall through to defaults rather than dropping."""
+    path = tmp_path / "download_fields.json"
+    path.write_text(json.dumps({"model": True}))  # only one optional key
+    monkeypatch.setattr(llm_lens, "_download_fields_path", lambda: path)
+    out = llm_lens._load_download_fields()
+    assert out["model"] is True                      # honored
+    assert out["commands"] is False                  # default
+    assert out["usage"] is False                     # default
+    assert out["role"] is True and out["content"] is True
+
+
+def test_load_download_fields_ignores_non_bool_values(tmp_path, monkeypatch):
+    """A stray string or null in the saved file for an optional field
+    shouldn't flip the flag truthy — use the default and move on."""
+    path = tmp_path / "download_fields.json"
+    path.write_text(json.dumps({"uuid": "yes", "model": None, "usage": 1}))
+    monkeypatch.setattr(llm_lens, "_download_fields_path", lambda: path)
+    out = llm_lens._load_download_fields()
+    # All three fall back to shipped defaults (True / False / False).
+    assert out["uuid"] is True      # default on
+    assert out["model"] is False    # default off
+    assert out["usage"] is False    # default off
+
+
+def test_save_download_fields_rejects_non_bool_and_rehydrates(tmp_path, monkeypatch):
+    path = tmp_path / "download_fields.json"
+    monkeypatch.setattr(llm_lens, "_download_fields_path", lambda: path)
+    saved = llm_lens._save_download_fields({"uuid": "truthy-string", "model": 1})
+    # Non-bool values get replaced by defaults, not coerced through bool().
+    assert saved["uuid"] is True       # default
+    assert saved["model"] is False     # default
+    # File contents match what we returned (no smuggled extra keys).
+    on_disk = json.loads(path.read_text())
+    assert on_disk == saved
+
+
+def test_save_download_fields_forces_required_fields_on(tmp_path, monkeypatch):
+    path = tmp_path / "download_fields.json"
+    monkeypatch.setattr(llm_lens, "_download_fields_path", lambda: path)
+    saved = llm_lens._save_download_fields({"role": False, "content": False})
+    assert saved["role"] is True and saved["content"] is True
+    assert json.loads(path.read_text())["role"] is True

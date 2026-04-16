@@ -38,6 +38,12 @@ export function updateEditButton() {
   if (statsBtn) {
     statsBtn.style.display = state.view === "messages" ? "" : "none";
   }
+  const dlBtn = document.getElementById("download-raw-convo");
+  if (dlBtn) {
+    // Gated behind edit mode: full-source dump is a power-user /
+    // destructive-adjacent action, so keep it out of the default UI.
+    dlBtn.style.display = (state.view === "messages" && state.editMode) ? "" : "none";
+  }
   const overviewStatsBtn = document.getElementById("overview-stats-toggle");
   if (overviewStatsBtn) {
     // The overview (and its Stats modal) now scopes automatically to the

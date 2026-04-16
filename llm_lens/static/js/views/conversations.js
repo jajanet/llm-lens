@@ -805,8 +805,14 @@ export function deleteConvo(id) {
       : `Permanently deletes the <code>.jsonl</code> file from
          <code>~/.claude/projects/</code>. <strong>Cannot be undone</strong>, and
          you won't be able to <code>/resume</code> it after.
-         <br><br>Click <em>Arch</em> to keep the content reversibly, or <em>Dup</em> for a backup.`,
+         <br><br>Click <em>Arch</em> to keep the content reversibly, or <em>Dup &amp; Delete</em> to keep a backup copy.`,
     onConfirm: async () => {
+      await api.deleteConversation(state.folder, id);
+      invalidateProjectsCache();
+      await refreshAndRender();
+    },
+    onDuplicate: archived ? undefined : async () => {
+      await api.duplicateConversation(state.folder, id);
       await api.deleteConversation(state.folder, id);
       invalidateProjectsCache();
       await refreshAndRender();

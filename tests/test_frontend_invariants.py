@@ -171,3 +171,171 @@ def test_copy_id_btn_hidden_until_hover(styles_css):
     assert "opacity: 0" in styles_css
     assert "tr:hover .copy-id-btn" in styles_css
     assert ".card:hover .copy-id-btn" in styles_css
+
+
+# --- Export / Extract menu + JSONL fields modal ---------------------------
+# Ensures the selection bar's Export/Extract button opens a menu with all
+# the intended destinations and the modal exposes the expected fields.
+
+@pytest.fixture(scope="module")
+def index_html():
+    return read(ROOT / "llm_lens" / "static" / "index.html")
+
+
+@pytest.fixture(scope="module")
+def exports_js():
+    return read(JS / "exports.js")
+
+
+def test_download_raw_convo_button_in_header(index_html):
+    # The new page-toolbar button sits next to the existing Edit toggle.
+    assert 'id="download-raw-convo"' in index_html
+    assert 'data-action="download-raw-convo"' in index_html
+    # Paranoia: it should sit BEFORE edit-toggle in the DOM so visual order
+    # matches the user's mental model ("next to Edit").
+    assert index_html.index("download-raw-convo") < index_html.index("edit-toggle")
+
+
+def test_download_raw_convo_has_tooltip(index_html):
+    # A placement without explanation would be mystery-meat; keep the
+    # tooltip on the element.
+    import re
+    m = re.search(r'id="download-raw-convo"[^>]*title="([^"]+)"', index_html)
+    assert m, "download-raw-convo button must carry a title/tooltip"
+    assert len(m.group(1)) > 10
+
+
+def test_selection_bar_uses_export_extract_menu(messages_js):
+    # Old loose Copy / Save-to-new-convo buttons in the sel-bar are gone;
+    # the single menu-opener replaces them.
+    assert 'data-action="open-export-menu"' in messages_js
+    assert "Export/Extract" in messages_js
+    # The old button labels must not linger — they'd confuse users who
+    # expect only the menu.
+    assert '>Save to new convo<' not in messages_js
+    # "Copy" as a bare selection-bar button is gone; the name now lives
+    # inside the menu as "Copy plain to clipboard".
+    assert 'data-action="copy-selected">Copy<' not in messages_js
+
+
+def test_export_menu_contains_all_destinations(messages_js):
+    # Each menu item's action must be wired.
+    for action in (
+        "copy-selected",
+        "copy-selected-jsonl",
+        "download-selected-jsonl",
+        "save-selected",
+        "open-jsonl-fields",
+    ):
+        assert f'data-action="{action}"' in messages_js, f"missing {action} menu entry"
+
+
+def test_export_menu_actions_registered_in_main(main_js):
+    # Without these entries in the action map the menu items silently do
+    # nothing — catch that at build-time.
+    for action in (
+        "copy-selected-jsonl",
+        "download-selected-jsonl",
+        "open-export-menu",
+        "open-jsonl-fields",
+        "download-raw-convo",
+    ):
+        assert f'"{action}"' in main_js, f"main.js action map missing {action}"
+
+
+def test_jsonl_fields_modal_locks_role_and_content(messages_js):
+    # role + content are structural; their checkboxes must render disabled.
+    # Checking for the exact snippet that flags required fields.
+    assert "REQUIRED_EXPORT_FIELDS.includes(f)" in messages_js
+    assert "disabled" in messages_js  # at least one disabled attr in the file
+
+
+def test_jsonl_fields_modal_has_select_all(messages_js):
+    assert "data-select-all" in messages_js
+    assert ">Select all<" in messages_js
+
+
+def test_exports_module_declares_required_fields(exports_js):
+    # Required-fields constant is the single source of truth for which
+    # checkboxes lock.
+    assert "REQUIRED_EXPORT_FIELDS" in exports_js
+    assert '"role"' in exports_js and '"content"' in exports_js
+
+
+def test_exports_jsonl_respects_required_even_if_unchecked(exports_js):
+    # The serializer itself re-guards required fields so a stale
+    # state.downloadFields can't produce a role-less JSONL line.
+    assert "REQUIRED_EXPORT_FIELDS.includes(f)" in exports_js
+
+
+def test_api_has_download_fields_endpoints(main_js):
+    # api.js re-exports through main.js' import graph — testing api.js
+    # directly is enough. Use the api.js file.
+    api_js = read(JS / "api.js")
+    assert "getDownloadFields" in api_js
+    assert "saveDownloadFields" in api_js
+    assert "rawConversationUrl" in api_js
+
+
+def test_jsonl_fields_modal_css_exists(styles_css):
+    assert ".jsonl-fields-list" in styles_css
+    assert ".jsonl-field-row" in styles_css
+
+
+# Preview-before-apply modal. The modal itself is tested via the pure-helper
+# unit tests in tests/js/test_preview.mjs; these invariants guard the static
+# wiring so a rename in one file doesn't silently break the feature.
+
+@pytest.fixture(scope="module")
+def preview_js():
+    return read(JS / "preview.js")
+
+def test_preview_module_exports_pure_helpers(preview_js):
+    # Unit tests import these by name — if they get renamed or un-exported
+    # the JS tests break loudly but Python will catch the missing export too.
+    assert "export function diffWords" in preview_js
+    assert "export function deltaOf" in preview_js
+    assert "export function computeRows" in preview_js
+    assert "export function showPreviewModal" in preview_js
+
+def test_state_persists_preview_toggle(state_js):
+    # Default ON (only explicit "0" turns it off).
+    assert 'localStorage.getItem("previewEnabled") !== "0"' in state_js
+    assert "setPreviewEnabled" in state_js
+    assert "setPreviewView" in state_js
+
+def test_main_registers_toggle_preview_action(main_js):
+    assert '"toggle-preview"' in main_js
+    assert "setPreviewEnabled" in main_js
+
+def test_messages_wires_preview_into_both_transform_paths(messages_js):
+    assert 'from "../preview.js"' in messages_js
+    assert "showPreviewModal" in messages_js
+    # Both single-message and bulk entry points must gate on the setting.
+    assert messages_js.count("state.previewEnabled") >= 2
+
+def test_transform_menus_include_preview_toggle(messages_js):
+    assert 'data-action="toggle-preview"' in messages_js
+    # Label flips between "Turn on" and "Turn off" depending on current state,
+    # so both strings must exist in the source.
+    assert "Turn on preview edits" in messages_js
+    assert "Turn off preview edits" in messages_js
+
+def test_preview_modal_has_skip_checkbox(preview_js):
+    # Top-bar checkbox that flips the global preview setting in place. The
+    # modal stays open so the user still chooses whether to commit the
+    # current batch under review.
+    assert 'data-preview-skip' in preview_js
+    assert 'type="checkbox"' in preview_js
+
+def test_preview_modal_has_apply_all_and_apply_selected(preview_js):
+    assert "data-preview-apply-all" in preview_js
+    assert "data-preview-apply-selected" in preview_js
+    assert "data-preview-cancel" in preview_js
+
+def test_preview_css_exists(styles_css):
+    assert ".modal.preview-modal" in styles_css
+    assert ".preview-row" in styles_css
+    assert ".preview-delta" in styles_css
+    assert ".preview-inline" in styles_css
+    assert ".preview-stacked" in styles_css

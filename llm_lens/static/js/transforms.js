@@ -86,12 +86,35 @@ export function stripFiller(text, phrases) {
   return out.trim();
 }
 
-export function applyTransform(kind, text, { swears = [], filler = [] } = {}) {
+// Word-bounded phrase removal — same mechanism as stripSwears without
+// the `*` stem syntax. Targets verbosity (obviousness signalers, meta-
+// commentary) which is about token cost, not agent behavior.
+export function stripVerbosity(text, phrases) {
+  if (!text || !phrases || !phrases.length) return text;
+  const sorted = [...phrases].sort((a, b) => b.length - a.length);
+  const parts = sorted
+    .filter((p) => typeof p === "string" && p.trim())
+    .map(reEscape);
+  if (!parts.length) return text;
+  const pattern = new RegExp(`\\b(?:${parts.join("|")})\\b`, "gi");
+  let out = text.replace(pattern, "");
+  out = out.replace(/[ \t]{2,}/g, " ");
+  out = out.replace(/\n{3,}/g, "\n\n");
+  out = out.replace(/\s+([,.!?;:])/g, "$1");
+  return out.trim();
+}
+
+export function applyTransform(kind, text, { swears = [], filler = [], verbosity = [] } = {}) {
   switch (kind) {
     case "scrub": return scrub();
     case "normalize_whitespace": return normalizeWs(text);
     case "remove_swears": return stripSwears(text, swears);
     case "remove_filler": return stripFiller(text, filler);
+    case "remove_verbosity": return stripVerbosity(text, verbosity);
+    // Priming = swears + drift phrases (same evidence base, different
+    // register). One user-facing action chains both; the individual
+    // kinds above stay callable for tests and internal use.
+    case "remove_priming": return stripFiller(stripSwears(text, swears), filler);
     default: throw new Error(`Unknown transform kind: ${kind}`);
   }
 }

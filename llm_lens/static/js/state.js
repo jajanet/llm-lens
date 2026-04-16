@@ -43,8 +43,12 @@ export const state = {
   msgSelected: new Set(),
 
   editMode: false,
-  showSide: false,
   showWhitespace: false,
+
+  // Agent-run view: when non-null, viewer is scoped to one subagent run
+  // (parent Task tool_use_id). Messages come from the agent endpoint; the
+  // parent convo's id stays in `convoId` so breadcrumbs/back work.
+  agentRunId: null,
 
   convoOffset: 0,
   convoTotal: 0,
@@ -84,6 +88,17 @@ export const state = {
   // null until fetched; null lets contextWindowFor fall back to its own
   // per-session heuristic.
   planContextWindow: null,
+
+  // Cached JSONL download field prefs (server-side). Null until first load;
+  // see exports.js/ensureDownloadFields. Invalidated after modal save.
+  downloadFields: null,
+
+  // Preview-before-apply for transforms (scrub/normalize/swears/filler).
+  // ON by default so destructive-adjacent edits route through a review
+  // modal first. Togglable from the transform menu and from buttons inside
+  // the preview modal itself.
+  previewEnabled: localStorage.getItem("previewEnabled") !== "0",
+  previewView: localStorage.getItem("previewView") === "diff" ? "diff" : "inline"
 };
 
 export function persist(key, value) {
@@ -113,6 +128,17 @@ export function setMode(m) {
 export function setTheme(theme) {
   state.theme = theme;
   persist("theme", theme);
+}
+
+export function setPreviewEnabled(on) {
+  state.previewEnabled = !!on;
+  persist("previewEnabled", on ? "1" : "0");
+}
+
+export function setPreviewView(v) {
+  if (v !== "inline" && v !== "diff") return;
+  state.previewView = v;
+  persist("previewView", v);
 }
 
 export function invalidateProjectsCache() {
