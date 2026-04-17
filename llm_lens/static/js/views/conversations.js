@@ -2,7 +2,7 @@
 
 import { state, invalidateProjectsCache, setViewMode, togglePreviewPosition, persistSelections } from "../state.js";
 import { api } from "../api.js";
-import { timeAgo, timeAbs, fmtSize, esc, escAttr, arrow, toast, renderStatsInline, renderStatsModalBody, fmtTokens, contextWindowFor } from "../utils.js";
+import { timeAgo, timeAbs, fmtSize, esc, escAttr, arrow, toast, renderStatsInline, renderStatsModalBody, fmtTokens, contextWindowFor, hlText } from "../utils.js";
 import { configureToolbar } from "../toolbar.js";
 import { showConfirmModal, showInfoModal } from "../modal.js";
 import { navigate } from "../router.js";
@@ -184,6 +184,123 @@ async function hydrateStats(items) {
 }
 
 
+// ── Full-content search ──────────────────────────────────────────────
+// state.searchMatches: { [convoId]: { count, top: {uuid, role, snippet, index} } }
+// state.searchQuery:   the query those matches correspond to (stale
+//   results get discarded when the user types again).
+
+let _searchDebounce = null;
+let _searchSeq = 0;
+
+function scheduleSearchHydrate(query) {
+  clearTimeout(_searchDebounce);
+  if (!query) {
+    state.searchMatches = {};
+    state.searchQuery = "";
+    state.searchExpanded = {};
+    return;
+  }
+  _searchDebounce = setTimeout(() => hydrateSearch(query), 200);
+}
+
+async function hydrateSearch(query) {
+  const folder = state.folder;
+  const seq = ++_searchSeq;
+  let data;
+  try {
+    data = await api.searchProject(folder, query);
+  } catch {
+    return;
+  }
+  // Drop stale responses: user kept typing, or folder changed.
+  if (seq !== _searchSeq || folder !== state.folder) return;
+  state.searchMatches = data || {};
+  state.searchQuery = query;
+  // Fresh query → everyone collapses back to the single primary line.
+  state.searchExpanded = {};
+  render();
+}
+
+// Each click reveals 5 more snippets below the primary line. Small
+// enough to stay readable inside a table row, large enough that users
+// hit the "+N more" again only once or twice for most convos.
+const SEARCH_MATCHES_PAGE = 5;
+
+export function expandSearchMatches(convoId) {
+  if (!state.searchExpanded) state.searchExpanded = {};
+  state.searchExpanded[convoId] = (state.searchExpanded[convoId] || 0) + SEARCH_MATCHES_PAGE;
+  render();
+}
+
+
+// Picks which text to show in the preview column. Priority:
+//   1. If full-content search hit landed for this convo AND the query
+//      isn't in first/last preview, show the matched snippet.
+//   2. Otherwise show the usual first/last preview per previewPosition.
+// Appends a "+N more" badge when there are multiple message matches.
+function renderPreviewCell(c) {
+  const q = state.search;
+  const defaultText = state.previewPosition === "last"
+    ? (c.last_preview || c.preview)
+    : c.preview;
+  if (!q || state.searchQuery !== q) {
+    return hlText(defaultText, q);
+  }
+  const hit = (state.searchMatches || {})[c.id];
+  if (!hit) return hlText(defaultText, q);
+
+  // Primary line prefers first/last preview when the match is there
+  // (keeps familiar context); otherwise falls back to the top deep hit.
+  const ql = q.toLowerCase();
+  const inFirst = (c.preview || "").toLowerCase().includes(ql);
+  const inLast = (c.last_preview || "").toLowerCase().includes(ql);
+  let main;
+  let primaryFromTop = false;
+  if (state.previewPosition === "last" && inLast) {
+    main = hlText(c.last_preview, q);
+  } else if (state.previewPosition !== "last" && inFirst) {
+    main = hlText(c.preview, q);
+  } else if (inFirst || inLast) {
+    main = hlText(inFirst ? c.preview : c.last_preview, q);
+  } else {
+    main = hlText(hit.top.snippet || defaultText, q);
+    primaryFromTop = true;
+  }
+
+  // Expansion: 0 = collapsed, grows by SEARCH_MATCHES_PAGE per click.
+  // When primary is literally `matches[0]`, skip it in the reveal list
+  // so we don't double-render. The payload caps at 20; past that, we
+  // can't reveal more but "+N more" still counts toward the true total.
+  const matches = hit.matches || (hit.top ? [hit.top] : []);
+  const revealed = (state.searchExpanded || {})[c.id] || 0;
+  const startIdx = primaryFromTop ? 1 : 0;
+  const revealableCount = Math.max(0, matches.length - startIdx);
+  const revealNow = Math.min(revealed, revealableCount);
+
+  const extras = [];
+  for (let i = startIdx; i < startIdx + revealNow; i++) {
+    extras.push(`<div class="search-extra-match">${hlText(matches[i].snippet, q)}</div>`);
+  }
+
+  // `visible` = primary line + extras already on screen.
+  // `remaining` = true total − visible. Stays accurate past the 20-match
+  // server cap because `count` is unbounded.
+  const visible = 1 + revealNow;
+  const remaining = hit.count - visible;
+  let moreBtn = "";
+  if (remaining > 0) {
+    moreBtn = `<button class="search-more-matches" data-action="expand-search-matches" data-id="${escAttr(c.id)}" title="${hit.count} matching messages in this convo — click to show up to ${SEARCH_MATCHES_PAGE} more">+${remaining} more match${remaining === 1 ? "" : "es"}</button>`;
+  }
+  // Wrap in .search-preview-wrap so the cell-level overflow/nowrap
+  // rules don't clip the "+N more" button or the revealed snippets.
+  // Primary line still truncates via .search-preview-main's ellipsis.
+  return `<div class="search-preview-wrap">
+    <div class="search-preview-main">${main}</div>
+    ${extras.join("")}${moreBtn}
+  </div>`;
+}
+
+
 // ── Tags ──────────────────────────────────────────────────────────────
 
 async function hydrateTags() {
@@ -217,6 +334,18 @@ const SMART_PRESETS = [
 
 function computeSmartMatches(preset, threshold) {
   const matches = new Set();
+  // Agent preset doesn't use a numeric threshold — the "threshold"
+  // slot holds the target agent name, or `null` for "no agent".
+  if (preset === "agent") {
+    for (const c of state.convoItems) {
+      if (threshold === null) {
+        if (!c.agent) matches.add(c.id);
+      } else if (c.agent === threshold) {
+        matches.add(c.id);
+      }
+    }
+    return matches;
+  }
   for (const c of state.convoItems) {
     if (!c.stats) continue;
     const s = c.stats;
@@ -280,6 +409,18 @@ function renderSmartBar() {
     buttons += `<button class="smart-btn${isActive ? " active" : ""}" data-action="smart-select" data-preset="${p.key}">${p.label}</button>`;
   }
 
+  // Agent button: only surfaced when the project actually has named
+  // (non-default) agents in some convo. Default/main-session convos
+  // have no c.agent, so an empty project here means nothing to filter.
+  const hasNamedAgents = state.convoItems.some((c) => c.agent);
+  if (hasNamedAgents) {
+    const isActive = state.smartSelect && state.smartSelect.preset === "agent";
+    const label = isActive
+      ? `Agent: ${state.smartSelect.threshold === null ? "none" : state.smartSelect.threshold}`
+      : "Select by agent";
+    buttons += `<button class="smart-btn${isActive ? " active" : ""}" data-action="open-agent-select-modal">${esc(label)}</button>`;
+  }
+
   let sliderHtml = "";
   if (state.smartSelect) {
     const p = SMART_PRESETS.find((x) => x.key === state.smartSelect.preset);
@@ -295,6 +436,60 @@ function renderSmartBar() {
   return `<div class="smart-bar"><span class="smart-bar-label">Select</span>${buttons}${sliderHtml}</div>`;
 }
 
+// Opens a modal listing every agent seen in the project (plus a "No
+// agent" option for default/main-session convos) with its convo count.
+// Clicking a row sets a smart-select filter matching that agent value
+// exactly — null stands in for "no agent".
+export function openAgentSelectModal() {
+  const counts = new Map();
+  let noAgentCount = 0;
+  for (const c of state.convoItems) {
+    if (c.agent) counts.set(c.agent, (counts.get(c.agent) || 0) + 1);
+    else noAgentCount += 1;
+  }
+  const rows = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const activeAgent = (state.smartSelect && state.smartSelect.preset === "agent")
+    ? state.smartSelect.threshold : undefined;
+  const hasFilter = activeAgent !== undefined;
+
+  const pill = (agentVal, labelHtml, n) => {
+    const isActive = activeAgent === agentVal;
+    return `<button class="agent-pill${isActive ? " active" : ""}" data-action="select-agent" data-agent="${escAttr(agentVal === null ? "" : agentVal)}">
+      ${labelHtml}<span class="agent-pill-count">${n}</span>
+    </button>`;
+  };
+
+  let body = `<div class="agent-pill-list">`;
+  body += pill(null, `<span>No agent</span>`, noAgentCount);
+  for (const [name, n] of rows) {
+    body += pill(name, `<span>@${esc(name)}</span>`, n);
+  }
+  body += `</div>`;
+  if (hasFilter) {
+    body += `<div class="agent-pill-actions">
+      <button class="btn btn-sm" data-action="clear-agent-filter">Clear filter</button>
+    </div>`;
+  }
+  showInfoModal({ title: "Filter by agent", body });
+}
+
+export function selectByAgent(agentName) {
+  const target = agentName === "" ? null : agentName;
+  state.smartSelect = { preset: "agent", threshold: target };
+  recomputeSmartMatches();
+  document.querySelectorAll(".modal-overlay").forEach((o) => o.remove());
+  render();
+}
+
+export function clearAgentFilter() {
+  if (state.smartSelect && state.smartSelect.preset === "agent") {
+    state.smartSelect = null;
+    state.smartMatches = new Set();
+  }
+  document.querySelectorAll(".modal-overlay").forEach((o) => o.remove());
+  render();
+}
+
 
 // renderFilterToggles removed — toggles live only in the overview bar.
 function _unused_renderFilterToggles() { return ""; }
@@ -305,14 +500,20 @@ function renderToolbar() {
   const assignPool = selN > 0 ? selN : smartN;
   let extra = "";
   if (selN > 0) {
-    // Bulk actions depend on mode: Active selection → Archive+Delete,
-    // Archived selection → Unarchive+Delete.
+    // Bulk actions depend on mode. Active selection: split button with
+    // Archive as the safe default face + menu (Archive / Debloat / Delete),
+    // severity-ranked so the fastest click does the least destructive thing.
+    // Archived selection: Unarchive + Delete (no Debloat — archived files
+    // are cold storage; reclaim is easier once unarchived).
     if (state.mode === "archived") {
       extra += `<button class="btn" data-action="bulk-unarchive-convos">Unarchive ${selN}</button> `;
+      extra += `<button class="btn-danger" data-action="bulk-delete-convos">Delete ${selN}</button> `;
     } else {
-      extra += `<button class="btn" data-action="bulk-archive-convos">Archive ${selN}</button> `;
+      extra += `<span class="split-btn">
+        <button class="btn" data-action="bulk-archive-convos">Archive ${selN}</button>
+        <button class="btn split-arrow" data-action="open-bulk-convos-menu" title="More bulk actions: Debloat, Delete">▾</button>
+      </span> `;
     }
-    extra += `<button class="btn-danger" data-action="bulk-delete-convos">Delete ${selN}</button> `;
   }
   // Edit-mode-only: assign tag to selected (or smart-matched).
   if (state.editMode && assignPool > 0) {
@@ -336,7 +537,11 @@ function renderToolbar() {
     placeholder: "Filter conversations...",
     searchValue: state.search,
     extraHtml: extra,
-    onSearch: (v) => { state.search = v; render(); },
+    onSearch: (v) => {
+      state.search = v;
+      scheduleSearchHydrate(v);
+      render();
+    },
   });
 }
 
@@ -347,10 +552,15 @@ export function render() {
   let items = state.convoItems;
   if (state.search) {
     const q = state.search.toLowerCase();
+    // When full-content search has landed for this query, union the
+    // metadata match (name/preview) with the deep-content hits so a
+    // match anywhere in the convo keeps the row visible.
+    const hits = (state.searchQuery === state.search) ? (state.searchMatches || {}) : {};
     items = items.filter((c) =>
       c.preview.toLowerCase().includes(q) ||
       (c.last_preview || "").toLowerCase().includes(q) ||
-      (c.name && c.name.toLowerCase().includes(q))
+      (c.name && c.name.toLowerCase().includes(q)) ||
+      Object.prototype.hasOwnProperty.call(hits, c.id)
     );
   }
   // Tag filter (OR logic)
@@ -359,6 +569,29 @@ export function render() {
     items = items.filter((c) => {
       const assigned = convoScope.getAssignment(c.id);
       return assigned.some((t) => activeFilters.includes(t));
+    });
+  }
+
+  // Name sort: client-side tiered order — (name+agent), (name only),
+  // (agent only), (neither). Within every tier, sort by the tier's
+  // primary label then fall back to id so items with the same name/
+  // agent (or tier-3 items with nothing) still have a stable order.
+  // `desc` flips intra-tier direction; tier order stays fixed.
+  if (state.sort === "name") {
+    const tier = (c) => {
+      if (c.name && c.agent) return 0;
+      if (c.name) return 1;
+      if (c.agent) return 2;
+      return 3;
+    };
+    const primary = (c) => (c.name || c.agent || "").toLowerCase();
+    const dir = state.desc ? -1 : 1;
+    items = [...items].sort((a, b) => {
+      const t = tier(a) - tier(b);
+      if (t) return t;
+      const p = primary(a).localeCompare(primary(b));
+      if (p) return dir * p;
+      return dir * a.id.localeCompare(b.id);
     });
   }
 
@@ -396,7 +629,7 @@ function renderTable(items, totalSize) {
   const allSel = items.length > 0 && items.every((c) => state.selected.has(c.id));
   let h = '<div class="tbl-wrap"><table class="tbl"><thead><tr>';
   h += `<th class="col-check"><input type="checkbox" style="accent-color:var(--accent)" ${allSel ? "checked" : ""} data-action="toggle-all-convos"></th>`;
-  h += `<th class="col-name">Name</th>`;
+  h += `<th class="col-name" data-action="sort-convos" data-col="name">Name${arrow(state, "name")}</th>`;
   h += `<th data-action="sort-convos" data-col="recent">Preview${arrow(state, "recent")}</th>`;
   h += `<th data-action="sort-convos" data-col="size" style="text-align:right">Size${arrow(state, "size")}</th>`;
   h += `<th data-action="sort-convos" data-col="context" style="text-align:right" title="Context at last turn (how close to /compact)">Ctx${arrow(state, "context")}</th>`;
@@ -412,8 +645,8 @@ function renderTable(items, totalSize) {
     const rowCls = c.archived ? " row-archived" : "";
     const smartCls = state.smartMatches.has(c.id) ? " smart-match" : "";
     const archBtn = c.archived
-      ? `<button class="btn btn-sm" data-action="unarchive-convo" data-id="${escAttr(c.id)}" title="Restore to ~/.claude/projects/">Unarch</button>`
-      : `<button class="btn btn-sm" data-action="archive-convo" data-id="${escAttr(c.id)}" title="Removes from Claude Code's /resume list. Restore anytime from the Archived filter.">Arch</button>`;
+      ? `<button class="btn btn-sm" data-action="unarchive-convo" data-id="${escAttr(c.id)}" title="Restore to ~/.claude/projects/">Unarchive</button>`
+      : `<button class="btn btn-sm" data-action="archive-convo" data-id="${escAttr(c.id)}" title="Removes from Claude Code's /resume list. Restore anytime from the Archived filter.">Archive</button>`;
     const archBadge = c.archived ? `<span class="badge badge-archived">archived</span> ` : "";
     const tagPills = Tags.renderTagPills(convoScope, c.id);
     const copyBtn = `<button class="copy-id-btn" data-action="copy-resume" data-id="${escAttr(c.id)}" title="Copy 'claude --resume ${escAttr(c.id)}'" aria-label="Copy resume command">${copyIconSvg()}</button>`;
@@ -440,15 +673,16 @@ function renderTable(items, totalSize) {
         <td class="col-check">
           <span class="check-hit" data-action="toggle-convo-sel" data-id="${escAttr(c.id)}"><input type="checkbox" class="item-check" ${ck} tabindex="-1"></span>
         </td>
-        <td class="col-name${dimCls}${loadCls}"><div class="col-name-wrap"><span class="col-name-text">${archBadge}${agentPill}${esc(nameText)}</span>${tagPills ? ` ${tagPills}` : ""}${copyBtn}${openNewTabBtn}</div></td>
-        <td class="col-preview">${esc(state.previewPosition === "last" ? (c.last_preview || c.preview) : c.preview)}</td>
+        <td class="col-name${dimCls}${loadCls}"><div class="col-name-wrap"><span class="col-name-text">${archBadge}${agentPill}${hlText(nameText, state.search)}</span>${tagPills ? ` ${tagPills}` : ""}${copyBtn}${openNewTabBtn}</div></td>
+        <td class="col-preview">${renderPreviewCell(c)}</td>
         <td class="col-size" style="text-align:right">${fmtSize(c.size_kb)} <span class="stats-pct">(${pct(c.size_kb)})</span></td>
         <td class="col-ctx" style="text-align:right">${ctxCell}</td>
         <td class="col-time" style="text-align:right" title="${escAttr(timeAbs(c.last_modified))}">${timeAgo(c.last_modified)}</td>
         <td class="col-actions">
-          ${archBtn}
-          <button class="btn btn-sm" data-action="duplicate-convo" data-id="${escAttr(c.id)}">Dup</button>
-          <button class="btn-danger btn-sm" data-action="delete-convo" data-id="${escAttr(c.id)}">Del</button>
+          <span class="split-btn">
+            ${archBtn}
+            <button class="btn btn-sm split-arrow" data-action="open-row-convo-menu" data-id="${escAttr(c.id)}" data-archived="${c.archived ? "1" : ""}" title="More: Duplicate, Delete">▾</button>
+          </span>
         </td>
       </tr>`;
   }
@@ -491,9 +725,18 @@ function renderCards(items, totalSize) {
 
     const agentBadge = c.agent ? `<span class="badge badge-agent" title="Agent: ${escAttr(c.agent)}">@${esc(c.agent)}</span>` : "";
 
+    let debloatedBadge = "";
+    if (c.statsHydrated && c.stats && c.stats.debloat_delta) {
+      const dd = c.stats.debloat_delta;
+      const reclaimed = dd.bytes_reclaimed || 0;
+      if (reclaimed > 0) {
+        debloatedBadge = `<span class="badge badge-debloated" title="Debloated — reclaimed ${_fmtBytesShort(reclaimed)} of local metadata. Stats preserved.">debloated · ${_fmtBytesShort(reclaimed)} freed</span>`;
+      }
+    }
+
     const archBtn = c.archived
-      ? `<button class="btn btn-sm" data-action="unarchive-convo" data-id="${escAttr(c.id)}" title="Restore to ~/.claude/projects/">Unarch</button>`
-      : `<button class="btn btn-sm" data-action="archive-convo" data-id="${escAttr(c.id)}" title="Removes from Claude Code's /resume list. Restore anytime from the Archived filter.">Arch</button>`;
+      ? `<button class="btn btn-sm" data-action="unarchive-convo" data-id="${escAttr(c.id)}" title="Restore to ~/.claude/projects/">Unarchive</button>`
+      : `<button class="btn btn-sm" data-action="archive-convo" data-id="${escAttr(c.id)}" title="Removes from Claude Code's /resume list. Restore anytime from the Archived filter.">Archive</button>`;
     const archBadge = c.archived ? `<span class="badge badge-archived">archived</span>` : "";
     const tagPills = Tags.renderTagPills(convoScope, c.id);
     const copyBtn = `<button class="copy-id-btn" data-action="copy-resume" data-id="${escAttr(c.id)}" title="Copy 'claude --resume ${escAttr(c.id)}'" aria-label="Copy resume command">${copyIconSvg()}</button>`;
@@ -501,10 +744,10 @@ function renderCards(items, totalSize) {
     const openNewTabBtn = `<a class="open-new-tab-btn" data-action="noop-anchor" href="${convoHref}" target="_blank" rel="noopener" title="Open in new tab" aria-label="Open in new tab">${newTabIconSvg()}</a>`;
     h += `
       <div class="card${archCls}${smartCls}" data-action="open-convo" data-id="${escAttr(c.id)}">
-        <div class="card-name${dimCls}${loadCls}"><span class="card-name-text">${esc(nameText)}</span>${copyBtn}${openNewTabBtn}</div>
+        <div class="card-name${dimCls}${loadCls}"><span class="card-name-text">${hlText(nameText, state.search)}</span>${copyBtn}${openNewTabBtn}</div>
         <div style="display:flex;align-items:start;gap:8px">
           <span class="check-hit" data-action="toggle-convo-sel" data-id="${escAttr(c.id)}"><input type="checkbox" class="item-check" ${ck} tabindex="-1"></span>
-          <div class="card-preview" style="flex:1;-webkit-line-clamp:4">${esc(state.previewPosition === "last" ? (c.last_preview || c.preview) : c.preview)}</div>
+          <div class="card-preview" style="flex:1;-webkit-line-clamp:4">${renderPreviewCell(c)}</div>
         </div>
         <div class="card-stats">${statsInner}</div>
         <div class="card-footer">
@@ -512,11 +755,13 @@ function renderCards(items, totalSize) {
           <span class="badge">${fmtSize(c.size_kb)} <span class="stats-pct">(${pct(c.size_kb)})</span></span>
           ${ctxBadge}
           ${agentBadge}
+          ${debloatedBadge}
           <span class="time-label" title="${escAttr(timeAbs(c.last_modified))}">${timeAgo(c.last_modified)}</span>
           <span style="flex:1"></span>
-          ${archBtn}
-          <button class="btn btn-sm" data-action="duplicate-convo" data-id="${escAttr(c.id)}">Dup</button>
-          <button class="btn-danger btn-sm" data-action="delete-convo" data-id="${escAttr(c.id)}">Del</button>
+          <span class="split-btn">
+            ${archBtn}
+            <button class="btn btn-sm split-arrow" data-action="open-row-convo-menu" data-id="${escAttr(c.id)}" data-archived="${c.archived ? "1" : ""}" title="More: Duplicate, Delete">▾</button>
+          </span>
         </div>
       </div>`;
   }
@@ -528,6 +773,9 @@ function renderCards(items, totalSize) {
 export function sortBy(col) {
   if (state.sort === col) state.desc = !state.desc;
   else { state.sort = col; state.desc = true; }
+  // "name" is client-side only — already-loaded items resort in place.
+  // Server-side sorts (recent/size/context) must wipe pagination.
+  if (col === "name") { render(); return; }
   state.convoOffset = 0;
   state.convoItems = [];
   refreshAndRender();
@@ -799,4 +1047,288 @@ export function bulkUnarchive() {
 export function togglePreview() {
   togglePreviewPosition();
   render();
+}
+
+
+// --------------------------------------------------------------------------
+// Bulk-actions split-button menu + Debloat flow
+// --------------------------------------------------------------------------
+
+// Floating menu anchored to the split-arrow. Reuses the `.transform-menu`
+// CSS (same pattern as Messages view's bulk-transform menu) so styling
+// stays consistent.
+export function openBulkConvosMenu(anchorEl) {
+  const existing = document.querySelector(".transform-menu[data-bulk-convos]");
+  if (existing) { existing.remove(); return; }
+  const selN = state.selected.size;
+  const menu = document.createElement("div");
+  menu.className = "transform-menu";
+  menu.dataset.bulkConvos = "1";
+  menu.innerHTML =
+    `<button class="btn btn-sm transform-menu-item" data-action="bulk-archive-convos" title="Remove from Claude Code's /resume list. Reversible — restore from the Archived filter.">Archive ${selN}</button>` +
+    `<button class="btn btn-sm transform-menu-item" data-action="bulk-debloat-convos" title="Reclaim disk space by stripping redundant local metadata. Lossy but stats-preserving.">Debloat ${selN}…</button>` +
+    `<div class="transform-menu-sep"></div>` +
+    `<button class="btn btn-sm transform-menu-item" data-action="bulk-delete-convos" title="Permanently delete. Not reversible.">Delete ${selN}</button>`;
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.position = "absolute";
+  menu.style.left = `${rect.left + window.scrollX}px`;
+  menu.style.visibility = "hidden";
+  document.body.appendChild(menu);
+  menu.style.top = `${rect.bottom + window.scrollY + 2}px`;
+  menu.style.visibility = "";
+  setTimeout(() => {
+    const handler = (ev) => {
+      if (!menu.contains(ev.target)) {
+        menu.remove();
+        document.removeEventListener("click", handler, true);
+      }
+    };
+    document.addEventListener("click", handler, true);
+  }, 0);
+}
+
+// Per-row split-arrow menu. Mirrors openBulkConvosMenu but acts on a
+// single convo id. Duplicate is suppressed for archived rows (archived
+// files are cold storage; duplicate from the unarchived copy instead).
+export function openRowConvoMenu(anchorEl) {
+  const existing = document.querySelector(".transform-menu[data-row-convo]");
+  if (existing) { existing.remove(); return; }
+  const id = anchorEl.dataset.id;
+  const archived = anchorEl.dataset.archived === "1";
+  const menu = document.createElement("div");
+  menu.className = "transform-menu";
+  menu.dataset.rowConvo = "1";
+  const archItem = archived
+    ? `<button class="btn btn-sm transform-menu-item" data-action="unarchive-convo" data-id="${escAttr(id)}" title="Restore to ~/.claude/projects/">Unarchive</button>`
+    : `<button class="btn btn-sm transform-menu-item" data-action="archive-convo" data-id="${escAttr(id)}" title="Removes from Claude Code's /resume list. Restore anytime from the Archived filter.">Archive</button>`;
+  const dupItem = archived
+    ? ""
+    : `<button class="btn btn-sm transform-menu-item" data-action="duplicate-convo" data-id="${escAttr(id)}" title="Copy to a new convo id">Duplicate</button>`;
+  menu.innerHTML =
+    archItem +
+    dupItem +
+    `<div class="transform-menu-sep"></div>` +
+    `<button class="btn btn-sm transform-menu-item" data-action="delete-convo" data-id="${escAttr(id)}" title="Permanently delete. Not reversible.">Delete</button>`;
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.position = "absolute";
+  menu.style.left = `${rect.left + window.scrollX}px`;
+  menu.style.visibility = "hidden";
+  document.body.appendChild(menu);
+  menu.style.top = `${rect.bottom + window.scrollY + 2}px`;
+  menu.style.visibility = "";
+  setTimeout(() => {
+    const handler = (ev) => {
+      if (!menu.contains(ev.target)) {
+        menu.remove();
+        document.removeEventListener("click", handler, true);
+      }
+    };
+    document.addEventListener("click", handler, true);
+  }, 0);
+}
+
+function _fmtBytesShort(b) {
+  const n = Math.max(0, Number(b) || 0);
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+// Scan selected convos, then open the danger-styled confirm modal with
+// per-convo reclaim numbers. No fuzzy estimates — each row's number is
+// the exact byte delta the apply would produce.
+export function bulkDebloat() {
+  const ids = [...state.selected];
+  if (!ids.length) return;
+
+  // Per-id result state. Two reclaim numbers come back from each scan:
+  //   rec           — without image strip (the safe default rules)
+  //   recImages     — with image strip (experimental, off by default)
+  // Image strip state is NOT persisted across modal opens. Every open
+  // starts with stripImages=false to keep users from accidentally
+  // carrying it over from a previous session.
+  const results = new Map();
+  ids.forEach((id) => results.set(id, {
+    cur: 0, rec: 0, recImages: 0,
+    images: 0,          // count of image blocks that would be stripped
+    err: null, done: false,
+  }));
+  let stripImages = false;
+
+  const renderRow = (id) => {
+    const r = results.get(id);
+    const shortId = esc(id.slice(0, 8));
+    if (!r.done) {
+      return `<tr data-row-id="${escAttr(id)}"><td><code>${shortId}</code></td>
+                  <td colspan="4" style="color:var(--color-text-muted)">
+                    <span class="debloat-spinner">◌</span> Scanning…
+                  </td></tr>`;
+    }
+    if (r.err) {
+      return `<tr data-row-id="${escAttr(id)}"><td><code>${shortId}</code></td>
+                  <td colspan="4" style="color:var(--color-text-muted)">${esc(r.err)}</td></tr>`;
+    }
+    const activeRec = stripImages ? r.recImages : r.rec;
+    const activePct = r.cur > 0 ? Math.round((activeRec / r.cur) * 100) : 0;
+    if (activeRec === 0) {
+      return `<tr data-row-id="${escAttr(id)}" style="color:var(--color-text-muted)">
+                  <td><code>${shortId}</code></td>
+                  <td>${esc(_fmtBytesShort(r.cur))}</td>
+                  <td>${esc(_fmtBytesShort(r.rec))}</td>
+                  <td>${esc(_fmtBytesShort(r.recImages))}${r.images ? ` <span style="color:var(--color-text-muted)">(${r.images} img)</span>` : ""}</td>
+                  <td colspan="1">— nothing to reclaim</td></tr>`;
+    }
+    const imgNote = r.images ? ` <span style="color:var(--color-text-muted)">(${r.images} img)</span>` : "";
+    return `<tr data-row-id="${escAttr(id)}"${stripImages && r.recImages > r.rec ? ' class="debloat-row-stripping"' : ""}>
+                <td><code>${shortId}</code></td>
+                <td>${esc(_fmtBytesShort(r.cur))}</td>
+                <td>${esc(_fmtBytesShort(r.rec))}</td>
+                <td>${esc(_fmtBytesShort(r.recImages))}${imgNote}</td>
+                <td><strong>−${esc(_fmtBytesShort(activeRec))}</strong> (${activePct}%)</td></tr>`;
+  };
+
+  const initialRowsHtml = ids.map(renderRow).join("");
+  const body = `
+    </p><div class="debloat-modal">
+    <p id="debloat-summary">Scanning ${ids.length}…</p>
+
+    <label class="debloat-stripimg-toggle" style="display:flex;gap:8px;align-items:flex-start;margin:8px 0;">
+      <input type="checkbox" id="debloat-strip-images" style="margin-top:3px">
+      <span>
+        <strong>Strip base64 images too</strong>
+        <span style="color:var(--color-text-muted)"> — experimental</span>
+        <br><span style="color:var(--color-text-muted);font-size:0.9em">
+          Images in user-role message content can be a huge chunk of disk (often 90%+ of the bloat). Unlike every other rule, images may be part of what Claude Code re-sends on <code>/resume</code> — stripping them may break resume in ways we can't predict without testing. Duplicate a convo first if <code>/resume</code>-ability matters.
+        </span>
+      </span>
+    </label>
+    <div id="debloat-strip-warning" class="debloat-danger-banner" style="display:none">
+      ⚠ <strong>Strip images is experimental.</strong> Usage, tokens, and cost stay exact, but <code>/resume</code> safety isn't verified. Test on a duplicate first.
+    </div>
+
+    <table class="debloat-scan-table">
+      <thead><tr><th>id</th><th>size</th><th>w/o img</th><th>w/ img</th><th>will apply</th></tr></thead>
+      <tbody id="debloat-rows">${initialRowsHtml}</tbody>
+    </table>
+    <p style="margin-top:12px"><strong>Stats preserved:</strong> tokens, cost, tool counts, thinking counts, bash commands, slash commands — all unchanged. Each rewrite is verified against its own pre-debloat stats; if any invariant fails, that convo's file is restored byte-for-byte.</p>
+    <p style="color:var(--color-text-muted)"><strong>⚠ Lossy.</strong> Truncated content can't be recovered. Same <code>/resume</code>-chain caveats as Redact and Delete — duplicate first if you care about a specific convo.</p>
+  </div><p>`;
+
+  showConfirmModal({
+    title: `Debloat ${ids.length} conversations`,
+    body,
+    confirmLabel: "Scanning…",
+    onConfirm: async () => {
+      const applyIds = ids.filter((id) => {
+        const r = results.get(id);
+        const active = stripImages ? r.recImages : r.rec;
+        return r.done && !r.err && active > 0;
+      });
+      if (!applyIds.length) { toast("Nothing to apply"); return; }
+      let res;
+      try {
+        res = await api.bulkDebloat(state.folder, applyIds, { stripImages });
+      } catch {
+        toast("Bulk debloat failed");
+        return;
+      }
+      const resMap = (res && res.results) || {};
+      let ok = 0, failed = 0, reclaimed = 0;
+      for (const r of Object.values(resMap)) {
+        if (r.ok) { ok += 1; reclaimed += r.bytes_reclaimed || 0; }
+        else failed += 1;
+      }
+      state.selected.clear();
+      invalidateProjectsCache();
+      await refreshAndRender();
+      toast(failed
+        ? `Debloated ${ok}; ${failed} failed invariant check`
+        : `Debloated ${ok} — reclaimed ${_fmtBytesShort(reclaimed)}`);
+    },
+  });
+
+  // Wire the checkbox — toggling re-renders rows + summary + button.
+  // Handler attached after showConfirmModal runs so the element exists.
+  setTimeout(() => {
+    const cb = document.getElementById("debloat-strip-images");
+    if (cb) {
+      cb.addEventListener("change", () => {
+        stripImages = cb.checked;
+        const warn = document.getElementById("debloat-strip-warning");
+        if (warn) warn.style.display = cb.checked ? "block" : "none";
+        // Redraw every row so the `will apply` column + highlighting
+        // reflect the new mode.
+        for (const id of ids) updateRow(id);
+        refreshSummary();
+      });
+    }
+  }, 0);
+
+  const updateRow = (id) => {
+    const tbody = document.getElementById("debloat-rows");
+    if (!tbody) return;
+    const old = tbody.querySelector(`tr[data-row-id="${CSS.escape(id)}"]`);
+    if (!old) return;
+    const tmp = document.createElement("tbody");
+    tmp.innerHTML = renderRow(id);
+    const neu = tmp.firstElementChild;
+    if (neu) old.replaceWith(neu);
+  };
+
+  const refreshSummary = () => {
+    const summary = document.getElementById("debloat-summary");
+    const btn = document.querySelector(".modal-overlay [data-modal-confirm]");
+    if (!summary) return;
+    const doneIds = ids.filter((id) => results.get(id).done);
+    const pending = ids.length - doneIds.length;
+    const applyIds = doneIds.filter((id) => {
+      const r = results.get(id);
+      const active = stripImages ? r.recImages : r.rec;
+      return !r.err && active > 0;
+    });
+    const totalReclaim = applyIds.reduce((s, id) => {
+      const r = results.get(id);
+      return s + (stripImages ? r.recImages : r.rec);
+    }, 0);
+    const modeSuffix = stripImages ? " (with images stripped)" : "";
+    if (pending > 0) {
+      if (btn) { btn.textContent = "Scanning…"; btn.disabled = true; }
+    } else if (applyIds.length) {
+      summary.innerHTML = `Scans complete. Will apply${modeSuffix} to <strong>${applyIds.length}</strong> of ${ids.length} selected; total reclaim <strong>${_fmtBytesShort(totalReclaim)}</strong>.`;
+      if (btn) {
+        btn.textContent = stripImages
+          ? `Debloat ${applyIds.length} (strip images)`
+          : `Debloat ${applyIds.length}`;
+        btn.disabled = false;
+      }
+    } else {
+      summary.innerHTML = `Scanned ${ids.length}${modeSuffix}. Nothing reclaimable.`;
+      if (btn) { btn.textContent = "Nothing to apply"; btn.disabled = true; }
+    }
+  };
+
+  refreshSummary();
+
+  ids.forEach(async (id) => {
+    try {
+      const resp = await api.debloatScan(state.folder, [id]);
+      const entry = (resp && resp[id]) || {};
+      results.set(id, {
+        cur: entry.current_size || 0,
+        rec: entry.bytes_reclaimable || 0,
+        recImages: entry.bytes_reclaimable_with_images || 0,
+        images: ((entry.counts_with_images || {}).images_stripped) || 0,
+        err: entry.error || null,
+        done: true,
+      });
+    } catch {
+      results.set(id, {
+        cur: 0, rec: 0, recImages: 0, images: 0,
+        err: "scan failed", done: true,
+      });
+    }
+    updateRow(id);
+    refreshSummary();
+  });
 }

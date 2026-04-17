@@ -99,7 +99,7 @@ export const state = {
   // see exports.js/ensureDownloadFields. Invalidated after modal save.
   downloadFields: null,
 
-  // Preview-before-apply for transforms (scrub/normalize/swears/filler).
+  // Preview-before-apply for transforms (redact/normalize/swears/filler).
   // ON by default so destructive-adjacent edits route through a review
   // modal first. Togglable from the transform menu and from buttons inside
   // the preview modal itself.

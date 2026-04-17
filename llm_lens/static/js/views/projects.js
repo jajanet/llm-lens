@@ -2,7 +2,7 @@
 
 import { state, invalidateProjectsCache, setViewMode } from "../state.js";
 import { api } from "../api.js";
-import { timeAgo, timeAbs, fmtSize, esc, escAttr, arrow, shortPath, renderStatsInline, renderTokenBars, fmtTokens, renderStatsModalBody } from "../utils.js";
+import { timeAgo, timeAbs, fmtSize, esc, escAttr, arrow, shortPath, renderStatsInline, renderTokenBars, fmtTokens, renderStatsModalBody, hlText } from "../utils.js";
 import { configureToolbar } from "../toolbar.js";
 import { showConfirmModal, showInfoModal } from "../modal.js";
 import { navigate } from "../router.js";
@@ -222,8 +222,8 @@ function renderTable(items, totalSize) {
       <tr data-action="open-project" data-folder="${escAttr(p.folder)}" data-path="${escAttr(p.path)}">
         <td class="col-check"><span class="check-hit" data-action="toggle-project-sel" data-folder="${escAttr(p.folder)}"><input type="checkbox" class="item-check" ${ck} tabindex="-1"></span></td>
         <td>
-          <div style="font-weight:600;color:var(--heading);font-size:13px">${esc(sp)}${tagPills ? " " + tagPills : ""}</div>
-          <div style="font-size:11px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px">${esc(p.latest_preview)}</div>
+          <div style="font-weight:600;color:var(--heading);font-size:13px">${hlText(sp, state.search)}${tagPills ? " " + tagPills : ""}</div>
+          <div style="font-size:11px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px">${hlText(p.latest_preview, state.search)}</div>
         </td>
         <td class="col-count">${p.conversation_count}</td>
         <td class="col-size">${fmtSize(p.total_size_kb)} <span class="stats-pct">(${pct(p.total_size_kb)})</span></td>
@@ -256,11 +256,11 @@ function renderCards(items, totalSize) {
     const tagPills = Tags.renderTagPills(projectScope, p.folder);
     h += `
       <div class="card" data-action="open-project" data-folder="${escAttr(p.folder)}" data-path="${escAttr(p.path)}">
-        <div class="card-title">${esc(sp)}</div>
+        <div class="card-title">${hlText(sp, state.search)}</div>
         ${tagPills ? `<div class="card-tagpills">${tagPills}</div>` : ""}
         <div style="display:flex;align-items:start;gap:8px">
           <span class="check-hit" data-action="toggle-project-sel" data-folder="${escAttr(p.folder)}"><input type="checkbox" class="item-check" ${ck} tabindex="-1"></span>
-          <div class="card-preview" style="flex:1">${esc(p.latest_preview)}</div>
+          <div class="card-preview" style="flex:1">${hlText(p.latest_preview, state.search)}</div>
         </div>
         <div class="card-stats">${statsInner}</div>
         <div class="card-footer">

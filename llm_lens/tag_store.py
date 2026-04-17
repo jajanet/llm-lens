@@ -21,9 +21,9 @@ The `TagSet` itself is not thread-safe — that responsibility lives
 here, on purpose, so the primitive stays testable in isolation.
 """
 
-import atexit
 import json
 import os
+import shutil
 import threading
 from pathlib import Path
 
@@ -32,7 +32,6 @@ from .tag_set import TagSet, NUM_COLORS  # noqa: F401 (NUM_COLORS re-exported)
 SCHEMA_VERSION = 2
 CACHE_DIR = Path.home() / ".cache" / "llm-lens"
 TAGS_PATH = CACHE_DIR / "tags.json"
-FLUSH_DELAY = 2.0
 
 # Seeded once on fresh installs. Deliberately small so users aren't
 # overwhelmed; they can delete / rename / recolor freely. Existing
@@ -46,7 +45,6 @@ DEFAULT_PROJECT_TAGS = [
 _lock = threading.Lock()
 _store: dict = {}
 _dirty = False
-_flush_timer: threading.Timer | None = None
 
 
 # ── Schema + load ─────────────────────────────────────────────────────
@@ -119,41 +117,42 @@ def _load():
     except (OSError, json.JSONDecodeError):
         _store = _fresh_store()
     _seed_fresh_defaults()
-
-
-_load()
-atexit.register(lambda: flush())
+    # Persist migration/seeding immediately. Previously deferred to atexit,
+    # but atexit runs after pytest's monkeypatch teardown, which could flush
+    # test state to the real ~/.cache/llm-lens/tags.json.
+    flush()
 
 
 # ── Persistence ──────────────────────────────────────────────────────
 
 def _schedule_flush():
-    global _flush_timer
-    if _flush_timer is not None:
-        return
-    _flush_timer = threading.Timer(FLUSH_DELAY, flush)
-    _flush_timer.daemon = True
-    _flush_timer.start()
+    """Write pending changes to disk. Synchronous — previously a 2-second
+    Timer debounce, which raced with server restarts and test teardown."""
+    flush()
 
 
 def flush():
-    """Atomically write the current store to disk."""
-    global _dirty, _flush_timer
+    """Atomically write the current store to disk. Keeps a single .bak
+    copy of the prior file as a safety net against accidental wipes."""
+    global _dirty
     with _lock:
         if not _dirty:
-            _flush_timer = None
             return
         snapshot = dict(_store)
         _dirty = False
-        _flush_timer = None
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        if TAGS_PATH.exists():
+            shutil.copy2(TAGS_PATH, TAGS_PATH.with_suffix(".json.bak"))
         tmp = TAGS_PATH.with_suffix(".json.tmp")
         with open(tmp, "w") as fh:
             json.dump(snapshot, fh)
         os.replace(tmp, TAGS_PATH)
     except OSError:
         pass
+
+
+_load()
 
 
 def _mark_dirty():

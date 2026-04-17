@@ -1,13 +1,13 @@
 // Pure text→text transforms. Run on the client; the result is sent to
 // /edit, which writes it verbatim. Ports of the server-side helpers that
-// used to live in llm_lens/__init__.py (_scrub_content, _normalize_ws,
+// used to live in llm_lens/__init__.py (_redact_content, _normalize_ws,
 // _strip_swears, _strip_filler). Behaviour should stay in sync with the
 // Python regex semantics those tested against.
 
-export const SCRUB_PLACEHOLDER = ".";
+export const REDACT_PLACEHOLDER = ".";
 
-export function scrub() {
-  return SCRUB_PLACEHOLDER;
+export function redact() {
+  return REDACT_PLACEHOLDER;
 }
 
 // Collapse cosmetic whitespace without touching code-shaped content.
@@ -201,7 +201,7 @@ export function applyTransform(kind, text, {
 } = {}) {
   // Global whitelist is honored by every remove_* transform — any entry
   // containing a whitelist phrase (case-insensitive substring) is
-  // dropped from the trigger list before matching. Scrub and normalize
+  // dropped from the trigger list before matching. Redact and normalize
   // don't consult it; they don't operate on curated lists.
   const fSwears = filterByWhitelist(swears, whitelist);
   const fFiller = filterByWhitelist(filler, whitelist);
@@ -217,7 +217,7 @@ export function applyTransform(kind, text, {
   }
 
   switch (kind) {
-    case "scrub": return scrub();
+    case "redact": return redact();
     case "normalize_whitespace": return normalizeWs(text);
     case "remove_swears": return stripSwears(text, fSwears);
     case "remove_filler": return stripFiller(text, fFiller);

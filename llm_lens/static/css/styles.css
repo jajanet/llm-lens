@@ -242,6 +242,46 @@ body.edit-mode .chat-bubble .msg-actions-row .btn-del-msg { display: inline-flex
   padding: 4px; z-index: 1000; display: flex; flex-direction: column;
   min-width: 220px;
 }
+.transform-menu[data-row-convo] { min-width: 0; }
+
+.agent-pill-list { display: flex; flex-wrap: wrap; gap: 6px; max-height: 50vh; overflow-y: auto; padding: 4px 0; }
+.agent-pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; background: var(--bg3); border: 1px solid var(--border); color: var(--text); font-size: 12px; cursor: pointer; }
+.agent-pill:hover { background: var(--border); }
+.agent-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.agent-pill-count { font-size: 11px; color: var(--text2); background: color-mix(in srgb, var(--border) 50%, transparent); padding: 0 6px; border-radius: 999px; }
+.agent-pill.active .agent-pill-count { background: rgba(255,255,255,0.25); color: #fff; }
+.agent-pill-actions { margin-top: 8px; display: flex; justify-content: flex-end; }
+.search-more-matches {
+  display: block;
+  font-size: 11px; color: var(--accent); margin-top: 4px;
+  background: transparent; border: 0; padding: 2px 0; cursor: pointer;
+  text-align: left; font-family: inherit;
+}
+.search-more-matches:hover { text-decoration: underline; }
+.search-extra-match {
+  display: block;
+  font-size: 12px; color: var(--text2); margin-top: 4px;
+  padding-left: 8px; border-left: 2px solid var(--border);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Preview cell defaults to white-space:nowrap for a one-line summary,
+   which would clip block-level children rendered underneath. When a
+   .search-preview-wrap is present, the cell opens up so the +N button
+   and revealed snippets get their own rows. The primary line still
+   ellipsis-truncates via .search-preview-main. */
+.col-preview:has(.search-preview-wrap),
+.card-preview:has(.search-preview-wrap) {
+  white-space: normal; overflow: visible; text-overflow: clip;
+  -webkit-line-clamp: unset;
+}
+.search-preview-wrap { display: flex; flex-direction: column; gap: 2px; }
+.search-preview-main {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.msg-search-loading {
+  font-size: 12px; color: var(--text2); padding: 0 6px;
+  font-style: italic;
+}
 .transform-menu .transform-menu-item {
   text-align: left; justify-content: flex-start; background: transparent;
   border: 0; border-radius: 4px; width: 100%;
@@ -1386,3 +1426,74 @@ table.tbl td.col-check .check-hit {
   margin-left: auto; font-size: 12px; color: var(--text2);
 }
 .tag-bar-sel-count { white-space: nowrap; }
+
+/* Debloat scan table inside the bulk confirm modal */
+.debloat-scan-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9em;
+  margin: 8px 0;
+}
+.debloat-scan-table th, .debloat-scan-table td {
+  padding: 4px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.debloat-scan-table th {
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+.debloat-scan-table td code {
+  font-family: var(--mono, monospace);
+  font-size: 0.85em;
+}
+
+/* Spinner glyph for debloat "Scanning…" rows */
+.debloat-spinner {
+  display: inline-block;
+  animation: debloat-spin 1s linear infinite;
+  font-family: var(--mono, monospace);
+  opacity: 0.7;
+}
+@keyframes debloat-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* Debloated convo marker — same shape as badge-archived, neutral color
+   to match "informational history marker" semantics. */
+.badge-debloated {
+  background: var(--bg2);
+  color: var(--text2);
+  border: 1px dashed var(--border);
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-right: 4px;
+}
+
+/* Experimental strip-images toggle: prominent warning banner when on. */
+.debloat-danger-banner {
+  background: var(--bg2);
+  border: 1px solid #c44;
+  border-left-width: 4px;
+  color: var(--text);
+  padding: 8px 10px;
+  margin: 6px 0 12px;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+/* Row highlight when image-strip mode bumps its reclaim. */
+.debloat-row-stripping td { background: rgba(200, 140, 40, 0.08); }
+
+/* Debloat modal sizing — wider and scrollable body, same pattern as the
+   stats modal (see .modal:has(.stats-modal) above). Without this, the
+   live-scan table overflows the 400px default and runs off-screen. */
+.modal:has(.debloat-modal) { max-width: 880px; }
+.modal:has(.debloat-modal) > p { margin: 0; }
+.debloat-modal {
+  max-height: calc(100vh - 260px);
+  overflow-y: auto;
+  padding-right: 6px;
+  margin: 0 0 12px;
+}

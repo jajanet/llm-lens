@@ -400,7 +400,7 @@ def test_smoke_edit_non_prose_tombstones_tool_and_command_counts(client, tmp_pat
     write_jsonl(path, [user_msg("u1", None, "hi"), bash_msg("a1", "u1", "grep foo .")])
     resp = client.post(
         "/api/projects/proj/conversations/c/messages/a1/edit",
-        json={"text": "scrubbed"},
+        json={"text": "redacted"},
     )
     assert resp.status_code == 200
     stats = client.get("/api/projects/proj/conversations/c/stats").get_json()
@@ -530,7 +530,7 @@ def test_smoke_bulk_delete_conversations(client, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Transforms (scrub family) — every kind once
+# Transforms (redact family) — every kind once
 # ---------------------------------------------------------------------------
 
 
@@ -709,7 +709,7 @@ def test_smoke_conversations_list_includes_last_preview(client, tmp_path):
 def test_smoke_messages_expose_has_tool_use_and_has_thinking_flags(client, tmp_path):
     """Each message in the /conversations/<id> response should carry
     `has_tool_use` / `has_thinking` booleans so the frontend can gate
-    non-prose warnings on bulk edit/delete/scrub actions without
+    non-prose warnings on bulk edit/delete/redact actions without
     re-parsing the flattened display content."""
     path = tmp_path / "proj" / "c.jsonl"
     write_jsonl(path, [
@@ -740,3 +740,111 @@ def test_smoke_messages_expose_has_tool_use_and_has_thinking_flags(client, tmp_p
     # User msg: no tool_use/thinking possible.
     assert not byId["u1"].get("has_tool_use")
     assert not byId["u1"].get("has_thinking")
+
+
+# ---------------------------------------------------------------------------
+# Debloat — breadth-first API smoke.
+# Deep coverage (invariants, per-rule behavior, tombstones, abort/restore)
+# lives in tests/test_debloat.py. Here we just prove the three endpoints are
+# reachable, return the expected shape, and integrate with the rest of the
+# stack (conversation-stats endpoint surfaces the tombstone afterward).
+# ---------------------------------------------------------------------------
+
+
+def _big_convo(path):
+    """Write a convo that will actually reclaim bytes under every rule."""
+    big_stdout = "x" * 5000
+    big_tur = {"kind": "WebFetch", "body": "Z" * 12000}
+    big_thinking = "T" * 25000
+    big_tool_result = "Q" * 12000
+    write_jsonl(path, [
+        user_msg("u1", None, "hi"),
+        {"uuid": "a1", "parentUuid": "u1", "type": "assistant",
+         "message": {"role": "assistant", "model": "claude-test",
+                     "content": [
+                         {"type": "thinking", "thinking": big_thinking},
+                         {"type": "tool_use", "id": "tA", "name": "Bash",
+                          "input": {"command": "sed -i s/x/y/g f"}},
+                     ],
+                     "usage": {"input_tokens": 10, "output_tokens": 5}}},
+        {"uuid": "u2", "parentUuid": "a1", "type": "user",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "tA", "content": big_tool_result},
+         ]},
+         "toolUseResult": {"stdout": big_stdout, "stderr": "", "exitCode": 0}},
+        {"uuid": "a2", "parentUuid": "u2", "type": "assistant",
+         "message": {"role": "assistant", "model": "claude-test",
+                     "content": [
+                         {"type": "tool_use", "id": "tB", "name": "WebFetch",
+                          "input": {"url": "x"}},
+                     ],
+                     "usage": {"input_tokens": 5, "output_tokens": 2}}},
+        {"uuid": "u3", "parentUuid": "a2", "type": "user",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "tB", "content": "ok"},
+         ]},
+         "toolUseResult": big_tur},
+    ])
+
+
+def test_debloat_scan_returns_exact_reclaim_per_id(client, tmp_path):
+    _big_convo(tmp_path / "proj" / "a.jsonl")
+    write_jsonl(tmp_path / "proj" / "b.jsonl", [user_msg("u1", None, "tiny")])
+
+    resp = client.post("/api/projects/proj/conversations/debloat-scan",
+                       json={"ids": ["a", "b", "missing"]})
+    assert resp.status_code == 200
+    body = resp.get_json()
+
+    # Both existing ids get a row; big one > 0 reclaim, small one == 0.
+    assert body["a"]["bytes_reclaimable"] > 0
+    assert body["a"]["current_size"] > 0
+    assert body["b"]["bytes_reclaimable"] == 0
+    # Missing id carries an error marker.
+    assert body["missing"].get("error") == "not_found"
+
+
+def test_debloat_single_apply_and_bulk_endpoints_return_ok(client, tmp_path):
+    _big_convo(tmp_path / "proj" / "single.jsonl")
+    _big_convo(tmp_path / "proj" / "one.jsonl")
+    _big_convo(tmp_path / "proj" / "two.jsonl")
+
+    r = client.post("/api/projects/proj/conversations/single/debloat")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is True
+    assert body["stats_verified"] is True
+    assert body["bytes_reclaimed"] > 0
+
+    r = client.post("/api/projects/proj/conversations/bulk-debloat",
+                    json={"ids": ["one", "two"]})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is True
+    assert body["results"]["one"]["ok"] is True
+    assert body["results"]["two"]["ok"] is True
+
+
+def test_debloat_tombstone_surfaces_on_convo_stats(client, tmp_path):
+    """After debloat, the per-convo stats endpoint must surface the
+    `debloat_delta` so the conversations-view card can render the
+    `debloated · N freed` badge without re-scanning the file."""
+    _big_convo(tmp_path / "proj" / "c.jsonl")
+    r = client.post("/api/projects/proj/conversations/c/debloat")
+    assert r.status_code == 200
+    reclaimed = r.get_json()["bytes_reclaimed"]
+    assert reclaimed > 0
+
+    # Stats endpoint is the integration layer the frontend actually reads.
+    stats_resp = client.get("/api/projects/proj/conversations/c/stats")
+    assert stats_resp.status_code == 200
+    stats = stats_resp.get_json()
+    dd = stats.get("debloat_delta") or {}
+    assert dd.get("bytes_reclaimed") == reclaimed
+    assert (dd.get("counts") or {}).get("tool_use_result_truncated", 0) >= 1
+
+
+def test_debloat_missing_convo_returns_404(client, tmp_path):
+    (tmp_path / "proj").mkdir()
+    r = client.post("/api/projects/proj/conversations/nope/debloat")
+    assert r.status_code == 404

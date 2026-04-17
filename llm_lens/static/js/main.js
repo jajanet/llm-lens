@@ -187,6 +187,18 @@ const actions = {
   "bulk-delete-convos":()      => Conversations.bulkDelete(),
   "bulk-archive-convos":()     => Conversations.bulkArchive(),
   "bulk-unarchive-convos":()   => Conversations.bulkUnarchive(),
+  "bulk-debloat-convos":()     => Conversations.bulkDebloat(),
+  "open-bulk-convos-menu": (_e, el) => Conversations.openBulkConvosMenu(el),
+  "open-row-convo-menu": (_e, el) => Conversations.openRowConvoMenu(el),
+  "open-agent-select-modal": ()     => Conversations.openAgentSelectModal(),
+  "select-agent":     (_e, el) => Conversations.selectByAgent(el.dataset.agent),
+  "clear-agent-filter":()      => Conversations.clearAgentFilter(),
+
+  "expand-search-matches": (e, el) => {
+    // Stop the row-open bubble so clicking +N stays on the list.
+    e.stopPropagation();
+    Conversations.expandSearchMatches(el.dataset.id);
+  },
   "load-more-convos": ()       => Conversations.loadMore(),
   "refresh-convos":   ()       => Conversations.refreshCache(),
   "open-project-stats":()      => Conversations.openProjectStats(),
@@ -206,13 +218,13 @@ const actions = {
   "copy-msg":         (_e, el) => Messages.copyMsg(el.dataset.uuid),
   "delete-msg":       (_e, el) => Messages.deleteMsg(el.dataset.uuid),
 
-  "transform-msg":    (_e, el) => Messages.transformMsg(el.dataset.uuid, el.dataset.kind || "scrub"),
+  "transform-msg":    (_e, el) => Messages.transformMsg(el.dataset.uuid, el.dataset.kind || "redact"),
   "open-transform-menu": (_e, el) => Messages.openTransformMenu(el.dataset.uuid, el),
 
   "edit-msg":         (_e, el) => Messages.editMsg(el.dataset.uuid),
   "save-edit-msg":    (_e, el) => Messages.saveEditMsg(el.dataset.uuid),
   "cancel-edit-msg":  (_e, el) => Messages.cancelEditMsg(el.dataset.uuid),
-  "bulk-transform":   (_e, el) => Messages.bulkTransform(el.dataset.kind || "scrub"),
+  "bulk-transform":   (_e, el) => Messages.bulkTransform(el.dataset.kind || "redact"),
   "open-bulk-transform-menu": (_e, el) => Messages.openBulkTransformMenu(el),
   "toggle-all-msgs":  (_e, el) => Messages.toggleAllMsgs(),
   "open-select-scope-menu": (_e, el) => Messages.openSelectScopeMenu(el),

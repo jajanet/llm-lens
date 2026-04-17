@@ -346,7 +346,7 @@ def _empty_stats() -> dict:
     """Canonical empty shape for the stats delta schema.
 
     The tombstone `deleted_delta` shape is kept equal to this so that adding
-    a new field here auto-flows through every destructive op (edit, scrub,
+    a new field here auto-flows through every destructive op (edit, redact,
     per-msg delete, whole-file delete) and through `api_overview` aggregation.
 
     Identity fields (`models` list, `git_branch`, `last_context_*`,
@@ -659,7 +659,7 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
 def _message_stats(entry: dict, ctx: dict | None = None) -> dict:
     """Per-entry stats in the canonical `_empty_stats()` shape.
 
-    Used by destructive endpoints (edit, scrub, per-msg delete) to compute
+    Used by destructive endpoints (edit, redact, per-msg delete) to compute
     before/after tombstone deltas. The extractor is shared with
     `_stats_cached`, so the delta schema covers every field the live scan
     produces — nothing drops silently on mutation.
@@ -798,6 +798,8 @@ def _stats(filepath, stat) -> dict:
         out = {k: cached[k] for k in _STATS_KEYS}
         if cached.get("deleted_delta"):
             out["deleted_delta"] = cached["deleted_delta"]
+        if cached.get("debloat_delta"):
+            out["debloat_delta"] = cached["debloat_delta"]
     else:
         stats = _stats_cached(str(filepath), stat.st_mtime, stat.st_size)
         peek_cache.set(filepath, stat, **stats)
@@ -807,6 +809,8 @@ def _stats(filepath, stat) -> dict:
         out = {**stats}
         if cached.get("deleted_delta"):
             out["deleted_delta"] = cached["deleted_delta"]
+        if cached.get("debloat_delta"):
+            out["debloat_delta"] = cached["debloat_delta"]
     # Duplicate subtraction lives outside the LRU/peek caches so that deleting
     # or archiving the parent flips the subtraction on/off without needing to
     # invalidate the dup's cached stats.
@@ -875,7 +879,7 @@ def _format_entry_message(entry):
          prefix marker that the frontend renders as a badge.
 
     Sets `has_tool_use` / `has_thinking` / `has_tool_result` booleans on the
-    output so the frontend can gate non-prose warnings (bulk edit/delete/scrub
+    output so the frontend can gate non-prose warnings (bulk edit/delete/redact
     UI) without re-parsing the flattened display content.
     """
     if entry.get("type") == "file-history-snapshot":
@@ -992,6 +996,52 @@ def _dedup_by_uuid(msgs):
                 continue
             seen.add(uid)
         out.append(m)
+    return out
+
+
+# Cap project-search payload: 20 is enough for four "show 5 more" clicks
+# in the UI. The backend still reports the true `count` so "+N more"
+# labels stay accurate past the cap.
+PROJECT_SEARCH_MATCHES_PER_CONVO = 20
+
+
+# Cap project-search payload: 20 is enough for four "show 5 more" clicks
+# in the UI. The backend still reports the true `count` so "+N more"
+# labels stay accurate past the cap.
+PROJECT_SEARCH_MATCHES_PER_CONVO = 20
+
+
+@lru_cache(maxsize=256)
+def _search_convo_cached(filepath_str: str, mtime: float, size: int, query_lower: str):
+    """Find all case-insensitive matches of `query_lower` in a convo's
+    message contents. Returns list of {uuid, role, snippet, index} — one
+    entry per matching message. Piggybacks on `_parse_messages_cached`
+    so cold cost is a single full parse; warm queries are in-memory.
+    Cache key includes the query so repeated searches hit the LRU.
+    """
+    msgs = _parse_messages_cached(filepath_str, mtime, size)
+    out = []
+    for idx, m in enumerate(msgs):
+        content = m.get("content") or ""
+        if not isinstance(content, str) or not content:
+            continue
+        cl = content.lower()
+        pos = cl.find(query_lower)
+        if pos < 0:
+            continue
+        start = max(0, pos - 60)
+        end = min(len(content), pos + len(query_lower) + 120)
+        snippet = content[start:end].replace("\n", " ").strip()
+        if start > 0:
+            snippet = "…" + snippet
+        if end < len(content):
+            snippet = snippet + "…"
+        out.append({
+            "uuid": m.get("uuid"),
+            "role": m.get("role"),
+            "snippet": snippet,
+            "index": idx,
+        })
     return out
 
 
@@ -1284,6 +1334,7 @@ def _invalidate_cache_for(filepath: Path):
     _peek_jsonl_cached.cache_clear()
     _parse_messages_cached.cache_clear()
     _inline_agent_runs_from_parent.cache_clear()
+    _search_convo_cached.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1948,6 +1999,59 @@ def api_single_conversation_stats(folder, convo_id):
     return jsonify(_stats(fp, fp.stat()))
 
 
+
+@app.route("/api/projects/<folder>/search")
+def api_project_search(folder):
+    """Full-content search across every convo in the project (live +
+    archive). Returns {convo_id: {count, top, matches}} — `top` is kept
+    for back-compat with renderers that only want one snippet; `matches`
+    holds up to the first `PROJECT_SEARCH_MATCHES_PER_CONVO` hits so the
+    UI can progressively reveal them without a second round-trip. `count`
+    is the true total (may exceed `len(matches)`). Only convos with ≥1
+    match are included. Warm queries are in-memory via
+    `_search_convo_cached`; edits invalidate via mtime/size.
+    """
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({})
+    ql = q.lower()
+    out = {}
+
+    project_dir = CLAUDE_PROJECTS_DIR / folder
+    archive_dir = _archive_folder(folder)
+    for base in (project_dir, archive_dir):
+        if not base.exists():
+            continue
+        for fp, stat in _convo_files(base):
+            try:
+                matches = _search_convo_cached(str(fp), stat.st_mtime, stat.st_size, ql)
+            except Exception:
+                continue
+            if not matches:
+                continue
+            out[fp.stem] = {
+                "count": len(matches),
+                "top": matches[0],
+                "matches": matches[:PROJECT_SEARCH_MATCHES_PER_CONVO],
+            }
+    return jsonify(out)
+
+
+@app.route("/api/projects/<folder>/conversations/<convo_id>/search")
+def api_convo_search(folder, convo_id):
+    """Per-convo search: every matching message with snippet + index so
+    the Messages view can jump to each hit.
+    """
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify([])
+    fp = _convo_path(folder, convo_id)
+    if not fp:
+        return jsonify([])
+    stat = fp.stat()
+    return jsonify(_search_convo_cached(str(fp), stat.st_mtime, stat.st_size, q.lower()))
+
+
 @app.route("/api/projects/<folder>/names", methods=["POST"])
 def api_conversation_names(folder):
     """Batch lookup of `/rename`-assigned titles. Checks live then archive."""
@@ -2546,7 +2650,7 @@ def api_delete_message(folder, convo_id, msg_uuid):
 def _is_prose_only(message: dict) -> bool:
     """Prose-only = `message.content` is a string or a list containing only
     text blocks. Any tool_use, tool_result, thinking, image, or other
-    structured block disqualifies — their shape carries meaning that scrub
+    structured block disqualifies — their shape carries meaning that redact
     would break.
     """
     if not isinstance(message, dict):
@@ -2878,7 +2982,7 @@ def api_edit_message(folder, convo_id, msg_uuid):
     """Replace the text content of a message in place.
 
     Body: {"text": "<new content>"}. Preserves `usage`, `uuid`, `parentUuid`,
-    `sessionId`, and message shape. Same resume-chain caveats as scrub.
+    `sessionId`, and message shape. Same resume-chain caveats as redact.
 
     Stats preservation: computes before/after `_message_stats` with ctx
     replayed to the target's position, and tombstones the positive diff.
@@ -3241,6 +3345,90 @@ def api_bulk_delete(folder):
         deleted += 1
     _invalidate_cache_for(CLAUDE_PROJECTS_DIR / folder)
     return jsonify({"ok": True, "deleted": deleted})
+
+
+@app.route("/api/projects/<folder>/conversations/debloat-scan", methods=["POST"])
+def api_debloat_scan(folder):
+    """Batch read-only scan: for each convo id, return bytes_reclaimable +
+    per-rule counts + current_size. No file mutation. The caller (the
+    frontend preview modal) uses these numbers to render exact savings
+    per convo before the user confirms the destructive apply."""
+    from llm_lens import debloat
+    ids = (request.get_json() or {}).get("ids") or []
+    out = {}
+    for cid in ids:
+        if not isinstance(cid, str) or not cid:
+            continue
+        fp = CLAUDE_PROJECTS_DIR / folder / f"{cid}.jsonl"
+        if not fp.exists():
+            out[cid] = {"bytes_reclaimable": 0, "counts": {}, "current_size": 0,
+                        "error": "not_found"}
+            continue
+        try:
+            out[cid] = debloat.scan_convo(fp)
+        except Exception as e:
+            out[cid] = {"bytes_reclaimable": 0, "counts": {}, "current_size": 0,
+                        "error": str(e)}
+    return jsonify(out)
+
+
+@app.route("/api/projects/<folder>/conversations/<convo_id>/debloat", methods=["POST"])
+def api_debloat_apply(folder, convo_id):
+    """Apply debloat to a single convo. Aborts + restores the file if the
+    post-rewrite stats don't match pre (StatsInvariantError).
+
+    Body (optional): `{"strip_images": true}` opts into the experimental
+    image-strip rule. Default is False.
+    """
+    from llm_lens import debloat
+    fp = CLAUDE_PROJECTS_DIR / folder / f"{convo_id}.jsonl"
+    if not fp.exists():
+        return jsonify({"ok": False, "error": "not found"}), 404
+    body = request.get_json(silent=True) or {}
+    strip_images = bool(body.get("strip_images", False))
+    try:
+        result = debloat.apply_debloat(fp, strip_images=strip_images)
+    except debloat.StatsInvariantError as e:
+        return jsonify({"ok": False, "error": f"stats invariant: {e}"}), 500
+    _invalidate_cache_for(fp)
+    return jsonify({
+        "ok": True,
+        "bytes_reclaimed": result["bytes_reclaimed"],
+        "counts": result["counts"],
+        "stats_verified": True,
+        "images_stripped": strip_images,
+    })
+
+
+@app.route("/api/projects/<folder>/conversations/bulk-debloat", methods=["POST"])
+def api_bulk_debloat(folder):
+    """Apply debloat across many convos. Per-id results; an invariant
+    failure on one convo does not block the others.
+
+    Body: `{"ids": [...], "strip_images": false}`. `strip_images` is
+    experimental — off by default.
+    """
+    from llm_lens import debloat
+    body = request.get_json() or {}
+    ids = body.get("ids") or []
+    strip_images = bool(body.get("strip_images", False))
+    results = {}
+    for cid in ids:
+        if not isinstance(cid, str) or not cid:
+            continue
+        fp = CLAUDE_PROJECTS_DIR / folder / f"{cid}.jsonl"
+        if not fp.exists():
+            results[cid] = {"ok": False, "error": "not_found"}
+            continue
+        try:
+            r = debloat.apply_debloat(fp, strip_images=strip_images)
+            results[cid] = {"ok": True, **r}
+            _invalidate_cache_for(fp)
+        except debloat.StatsInvariantError as e:
+            results[cid] = {"ok": False, "error": f"stats invariant: {e}"}
+        except Exception as e:
+            results[cid] = {"ok": False, "error": str(e)}
+    return jsonify({"ok": True, "results": results, "images_stripped": strip_images})
 
 
 @app.route("/api/projects/<folder>", methods=["DELETE"])

@@ -548,7 +548,7 @@ def test_extract_empty_selection_returns_400(client, tmp_path):
 
 # ----------------------------------------------------------------------------
 # /messages/<uuid>/edit — in-place text replacement. Preserves usage, uuid,
-# and parentUuid (same file-rewrite contract as delete/scrub). Prose-only:
+# and parentUuid (same file-rewrite contract as delete/redact). Prose-only:
 # messages containing tool_use / tool_result / thinking blocks must be
 # rejected because their shape carries structural meaning.
 # ----------------------------------------------------------------------------
@@ -743,7 +743,7 @@ def test_edit_bash_tool_use_tombstones_command_breakdown(client, tmp_path):
 
     resp = client.post(
         "/api/projects/proj/conversations/s/messages/a1/edit",
-        json={"text": "scrubbed"},
+        json={"text": "redacted"},
     )
     assert resp.status_code == 200
 

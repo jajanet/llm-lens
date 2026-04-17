@@ -258,9 +258,19 @@ export async function pickConvoTag(tagId) {
 
 function renderToolbar() {
   let extra = "";
+  // While a search-triggered full-load is in flight, show an inline
+  // spinner chip so the user sees that old messages are being pulled
+  // (otherwise they type, see only the last-60-window matches, and
+  // think the search is broken until the fetch lands).
+  if (state.msgSearchLoading) {
+    extra += `<span class="msg-search-loading">searching all messages…</span> `;
+  }
   // "Earlier" only applies to parent-convo paging; agent runs are loaded
-  // whole by the /agent/<run_id> endpoint.
-  if (!state.agentRunId && state.msgOffset > 0) {
+  // whole by the /agent/<run_id> endpoint. Hidden during an active
+  // search because the search flow pulls the full set anyway — leaving
+  // the button would let the user kick off a redundant fetch that then
+  // also resets pagination counters in a confusing way.
+  if (!state.agentRunId && state.msgOffset > 0 && !state.msgSearch) {
     extra += `<button class="btn" data-action="load-earlier-msgs">Earlier (${state.msgOffset})</button> `;
   }
   // Agent-run index — comprehensive list (anchored + standalone). Anchored
@@ -275,8 +285,76 @@ function renderToolbar() {
     placeholder: "Search messages...",
     searchValue: state.msgSearch,
     extraHtml: extra,
-    onSearch: (v) => { state.msgSearch = v; render(); },
+    onSearch: (v) => {
+      const prev = state.msgSearch;
+      state.msgSearch = v;
+      // Clearing the search box: we loaded all messages to make search
+      // work, which left msgOffset=0 and Earlier hidden. Restore the
+      // original windowed view (last PAGE_MSGS + Earlier button) so the
+      // UI returns to its pre-search shape. The backend LRU keeps the
+      // parse warm so reloading the window is in-memory fast.
+      if (prev && !v) restoreWindowedView();
+      scheduleMsgSearchLoad(v);
+      render();
+    },
   });
+}
+
+// Re-slices the locally held messages back into the last-PAGE_MSGS
+// window and restores the Earlier offset. Purely client-side — we
+// already have the messages from the search-triggered full load, so
+// there's no network round-trip here.
+function restoreWindowedView() {
+  if (state.agentRunId) return;
+  const all = state.msgData?.main || [];
+  const total = state.msgTotal || all.length;
+  if (all.length <= PAGE_MSGS) return;
+  const start = Math.max(0, all.length - PAGE_MSGS);
+  state.msgData.main = all.slice(start);
+  state.msgOffset = Math.max(0, total - PAGE_MSGS);
+}
+
+
+// When the user searches, ensure every message in the convo is loaded —
+// default pagination only has the last 60, so earlier matches would be
+// invisible. Debounced so we don't re-fetch per keystroke; skipped on
+// agent-run view (those load whole already) and when we already have
+// the full set.
+let _msgSearchDebounce = null;
+let _msgSearchSeq = 0;
+function scheduleMsgSearchLoad(query) {
+  if (!query) return;
+  if (state.agentRunId) return;
+  const loaded = (state.msgData?.main || []).length;
+  const total = state.msgTotal || 0;
+  if (total <= loaded) return;
+  // Kick off immediately — there's nothing to debounce. The fetch is
+  // idempotent (subsequent calls bail at `total <= loaded`) and we want
+  // old matches on screen as fast as possible. Set a flag so the toolbar
+  // can show "searching all messages…" while we wait.
+  const folder = state.folder;
+  const convoId = state.convoId;
+  const seq = ++_msgSearchSeq;
+  state.msgSearchLoading = true;
+  render();
+  (async () => {
+    let data;
+    try {
+      data = await api.messages(folder, convoId, { offset: 0, limit: total });
+    } catch {
+      state.msgSearchLoading = false;
+      render();
+      return;
+    }
+    if (seq !== _msgSearchSeq || folder !== state.folder || convoId !== state.convoId) {
+      state.msgSearchLoading = false;
+      return;
+    }
+    state.msgData.main = data.main || [];
+    state.msgOffset = 0;
+    state.msgSearchLoading = false;
+    render();
+  })();
 }
 
 export function render() {
@@ -311,7 +389,7 @@ export function render() {
         <span>${state.msgSelected.size} selected</span>
         <button class="btn" data-action="open-export-menu" title="Copy, download, or extract the selected messages.">Export/Extract ▾</button>
         <span class="split-btn">
-          <button class="btn" data-action="bulk-transform" data-kind="scrub" title="Scrub text on selected messages. Non-prose messages have their tool_use / thinking blocks collapsed; stats are preserved via tombstones but raw block contents are lost.">Scrub</button>
+          <button class="btn" data-action="bulk-transform" data-kind="redact" title="Redact text on selected messages. Non-prose messages have their tool_use / thinking blocks collapsed; stats are preserved via tombstones but raw block contents are lost.">Redact</button>
           <button class="btn split-arrow" data-action="open-bulk-transform-menu" title="More text transforms">▾</button>
         </span>
         <button class="btn-danger" style="border-color:rgba(255,255,255,0.4);color:#fff" data-action="delete-selected" title="Rewrites original file in place. May break /resume in edge cases — duplicate the conversation first if you care about it.">Delete</button>
@@ -911,7 +989,7 @@ export async function copyMsg(uuid) {
 
 
 // True when the message has tool_use or thinking blocks (structural data
-// that a text-only edit/scrub/delete destroys). Backend sets these flags
+// that a text-only edit/redact/delete destroys). Backend sets these flags
 // explicitly in _format_entry_message so the frontend doesn't have to
 // re-parse the flattened display content.
 function _isNonProseMsg(m) {
@@ -949,7 +1027,7 @@ export function deleteMsg(uuid) {
     body: `Rewrites the original conversation file in place. This may break
       <code>/resume</code> for this conversation — Claude Code's replay
       semantics aren't publicly documented.
-      <br><br><strong>Prefer Scrub</strong> if you only want to redact the
+      <br><br><strong>Prefer Redact</strong> if you only want to redact the
       text — it leaves <code>usage</code> and the chain intact, so it's
       strictly less invasive than delete.
       <br>Or use Edit mode → "Save to new convo" to curate non-destructively.${nonProseWarning}`,
@@ -962,7 +1040,7 @@ export function deleteMsg(uuid) {
 
 
 export const TRANSFORM_LABELS = {
-  scrub: "Scrub (replace text with \".\")",
+  redact: "Redact (replace text with \".\")",
   normalize_whitespace: "Normalize whitespace",
   remove_verbosity: "Remove verbosity",
   remove_priming: "Remove priming language",
@@ -970,7 +1048,7 @@ export const TRANSFORM_LABELS = {
 };
 
 const TRANSFORM_CONFIRM = {
-  scrub: `Replaces this message's text content with "." in place. Leaves
+  redact: `Replaces this message's text content with "." in place. Leaves
     <code>usage</code>, <code>uuid</code>, and <code>parentUuid</code>
     alone, so token stats and the resume chain are preserved. Only works
     on prose-only messages. Like other destructive edits, this may still
@@ -1023,7 +1101,7 @@ function visibleTransformEntries() {
   });
 }
 
-export async function transformMsg(uuid, kind = "scrub") {
+export async function transformMsg(uuid, kind = "redact") {
   const body = TRANSFORM_CONFIRM[kind];
   if (!body) {
     alert(`Unknown transform: ${kind}`);
@@ -1112,7 +1190,7 @@ export function editMsg(uuid) {
   content.innerHTML =
     warning +
     `<textarea class="msg-edit-ta" spellcheck="false"></textarea>` +
-    `<div class="msg-edit-hint">Rewrites the file in place. Preserves usage/stats and resume chain — same caveats as scrub.</div>`;
+    `<div class="msg-edit-hint">Rewrites the file in place. Preserves usage/stats and resume chain — same caveats as redact.</div>`;
   const ta = content.querySelector("textarea");
   ta.value = m.content || "";
   if (actions) {
@@ -1314,7 +1392,7 @@ export async function openWordListsModal() {
           <summary><strong>Whitelist</strong> <span style="color:var(--text3); font-weight:normal" id="wl-count-badge">(${current.whitelist.length} entries, applies to all filters)</span></summary>
           <div style="padding:8px 4px 4px">
             <p style="font-size:12px; color:var(--text2); margin:0 0 8px 0">
-              Global "never scrub" list. Any entry in any remove-* list that
+              Global "never redact" list. Any entry in any remove-* list that
               contains a whitelisted phrase (case-insensitive substring) is
               skipped at transform time. Ships with a curated seed of SWE /
               tool / code terms; edit freely.
@@ -1522,7 +1600,7 @@ export async function openWordListsModal() {
   });
 }
 
-export async function bulkTransform(kind = "scrub") {
+export async function bulkTransform(kind = "redact") {
   const ids = Array.from(state.msgSelected);
   if (!ids.length) return;
   const label = TRANSFORM_LABELS[kind] || kind;
@@ -1644,7 +1722,7 @@ export function deleteSelected() {
     body: `Rewrites the original conversation file in place. Cannot be undone,
       and may break <code>/resume</code> for this conversation — Claude Code's
       replay semantics aren't publicly documented.
-      <br><br><strong>Prefer Scrub</strong> on these messages if you only
+      <br><br><strong>Prefer Redact</strong> on these messages if you only
       want to redact text — it preserves <code>usage</code> and the chain.
       <br>Or use "Save to new convo" (non-destructive, creates a copy).${_nonProseWarningBlock(nonProseN)}`,
     onConfirm: async () => {

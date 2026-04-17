@@ -59,6 +59,20 @@ export const api = {
       body: JSON.stringify({ ids }),
     }),
 
+  debloatScan: (folder, ids) =>
+    json(`/api/projects/${folder}/conversations/debloat-scan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }),
+
+  bulkDebloat: (folder, ids, { stripImages = false } = {}) =>
+    json(`/api/projects/${folder}/conversations/bulk-debloat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, strip_images: !!stripImages }),
+    }),
+
   conversationNames: (folder, ids) =>
     json(`/api/projects/${folder}/names`, {
       method: "POST",
@@ -198,3 +212,11 @@ export const api = {
       body: JSON.stringify({ folders, tag, add }),
     }),
 };
+
+
+Object.assign(api, {
+  searchProject: (folder, q) =>
+    json(`/api/projects/${folder}/search?q=${encodeURIComponent(q)}`),
+  searchConvo: (folder, convoId, q) =>
+    json(`/api/projects/${folder}/conversations/${convoId}/search?q=${encodeURIComponent(q)}`),
+});

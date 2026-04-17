@@ -838,7 +838,7 @@ function renderStatsCombined(s, opts) {
     return out;
   };
   // Session-artifact counters (slash commands, queued drafts, compactions,
-  // …) ARE now tombstoned on every edit/scrub/delete, so union them across
+  // …) ARE now tombstoned on every edit/redact/delete, so union them across
   // active/archived/deleted per the filter toggles. When the "deleted"
   // filter is off, behavior matches the pre-tombstone UI (counters appear
   // only from the current file).
@@ -883,7 +883,7 @@ function renderStatsCombined(s, opts) {
   const toolTotal = toolEntries.reduce((n, [, c]) => n + c, 0);
 
   // per_model union across active/archived/deleted so tool/command cost
-  // breakdowns and total cost survive edit/scrub/delete. Tombstoned
+  // breakdowns and total cost survive edit/redact/delete. Tombstoned
   // per_model entries carry the same shape as live per_model (tokens,
   // tool_uses, commands, tool_turn_tokens, command_turn_tokens,
   // thinking_count).
@@ -1525,7 +1525,26 @@ export function toast(msg) {
 export function highlightText(html, query) {
   if (!query) return html;
   const re = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi");
-  return html.replace(/>([^<]*)</g, (m, text) =>
+  // Wrap in `>` / `<` sentinels so the text-between-tags regex still
+  // matches when the input is pure escaped text (e.g. a plain user
+  // message with no tool badges or thinking blocks). Without this,
+  // assistant messages highlight because they contain tool-badge
+  // spans that give the regex boundaries — user messages don't, and
+  // so never get highlighted. Sentinels are sliced off before return.
+  return (">" + html + "<").replace(/>([^<]*)</g, (_m, text) =>
     ">" + text.replace(re, '<span class="highlight">$1</span>') + "<"
-  );
+  ).slice(1, -1);
+}
+
+// Highlight matches of `query` inside plain (unescaped) text. Escapes
+// both the text and the query, then wraps case-insensitive matches in
+// `<span class="highlight">`. Use this for list/table cells where the
+// underlying value is a raw string, not rendered HTML.
+export function hlText(text, query) {
+  const safe = esc(text == null ? "" : String(text));
+  if (!query) return safe;
+  const escQ = esc(String(query)).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!escQ) return safe;
+  const re = new RegExp(`(${escQ})`, "gi");
+  return safe.replace(re, '<span class="highlight">$1</span>');
 }

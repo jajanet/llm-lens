@@ -853,3 +853,292 @@ def test_api_has_project_tag_methods():
     src = read(ROOT / "llm_lens" / "static" / "js" / "api.js")
     for method in ("getProjectTags", "setProjectTagLabels", "assignProjectTags", "bulkAssignProjectTag"):
         assert f"{method}:" in src or f"{method} =" in src, f"api.js missing {method}"
+
+
+# ------------------------------------------------------------------
+# Debloat feature — static wiring invariants
+# ------------------------------------------------------------------
+#
+# Every click-path needs a data-action emitted in a view, a handler
+# registered in main.js, and (for network paths) an api.js method the
+# handler calls. Catches the class of bug where a rename on one side
+# leaves the other side broken with no runtime error.
+
+def test_conversations_has_split_button_with_bulk_menu_arrow(convos_js):
+    # Active-mode selection renders a split-button with an Archive face
+    # and an arrow that opens the bulk-convos menu.
+    assert 'data-action="open-bulk-convos-menu"' in convos_js
+    assert 'class="split-btn"' in convos_js
+
+
+def test_bulk_convos_menu_contains_archive_debloat_delete(convos_js):
+    # The floating menu emits all three destructive-adjacent actions
+    # in severity order. If a rename splits them across files the
+    # menu silently loses items — grep pins the contract.
+    src = convos_js
+    # openBulkConvosMenu constructs the menu; look for all three
+    # data-action values it embeds.
+    assert 'data-action="bulk-archive-convos"' in src
+    assert 'data-action="bulk-debloat-convos"' in src
+    assert 'data-action="bulk-delete-convos"' in src
+
+
+def test_main_registers_debloat_actions(main_js):
+    # Both handlers must be present — one to open the menu, one to
+    # run the scan+apply flow.
+    assert '"open-bulk-convos-menu"' in main_js
+    assert '"bulk-debloat-convos"' in main_js
+    assert "openBulkConvosMenu" in main_js
+    assert "bulkDebloat" in main_js
+
+
+def test_api_has_debloat_methods(api_js):
+    for method in ("debloatScan", "bulkDebloat"):
+        assert f"{method}:" in api_js, f"api.js missing {method}"
+    # Endpoint URLs (the frontend and backend must agree on paths).
+    assert "/conversations/debloat-scan" in api_js
+    assert "/conversations/bulk-debloat" in api_js
+
+
+def test_debloat_modal_surface_has_required_warnings(convos_js):
+    # The confirm modal's body must carry the stats-preserved pitch
+    # AND the lossy warning AND the /resume caveat — three warnings
+    # we promised in the tooltip-level spec earlier. If any drops
+    # off, the user is surprised by data loss.
+    assert "Stats preserved" in convos_js
+    assert "Lossy" in convos_js or "lossy" in convos_js
+    assert "/resume" in convos_js
+
+
+def test_debloat_badge_rendered_from_sidecar_delta(convos_js):
+    # The card reads `c.stats.debloat_delta` and emits the
+    # `badge-debloated` pill when bytes_reclaimed > 0.
+    assert "debloat_delta" in convos_js
+    assert "badge-debloated" in convos_js
+    assert "bytes_reclaimed" in convos_js
+
+
+def test_badge_debloated_css_exists(styles_css):
+    assert ".badge-debloated" in styles_css
+
+
+def test_debloat_scan_table_css_exists(styles_css):
+    # Confirm modal's per-convo table needs styling.
+    assert ".debloat-scan-table" in styles_css
+
+
+def test_debloat_confirm_button_starts_disabled_while_scanning(convos_js):
+    # Live-scan UX contract: initial label is "Scanning…" and the
+    # confirm button toggles disabled until every row resolves. Grep
+    # the string rather than simulate.
+    assert "Scanning…" in convos_js
+    assert "btn.disabled = true" in convos_js
+    assert "btn.disabled = false" in convos_js
+
+
+def test_debloat_modal_has_strip_images_toggle(convos_js):
+    # Checkbox must exist with the right id so the change handler can
+    # find it; warning banner must exist so flipping the checkbox has
+    # something to reveal.
+    assert 'id="debloat-strip-images"' in convos_js
+    assert 'id="debloat-strip-warning"' in convos_js
+    # Off by default: checkbox has no `checked` attribute in markup,
+    # and the warning banner starts hidden.
+    assert 'display:none' in convos_js
+    # Experimental wording must appear so users understand the risk
+    # is categorically different from the default rules.
+    assert "experimental" in convos_js.lower()
+
+
+def test_debloat_modal_has_five_column_scan_table(convos_js):
+    # Table needs to surface both reclaim modes (w/o and w/ images) so
+    # the toggle has two numbers to switch between.
+    assert "w/o img" in convos_js
+    assert "w/ img" in convos_js
+
+
+def test_api_bulk_debloat_passes_strip_images_flag(api_js):
+    # The flag must reach the backend; otherwise flipping the checkbox
+    # does nothing.
+    assert "strip_images" in api_js
+
+
+def test_strip_images_danger_banner_css(styles_css):
+    assert ".debloat-danger-banner" in styles_css
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Search wiring (full-content search across project + convo)
+# Catches drift between the api/endpoint/state/render handshake. These
+# are the pieces where a rename in one file would silently break search
+# in the UI (no JS error, just "filter finds nothing").
+# ──────────────────────────────────────────────────────────────────────
+
+def test_api_exposes_search_endpoints(api_js):
+    assert "searchProject" in api_js
+    assert "searchConvo" in api_js
+    assert "/api/projects/${folder}/search" in api_js
+    assert "/search?q=" in api_js
+
+
+def test_conversations_view_hydrates_search(convos_js):
+    # Hydrator + debounce scheduler wired to the toolbar onSearch.
+    assert "scheduleSearchHydrate" in convos_js
+    assert "hydrateSearch" in convos_js
+    assert "api.searchProject" in convos_js
+
+
+def test_conversations_search_state_keys(convos_js):
+    # Render() reads both to render preview swap + avoid stale matches.
+    assert "state.searchMatches" in convos_js
+    assert "state.searchQuery" in convos_js
+
+
+def test_conversations_render_has_preview_cell_helper(convos_js):
+    assert "renderPreviewCell" in convos_js
+    # The helper is called from both table and card render paths so the
+    # two views stay in sync on snippet + "+N more" behavior.
+    assert convos_js.count("renderPreviewCell(c)") >= 2
+
+
+def test_conversations_shows_plus_n_badge(convos_js):
+    assert "search-more-matches" in convos_js
+    assert "more match" in convos_js  # label text for the +N badge
+
+
+def test_search_more_matches_css_class_exists(styles_css):
+    assert ".search-more-matches" in styles_css
+
+
+def test_conversations_search_filter_unions_content_hits(convos_js):
+    # Row stays visible when the search term only appears deep in the
+    # body. Regression guard: the filter must OR against searchMatches,
+    # not AND (otherwise the hydrate result would shrink the list).
+    assert "Object.prototype.hasOwnProperty.call(hits, c.id)" in convos_js
+
+
+def test_messages_view_loads_full_convo_on_search(messages_js):
+    # Default pagination holds only the last 60; without this loader,
+    # earlier matches are invisible even though highlightText would
+    # render them if they were present in state.msgData.main.
+    assert "scheduleMsgSearchLoad" in messages_js
+    assert "state.msgTotal" in messages_js
+
+
+def test_hltext_helper_exported_and_used(utils_js, convos_js, projects_js):
+    assert "export function hlText" in utils_js
+    # Both list views use it for the filter-match highlight.
+    assert "hlText(" in convos_js
+    assert "hlText(" in projects_js
+
+
+def test_hltext_handles_empty_and_missing_query(utils_js):
+    # The helper must short-circuit on falsy queries so an empty search
+    # doesn't wrap every character in a <span class="highlight"> (would
+    # also break the regex compile for empty alternation).
+    assert 'if (!query) return safe' in utils_js
+    assert 'if (!escQ) return safe' in utils_js
+
+
+def test_projects_view_filters_include_search_highlight(projects_js):
+    # Both the list table and the card grid must pass state.search
+    # through hlText so matches light up in either view.
+    assert "hlText(sp, state.search)" in projects_js
+    assert "hlText(p.latest_preview, state.search)" in projects_js
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Progressive match expansion ("+N more matches" → reveal 5, repeat)
+# ──────────────────────────────────────────────────────────────────────
+
+def test_expand_search_matches_action_registered(main_js, convos_js):
+    # Delegated action must exist in main.js AND the renderer must emit
+    # a button with the matching data-action; drift either way breaks
+    # the reveal click.
+    assert '"expand-search-matches"' in main_js
+    assert 'Conversations.expandSearchMatches' in main_js
+    assert 'data-action="expand-search-matches"' in convos_js
+
+
+def test_expand_search_stops_propagation(main_js):
+    # Clicking "+N more" sits inside the row's open-convo hit area. If
+    # we don't stop propagation, the click both expands AND navigates
+    # — navigation wins visually, the expansion is invisible.
+    assert "expand-search-matches" in main_js
+    # Simple structural check: the handler body references stopPropagation
+    # near the expand-search-matches key.
+    idx = main_js.index('"expand-search-matches"')
+    window = main_js[idx:idx + 300]
+    assert "stopPropagation" in window
+
+
+def test_search_expansion_state_reset_on_new_query(convos_js):
+    # New query must reset expansion — otherwise a user who typed "foo"
+    # and expanded 2 pages, then typed "bar", sees a stale 10-deep
+    # reveal for whichever rows still match.
+    assert "state.searchExpanded = {}" in convos_js
+
+
+def test_search_matches_page_constant_present(convos_js):
+    # UX depends on reveal size being 5. Name-pinned so a future
+    # refactor can't silently change the page size.
+    assert "SEARCH_MATCHES_PAGE = 5" in convos_js
+
+
+def test_search_extra_match_css_class_exists(styles_css):
+    # Revealed snippets use this class for the indented/dimmed look.
+    assert ".search-extra-match" in styles_css
+
+
+def test_expand_button_is_clickable_button_element(convos_js):
+    # The "+N more" must be a <button> with cursor:pointer behavior, not
+    # a <div> (regression risk: older code used a non-interactive div).
+    assert '<button class="search-more-matches"' in convos_js
+
+
+def test_project_search_response_includes_matches_array(api_js):
+    # Backend contract includes `matches`; without it the progressive
+    # reveal can't proceed past the primary line.
+    # (Frontend reads hit.matches — this string lives in conversations.js,
+    # but we also assert the URL shape in api.js stays correct.)
+    assert "searchProject" in api_js
+
+
+def test_conversations_renderer_reads_matches_field(convos_js):
+    assert "hit.matches" in convos_js
+    assert "hit.count" in convos_js
+
+
+def test_messages_search_shows_loading_chip(messages_js, styles_css):
+    # While the full-convo load is in flight, a text chip keeps the user
+    # from concluding "search is broken" when only last-60-window hits
+    # appear initially.
+    assert "msgSearchLoading" in messages_js
+    assert "searching all messages" in messages_js
+    assert ".msg-search-loading" in styles_css
+
+
+def test_earlier_button_hidden_during_active_search(messages_js):
+    # During search, the "Earlier" button is suppressed because the
+    # search flow pulls the full set anyway. Leaving it visible would
+    # invite a redundant fetch that also resets pagination weirdly.
+    # Regression guard: the condition must include `!state.msgSearch`.
+    assert "!state.msgSearch" in messages_js
+
+
+def test_messages_search_load_fires_immediately(messages_js):
+    # Debounce removed — fetch is idempotent (subsequent calls bail at
+    # `total <= loaded`) and any delay between keystroke and old-match
+    # reveal feels like a bug.
+    assert "setTimeout" not in messages_js.split("function scheduleMsgSearchLoad")[1].split("\n}\n")[0]
+
+
+def test_clearing_search_restores_windowed_view(messages_js):
+    # Regression guard: searching loads all messages + sets msgOffset=0.
+    # Without this restore, clearing the search box leaves Earlier hidden
+    # forever because msgOffset stays at 0 even though the user is out
+    # of search mode. The restore slices locally held data back down to
+    # the last PAGE_MSGS + resets the offset — no network call needed.
+    assert "restoreWindowedView" in messages_js
+    assert "prev && !v" in messages_js  # detect the clear transition
+    assert "state.msgData.main = all.slice" in messages_js

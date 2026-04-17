@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const {
-  scrub,
+  redact,
   normalizeWs,
   stripSwears,
   stripFiller,
@@ -10,10 +10,10 @@ const {
   applyTransform,
 } = await import("../../llm_lens/static/js/transforms.js");
 
-test("scrub always returns a single period regardless of input", () => {
-  assert.equal(scrub("anything"), ".");
-  assert.equal(scrub(""), ".");
-  assert.equal(scrub(), ".");
+test("redact always returns a single period regardless of input", () => {
+  assert.equal(redact("anything"), ".");
+  assert.equal(redact(""), ".");
+  assert.equal(redact(), ".");
 });
 
 test("normalizeWs collapses inline runs and tightens blank lines", () => {
@@ -374,7 +374,7 @@ test("stripVerbosity returns input unchanged with empty phrase list", () => {
 });
 
 test("applyTransform dispatches by kind and passes word lists through", () => {
-  assert.equal(applyTransform("scrub", "anything"), ".");
+  assert.equal(applyTransform("redact", "anything"), ".");
   assert.equal(applyTransform("normalize_whitespace", "a   b"), "a b");
   assert.equal(applyTransform("remove_swears", "oh damn", { swears: ["damn"] }), "oh ");
   assert.equal(
