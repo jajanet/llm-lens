@@ -6,6 +6,8 @@ import { timeAgo, timeAbs, fmtSize, esc, escAttr, arrow, shortPath, renderStatsI
 import { configureToolbar } from "../toolbar.js";
 import { showConfirmModal, showInfoModal } from "../modal.js";
 import { navigate } from "../router.js";
+import { projectScope } from "../scopes.js";
+import * as Tags from "../tag_components.js";
 
 const app = document.getElementById("app");
 const bc = document.getElementById("breadcrumb");
@@ -15,6 +17,10 @@ export async function show() {
   state.folder = null;
   state.path = null;
   state.selected.clear();
+  // Keep project selection across accidental nav while edit mode is
+  // on; reset when exiting edit mode (done by toggleEditMode handler).
+  if (!state.editMode) state.projectSelected = new Set();
+  projectScope.setActiveFiltersLocal([]);
   state.sort = "recent";
   state.desc = true;
   state.search = "";
@@ -33,6 +39,9 @@ export async function show() {
     app.innerHTML = '<div class="loading">Loading...</div>';
     state.projectsCache = await api.projects();
   }
+  // Pull the global project-tag set + assignments so pills and the
+  // tag bar render from real data rather than an empty stub.
+  try { await projectScope.refresh(); } catch { /* best-effort */ }
   render();
   hydrateProjectStats(state.projectsCache);
   hydrateOverview();
@@ -79,19 +88,50 @@ export function render() {
   }
   items.sort(sortComparator());
 
+  // Project-tag filter (OR). Same semantics as convo-tag filtering.
+  const activeFilters = projectScope.getActiveFilters();
+  if (activeFilters.length) {
+    items = items.filter((p) => {
+      const assigned = projectScope.getAssignment(p.folder);
+      return assigned.some((t) => activeFilters.includes(t));
+    });
+  }
+
   const overviewHtml = renderOverviewBar();
+  const tagBarHtml = Tags.renderTagBar(projectScope, {
+    editMode: state.editMode,
+    label: "Project tags",
+  });
   const totalSize = items.reduce((s, p) => s + (p.total_size_kb || 0), 0);
+
+  // Bulk-tag action bar — inlined into the tag-bar row in edit mode
+  // so "N selected / Tag N / Clear" sits on the right of the same
+  // line as the tag pills, instead of stacking on its own line.
+  const selN = state.projectSelected ? state.projectSelected.size : 0;
+  const bulkHtml = (state.editMode && selN > 0)
+    ? `<div class="tag-bar-bulk"><span class="tag-bar-sel-count">${selN} selected</span>
+         <button class="btn btn-sm" data-scope="projects" data-action="open-tag-assign-popup" title="Apply a tag to selected projects">Tag ${selN} selected</button>
+         <button class="btn btn-sm" data-action="clear-project-selection">Clear</button>
+       </div>`
+    : "";
+
+  // When the tag-bar has content, wrap both in a flex row; otherwise
+  // fall back to just the bulk bar (edge case: edit mode on but render
+  // happened before tags hydrated).
+  const tagRowHtml = tagBarHtml
+    ? (bulkHtml ? `<div class="tag-row">${tagBarHtml}${bulkHtml}</div>` : tagBarHtml)
+    : bulkHtml;
 
   if (!items.length) {
     const empty = state.mode === "archived"
       ? "No archived projects"
       : "No projects found";
-    app.innerHTML = overviewHtml + `<div class="empty-state">${empty}</div>`;
+    app.innerHTML = overviewHtml + tagRowHtml + `<div class="empty-state">${empty}</div>`;
     return;
   }
 
   const grid = state.viewMode === "list" ? renderTable(items, totalSize) : renderCards(items, totalSize);
-  app.innerHTML = overviewHtml + grid;
+  app.innerHTML = overviewHtml + tagRowHtml + grid;
 }
 
 export function renderOverviewBar() {
@@ -132,7 +172,7 @@ export function renderOverviewBar() {
     <label class="filter-toggle" title="${title}">
       <input type="checkbox" data-action="toggle-filter" data-filter="${k}" ${f[k] ? "checked" : ""}>
       ${label}
-    </label>`;
+    </span>`;
   const filterToggles = `<div class="filter-toggles">
     ${tog("active",   "active",   "Include live conversations")}
     ${tog("archived", "archived", "Include archived conversations + their stats")}
@@ -160,7 +200,13 @@ export function renderOverviewBar() {
 
 function renderTable(items, totalSize) {
   const pct = (kb) => totalSize > 0 ? `${(kb / totalSize * 100).toFixed(1)}%` : "";
+  // Header "select all" checkbox reflects current selection: checked
+  // iff every visible project is in `projectSelected`, else unchecked.
+  const allSel = items.length > 0
+    && state.projectSelected
+    && items.every((p) => state.projectSelected.has(p.folder));
   let h = '<div class="tbl-wrap"><table class="tbl"><thead><tr>';
+  h += `<th class="col-check"><input type="checkbox" style="accent-color:var(--accent)" ${allSel ? "checked" : ""} data-action="toggle-all-projects"></th>`;
   h += `<th data-action="sort-projects" data-col="name">Project${arrow(state, "name")}</th>`;
   h += `<th data-action="sort-projects" data-col="convos" style="text-align:right">Convos${arrow(state, "convos")}</th>`;
   h += `<th data-action="sort-projects" data-col="size" style="text-align:right">Size${arrow(state, "size")}</th>`;
@@ -169,10 +215,14 @@ function renderTable(items, totalSize) {
 
   for (const p of items) {
     const sp = shortPath(p.path);
+    const selected = state.projectSelected && state.projectSelected.has(p.folder);
+    const ck = selected ? "checked" : "";
+    const tagPills = Tags.renderTagPills(projectScope, p.folder);
     h += `
       <tr data-action="open-project" data-folder="${escAttr(p.folder)}" data-path="${escAttr(p.path)}">
+        <td class="col-check"><span class="check-hit" data-action="toggle-project-sel" data-folder="${escAttr(p.folder)}"><input type="checkbox" class="item-check" ${ck} tabindex="-1"></span></td>
         <td>
-          <div style="font-weight:600;color:var(--heading);font-size:13px">${esc(sp)}</div>
+          <div style="font-weight:600;color:var(--heading);font-size:13px">${esc(sp)}${tagPills ? " " + tagPills : ""}</div>
           <div style="font-size:11px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px">${esc(p.latest_preview)}</div>
         </td>
         <td class="col-count">${p.conversation_count}</td>
@@ -201,10 +251,17 @@ function renderCards(items, totalSize) {
     const archBadge = p.archived_count
       ? `<span class="badge${state.filters.archived ? "" : " badge-muted"}">${p.archived_count} archived</span>`
       : "";
+    const selected = state.projectSelected && state.projectSelected.has(p.folder);
+    const ck = selected ? "checked" : "";
+    const tagPills = Tags.renderTagPills(projectScope, p.folder);
     h += `
       <div class="card" data-action="open-project" data-folder="${escAttr(p.folder)}" data-path="${escAttr(p.path)}">
         <div class="card-title">${esc(sp)}</div>
-        <div class="card-preview">${esc(p.latest_preview)}</div>
+        ${tagPills ? `<div class="card-tagpills">${tagPills}</div>` : ""}
+        <div style="display:flex;align-items:start;gap:8px">
+          <span class="check-hit" data-action="toggle-project-sel" data-folder="${escAttr(p.folder)}"><input type="checkbox" class="item-check" ${ck} tabindex="-1"></span>
+          <div class="card-preview" style="flex:1">${esc(p.latest_preview)}</div>
+        </div>
         <div class="card-stats">${statsInner}</div>
         <div class="card-footer">
           <span class="badge">${p.conversation_count} convos</span>

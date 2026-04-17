@@ -1,6 +1,6 @@
 // App entry point. Wires up routing, theme, and the delegated click handler.
 
-import { state, setTheme, setFilter, setMode, setPreviewEnabled } from "./state.js";
+import { state, setTheme, setFilter, setMode, setPreviewEnabled, persistSelections, restoreSelections } from "./state.js";
 import { defineRoute, initRouter, navigate } from "./router.js";
 import { api } from "./api.js";
 import { updateEditButton } from "./toolbar.js";
@@ -8,6 +8,19 @@ import { updateEditButton } from "./toolbar.js";
 import * as Projects from "./views/projects.js";
 import * as Conversations from "./views/conversations.js";
 import * as Messages from "./views/messages.js";
+import * as Tags from "./tag_components.js";
+import { convoScope, projectScope, scopeFor } from "./scopes.js";
+
+// Bind each scope's onChange to its owning view's render. Has to
+// happen after the view imports so the functions exist.
+convoScope.onChange = () => {
+  if (state.view === "conversations") Conversations.render();
+  else if (state.view === "messages") Messages.renderBreadcrumb();
+};
+projectScope.onChange = () => {
+  if (state.view === "projects") Projects.render();
+  else if (state.view === "conversations") Conversations.renderBreadcrumb();
+};
 
 // --- Theme ---
 
@@ -16,6 +29,21 @@ function applyTheme() {
   document.getElementById("theme-toggle").textContent = state.theme === "dark" ? "Light" : "Dark";
 }
 applyTheme();
+
+// Rehydrate edit mode + selections from localStorage so a hard reload
+// while editing doesn't wipe progress. Views' show() handlers decide
+// whether to keep or discard the restored selection based on folder.
+const _restored = restoreSelections();
+if (_restored) {
+  if (_restored.editMode) {
+    state.editMode = true;
+    document.body.classList.add("edit-mode");
+  }
+  if (Array.isArray(_restored.selected)) state.selected = new Set(_restored.selected);
+  if (Array.isArray(_restored.projectSelected)) state.projectSelected = new Set(_restored.projectSelected);
+  if (_restored.folder) state._restoredFolder = _restored.folder;
+}
+
 function applyMode() {
   const sel = document.getElementById("mode-select");
   if (sel) sel.value = state.mode;
@@ -28,17 +56,20 @@ applyMode();
 function toggleEditMode() {
   state.editMode = !state.editMode;
   document.body.classList.toggle("edit-mode", state.editMode);
+  persistSelections();
   const btn = document.getElementById("edit-toggle");
   btn.textContent = state.editMode ? "Done" : "Edit";
   btn.classList.toggle("active", state.editMode);
   if (!state.editMode) {
     state.msgSelected.clear();
     state.selected.clear();
+    if (state.projectSelected) state.projectSelected.clear();
   }
   // Refresh header-button visibility (download-raw-convo is gated on edit mode).
   updateEditButton();
   if (state.view === "messages") Messages.render();
   else if (state.view === "conversations") Conversations.render();
+  else if (state.view === "projects") Projects.render();
 }
 
 // --- Routes ---
@@ -95,6 +126,35 @@ const actions = {
   // Projects view
   "sort-projects":    (_e, el) => Projects.sortBy(el.dataset.col),
   "delete-project":   (_e, el) => Projects.deleteProject(el.dataset.folder, el.dataset.name),
+  "toggle-project-sel": (e, el) => {
+    e.stopPropagation();
+    const f = el.dataset.folder;
+    if (!state.projectSelected) state.projectSelected = new Set();
+    if (state.projectSelected.has(f)) state.projectSelected.delete(f);
+    else state.projectSelected.add(f);
+    persistSelections();
+    Projects.render();
+  },
+  "toggle-all-projects": (_e) => {
+    // Partial → full, full → clear. Operates only on currently-visible
+    // projects (what the user can actually see) so filters/search are
+    // respected — otherwise a "select all" click would quietly also
+    // grab projects the filter is hiding.
+    if (!state.projectSelected) state.projectSelected = new Set();
+    const visible = Array.from(
+      document.querySelectorAll('[data-action="toggle-project-sel"]')
+    ).map((el) => el.dataset.folder);
+    const allSelected = visible.length > 0 && visible.every((f) => state.projectSelected.has(f));
+    if (allSelected) for (const f of visible) state.projectSelected.delete(f);
+    else for (const f of visible) state.projectSelected.add(f);
+    persistSelections();
+    Projects.render();
+  },
+  "clear-project-selection": (_e) => {
+    if (state.projectSelected) state.projectSelected.clear();
+    persistSelections();
+    Projects.render();
+  },
   "set-overview-range":(e)     => Projects.setOverviewRange(e.target.value),
   "overview-nav-prev":()       => Projects.navOverview(-1),
   "overview-nav-next":()       => Projects.navOverview(+1),
@@ -119,7 +179,7 @@ const actions = {
   // Conversations view
   "sort-convos":      (_e, el) => Conversations.sortBy(el.dataset.col),
   "toggle-convo-sel": (_e, el) => Conversations.toggleSel(el.dataset.id),
-  "toggle-all-convos":(e)      => Conversations.toggleAll(e.target.checked),
+  "toggle-all-convos":(_e)     => Conversations.toggleAll(),
   "delete-convo":     (_e, el) => Conversations.deleteConvo(el.dataset.id),
   "duplicate-convo":  (_e, el) => Conversations.duplicateConvo(el.dataset.id),
   "archive-convo":    (_e, el) => Conversations.archiveConvo(el.dataset.id),
@@ -155,6 +215,8 @@ const actions = {
   "bulk-transform":   (_e, el) => Messages.bulkTransform(el.dataset.kind || "scrub"),
   "open-bulk-transform-menu": (_e, el) => Messages.openBulkTransformMenu(el),
   "toggle-all-msgs":  (_e, el) => Messages.toggleAllMsgs(),
+  "open-select-scope-menu": (_e, el) => Messages.openSelectScopeMenu(el),
+  "select-scope":     (_e, el) => Messages.selectByScope(el.dataset.scope),
 
   "open-word-lists":  ()       => Messages.openWordListsModal(),
   "toggle-preview":   (_e, el) => {
@@ -217,13 +279,15 @@ const actions = {
     if (state.view === "projects") Projects.setMode(mode);
     else if (state.view === "conversations") Conversations.setMode(mode);
   },
+  "toggle-preview-position": () => Conversations.togglePreview(),
 
   // Tags (conversations view)
-  "toggle-tag-filter":      (e, el) => { e.stopPropagation(); Conversations.toggleTagFilter(parseInt(el.dataset.tag)); },
-  "rename-tag-start":       (e, el) => { e.stopPropagation(); Conversations.renameTag(parseInt(el.dataset.tag)); },
-  "open-tag-assign-popup":  (e, el) => { e.stopPropagation(); Conversations.openTagAssignPopup(el); },
-  "apply-existing-tag":     (e, el) => { e.stopPropagation(); Conversations.applyExistingTag(parseInt(el.dataset.tag)); },
-  "create-and-assign-tag":  (e, el) => { e.stopPropagation(); Conversations.createAndAssignTag(parseInt(el.dataset.slot)); },
+  "toggle-tag-filter":      (e, el) => { e.stopPropagation(); Tags.toggleTagFilter(scopeFor(el), parseInt(el.dataset.tag)); },
+  "rename-tag-start":       (e, el) => { e.stopPropagation(); Tags.renameTag(scopeFor(el), parseInt(el.dataset.tag)); },
+  "add-new-tag":            (e, el) => { e.stopPropagation(); Tags.addNewTag(scopeFor(el)); },
+  "open-tag-assign-popup":  (e, el) => { e.stopPropagation(); Tags.openTagAssignPopup(scopeFor(el), el); },
+  "apply-existing-tag":     (e, el) => { e.stopPropagation(); Tags.applyExistingTag(parseInt(el.dataset.tag)); },
+  "create-and-assign-tag":  (e)     => { e.stopPropagation(); Tags.createAndAssignTag(); },
 
   // Smart-select
   "smart-select":      (e, el)  => { e.stopPropagation(); Conversations.toggleSmartSelect(el.dataset.preset); },
@@ -233,6 +297,29 @@ const actions = {
   "remove-convo-tag":  (e, el)  => { e.stopPropagation(); Messages.removeConvoTag(parseInt(el.dataset.tag)); },
   "open-tag-picker":   (e, el)  => { e.stopPropagation(); Messages.openTagPicker(el); },
   "pick-convo-tag":    (e, el)  => { e.stopPropagation(); Messages.pickConvoTag(parseInt(el.dataset.tag)); },
+  "open-convo-tag-popup": (e, el) => {
+    e.stopPropagation();
+    if (!state.convoId) return;
+    Tags.openTagAssignPopup(convoScope, el, {
+      ids: [state.convoId],
+      poolLabel: "this convo",
+      onDone: () => Messages.renderBreadcrumb(),
+    });
+  },
+  "open-project-tag-popup": (e, el) => {
+    e.stopPropagation();
+    if (!state.folder) return;
+    Tags.openTagAssignPopup(projectScope, el, {
+      ids: [state.folder],
+      poolLabel: "this project",
+      onDone: () => Conversations.renderBreadcrumb(),
+    });
+  },
+  "remove-project-tag": (e, el) => {
+    e.stopPropagation();
+    if (!state.folder) return;
+    Tags.toggleKeyTag(projectScope, state.folder, parseInt(el.dataset.tag));
+  },
 };
 
 // <select> and radio/checkbox inputs fire `change`, not `click` — delegate

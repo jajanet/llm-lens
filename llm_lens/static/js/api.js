@@ -172,4 +172,29 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ids, tag, add }),
     }),
+
+  // ── Project-tag namespace (global: one set of labels, keyed by folder) ──
+
+  getProjectTags: () => json(`/api/tags/projects`),
+
+  setProjectTagLabels: (labels) =>
+    json(`/api/tags/projects/labels`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ labels }),
+    }),
+
+  assignProjectTags: (folder, tags) =>
+    json(`/api/tags/projects/assign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder, tags }),
+    }),
+
+  bulkAssignProjectTag: (folders, tag, add) =>
+    json(`/api/tags/projects/bulk-assign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folders, tag, add }),
+    }),
 };

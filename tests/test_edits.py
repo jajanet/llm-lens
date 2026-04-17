@@ -624,10 +624,13 @@ def test_edit_rejects_missing_text_field(client, tmp_path):
     assert resp.status_code == 400
 
 
-def test_edit_rejects_message_with_tool_use_block(client, tmp_path):
-    """A message carrying a tool_use block can't be edited — the block links
-    to a tool_result elsewhere; blanket-replacing the content array would
-    break the pairing."""
+def test_edit_allows_message_with_tool_use_block_and_tombstones_counts(client, tmp_path):
+    """Edit on non-prose messages is allowed — the tool_use block gets
+    collapsed to the new text, and the lost tool_uses count is tombstoned
+    into deleted_delta so stats totals survive the re-scan."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+
     path = tmp_path / "proj" / "s.jsonl"
     write_jsonl(path, [tool_use_msg("t1", None, tool_id="tu1", text="I'll look that up.")])
 
@@ -635,15 +638,25 @@ def test_edit_rejects_message_with_tool_use_block(client, tmp_path):
         "/api/projects/proj/conversations/s/messages/t1/edit",
         json={"text": "anything"},
     )
-    assert resp.status_code == 400
-    assert "prose-only" in resp.get_json()["error"]
+    assert resp.status_code == 200
 
-    # File unchanged — tool_use block still present.
+    # Content collapsed to a single text block.
     lines = read_jsonl(path)
-    assert lines[0]["message"]["content"][1]["type"] == "tool_use"
+    assert lines[0]["message"]["content"] == [{"type": "text", "text": "anything"}]
+
+    # Tombstone carries the lost tool_use count + messages_edited counter.
+    dd = llm_lens.peek_cache._store[str(path)]["deleted_delta"]
+    assert dd["tool_uses"] == {"Read": 1}
+    assert dd["messages_edited"] == 1
 
 
-def test_edit_rejects_message_with_tool_result_block(client, tmp_path):
+def test_edit_allows_message_with_tool_result_block(client, tmp_path):
+    """Tool_result blocks aren't counted in stats, so editing a tool_result-only
+    message collapses content but produces an empty stats diff (no tombstoned
+    stats) aside from the messages_edited counter."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+
     path = tmp_path / "proj" / "s.jsonl"
     write_jsonl(path, [tool_result_msg("r1", None, tool_id="tu1", text="result")])
 
@@ -651,13 +664,23 @@ def test_edit_rejects_message_with_tool_result_block(client, tmp_path):
         "/api/projects/proj/conversations/s/messages/r1/edit",
         json={"text": "anything"},
     )
-    assert resp.status_code == 400
-    assert "prose-only" in resp.get_json()["error"]
+    assert resp.status_code == 200
+    lines = read_jsonl(path)
+    assert lines[0]["message"]["content"] == [{"type": "text", "text": "anything"}]
+
+    dd = llm_lens.peek_cache._store[str(path)]["deleted_delta"]
+    assert dd["messages_edited"] == 1
+    # tool_results aren't counted in stats — diff should have no tool_uses etc.
+    assert "tool_uses" not in dd or not dd["tool_uses"]
 
 
-def test_edit_rejects_message_with_thinking_block(client, tmp_path):
-    """Thinking blocks carry signature metadata and aren't user-visible;
-    editing would strip them."""
+def test_edit_allows_message_with_thinking_block_and_tombstones(client, tmp_path):
+    """Editing a thinking-bearing assistant turn is allowed; the thinking_count
+    and thinking_output_tokens_estimate move to deleted_delta so modal stats
+    stay accurate."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+
     path = tmp_path / "proj" / "s.jsonl"
     thinking_msg = {
         "uuid": "th1",
@@ -665,6 +688,9 @@ def test_edit_rejects_message_with_thinking_block(client, tmp_path):
         "type": "assistant",
         "message": {
             "role": "assistant",
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 10, "output_tokens": 20,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
             "content": [
                 {"type": "text", "text": "answer"},
                 {"type": "thinking", "thinking": "let me reason", "signature": "sig"},
@@ -677,12 +703,172 @@ def test_edit_rejects_message_with_thinking_block(client, tmp_path):
         "/api/projects/proj/conversations/s/messages/th1/edit",
         json={"text": "new"},
     )
-    assert resp.status_code == 400
-    assert "prose-only" in resp.get_json()["error"]
+    assert resp.status_code == 200
 
-    # File unchanged.
+    # Thinking block is gone from content.
     lines = read_jsonl(path)
-    assert any(b.get("type") == "thinking" for b in lines[0]["message"]["content"])
+    assert not any(b.get("type") == "thinking" for b in lines[0]["message"]["content"])
+
+    dd = llm_lens.peek_cache._store[str(path)]["deleted_delta"]
+    assert dd["thinking_count"] == 1
+    assert dd["messages_edited"] == 1
+    # Tokens stay at 0 in delta because usage is preserved on the message.
+    assert "input_tokens" not in dd
+
+
+def test_edit_bash_tool_use_tombstones_command_breakdown(client, tmp_path):
+    """Editing over a Bash tool_use moves its command-name count and
+    per-command token slice into the tombstone, so the Bash command breakdown
+    in the stats modal survives the edit (both top-level and per_model)."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+
+    path = tmp_path / "proj" / "s.jsonl"
+    bash_msg = {
+        "uuid": "a1",
+        "parentUuid": None,
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 100, "output_tokens": 50,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            "content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "grep -rn foo ."}},
+                {"type": "text", "text": "looking"},
+            ],
+        },
+    }
+    write_jsonl(path, [bash_msg])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/a1/edit",
+        json={"text": "scrubbed"},
+    )
+    assert resp.status_code == 200
+
+    dd = llm_lens.peek_cache._store[str(path)]["deleted_delta"]
+    assert dd["tool_uses"] == {"Bash": 1}
+    assert dd["commands"] == {"grep": 1}
+    assert dd["per_model"]["claude-opus-4-7"]["commands"] == {"grep": 1}
+    assert dd["per_model"]["claude-opus-4-7"]["command_turn_tokens"]["grep"]["input_tokens"] > 0
+
+
+def test_edit_prose_only_produces_empty_stats_diff(client, tmp_path):
+    """A prose-only edit shouldn't tombstone stats fields (content shape
+    unchanged, usage preserved) — only the messages_edited counter bumps."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+
+    path = tmp_path / "proj" / "s.jsonl"
+    write_jsonl(path, [msg("u1", None, "original")])
+
+    resp = client.post(
+        "/api/projects/proj/conversations/s/messages/u1/edit",
+        json={"text": "rewritten"},
+    )
+    assert resp.status_code == 200
+
+    dd = llm_lens.peek_cache._store[str(path)]["deleted_delta"]
+    assert dd == {"messages_edited": 1}
+
+
+def test_delete_message_tombstones_full_per_message_stats(client, tmp_path):
+    """Per-message delete should tombstone the full stats of the removed
+    message (tokens, tool_uses, commands, thinking_count, per_model) plus
+    the messages_deleted counter."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+
+    path = tmp_path / "proj" / "s.jsonl"
+    bash_msg = {
+        "uuid": "a1",
+        "parentUuid": None,
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 40, "output_tokens": 20,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            "content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "ls -la"}},
+                {"type": "text", "text": "listing"},
+            ],
+        },
+    }
+    write_jsonl(path, [bash_msg])
+
+    resp = client.delete("/api/projects/proj/conversations/s/messages/a1")
+    assert resp.status_code == 200
+
+    dd = llm_lens.peek_cache._store[str(path)]["deleted_delta"]
+    assert dd["messages_deleted"] == 1
+    assert dd["input_tokens"] == 40
+    assert dd["output_tokens"] == 20
+    assert dd["tool_uses"] == {"Bash": 1}
+    assert dd["commands"] == {"ls": 1}
+    pm = dd["per_model"]["claude-opus-4-7"]
+    assert pm["tool_uses"] == {"Bash": 1}
+    assert pm["input_tokens"] == 40
+
+
+def test_edit_on_subagent_file_succeeds(client, tmp_path):
+    """api_edit_message must find messages that live in subagent run files
+    (<convo_id>/subagents/agent-*.jsonl), not just in the main convo file.
+    Regression: subagent-view edits used to return 404."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+
+    convo = "sess"
+    main = tmp_path / "proj" / f"{convo}.jsonl"
+    sub = tmp_path / "proj" / convo / "subagents" / "agent-x-abc.jsonl"
+    write_jsonl(main, [msg("m1", None, "hi")])
+    write_jsonl(sub, [msg("s1", None, "subagent text")])
+
+    resp = client.post(
+        f"/api/projects/proj/conversations/{convo}/messages/s1/edit",
+        json={"text": "edited in subagent"},
+    )
+    assert resp.status_code == 200
+
+    # Subagent file updated, main file untouched.
+    assert read_jsonl(sub)[0]["message"]["content"] == [{"type": "text", "text": "edited in subagent"}]
+    assert read_jsonl(main)[0]["uuid"] == "m1"
+
+
+def test_delete_on_subagent_file_succeeds(client, tmp_path):
+    """api_delete_message resolves subagent file paths the same way as edit."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+
+    convo = "sess"
+    main = tmp_path / "proj" / f"{convo}.jsonl"
+    sub = tmp_path / "proj" / convo / "subagents" / "agent-x-abc.jsonl"
+    write_jsonl(main, [msg("m1", None, "hi")])
+    write_jsonl(sub, [msg("s1", None, "subagent a"), msg("s2", "s1", "subagent b")])
+
+    resp = client.delete(f"/api/projects/proj/conversations/{convo}/messages/s2")
+    assert resp.status_code == 200
+
+    # s2 removed from subagent file; main file untouched.
+    uuids = [e["uuid"] for e in read_jsonl(sub)]
+    assert uuids == ["s1"]
+    assert read_jsonl(main)[0]["uuid"] == "m1"
+
+
+def test_edit_on_nonexistent_uuid_in_subagent_still_404(client, tmp_path):
+    """If the uuid isn't in the main file or any subagent file, 404."""
+    convo = "sess"
+    main = tmp_path / "proj" / f"{convo}.jsonl"
+    sub = tmp_path / "proj" / convo / "subagents" / "agent-x-abc.jsonl"
+    write_jsonl(main, [msg("m1", None, "hi")])
+    write_jsonl(sub, [msg("s1", None, "subagent")])
+
+    resp = client.post(
+        f"/api/projects/proj/conversations/{convo}/messages/ghost/edit",
+        json={"text": "x"},
+    )
+    assert resp.status_code == 404
 
 
 def test_edit_returns_404_for_missing_message(client, tmp_path):
@@ -744,3 +930,305 @@ def test_edit_on_string_content_keeps_string_shape(client, tmp_path):
 
     lines = read_jsonl(path)
     assert lines[0]["message"]["content"] == "replaced"
+
+
+
+def test_delete_conversation_tombstones_all_live_stats(client, tmp_path):
+    """Whole-file delete stores the file's full live stats (tokens, tool_uses,
+    commands, per_model, thinking_count, etc) in deleted_delta so totals
+    survive in aggregation even after the JSONL is gone."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+
+    path = tmp_path / "proj" / "g.jsonl"
+    write_jsonl(path, [
+        {"uuid": "a1", "type": "assistant", "message": {
+            "role": "assistant", "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 80, "output_tokens": 40,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            "content": [
+                {"type": "thinking", "thinking": "t"},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "grep x"}},
+                {"type": "text", "text": "done"},
+            ]}},
+    ])
+
+    resp = client.delete("/api/projects/proj/conversations/g")
+    assert resp.status_code == 200
+    assert not path.exists()
+
+    dd = llm_lens.peek_cache._store[str(path)]["deleted_delta"]
+    assert dd["input_tokens"] == 80
+    assert dd["output_tokens"] == 40
+    assert dd["tool_uses"] == {"Bash": 1}
+    assert dd["commands"] == {"grep": 1}
+    assert dd["thinking_count"] == 1
+    assert dd["per_model"]["claude-opus-4-7"]["tool_uses"] == {"Bash": 1}
+
+
+def test_overview_deleted_delta_surfaces_tombstoned_fields(client, tmp_path):
+    """api_overview's totals.deleted_delta must carry every field the
+    unified schema covers (commands, per_model, messages_edited, etc) so
+    tombstones written by edit/delete show up under the 'Deleted' filter."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+
+    path = tmp_path / "proj" / "ov.jsonl"
+    write_jsonl(path, [
+        {"uuid": "a1", "type": "assistant", "message": {
+            "role": "assistant", "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 30, "output_tokens": 10,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            "content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "ls -la"}},
+                {"type": "text", "text": "x"},
+            ]}},
+    ])
+    resp = client.post(
+        "/api/projects/proj/conversations/ov/messages/a1/edit",
+        json={"text": "edited"},
+    )
+    assert resp.status_code == 200
+
+    r = client.get("/api/overview?folder=proj&range=all")
+    assert r.status_code == 200
+    dd = r.get_json()["totals"]["deleted_delta"]
+    assert dd["tool_uses"] == {"Bash": 1}
+    assert dd["commands"] == {"ls": 1}
+    assert dd["messages_edited"] == 1
+    assert dd["per_model"]["claude-opus-4-7"]["commands"] == {"ls": 1}
+
+
+
+# ---------------------------------------------------------------------------
+# Preview extraction (first + last user message) — edge cases
+# ---------------------------------------------------------------------------
+
+def test_preview_handles_string_content(tmp_path):
+    import llm_lens
+    llm_lens._peek_jsonl_cached.cache_clear()
+    path = tmp_path / "proj" / "c.jsonl"
+    path.parent.mkdir(parents=True)
+    with open(path, "w") as f:
+        f.write(json.dumps({"uuid":"u1","type":"user","message":{"role":"user","content":"hi there"}})+"\n")
+    stat = path.stat()
+    r = llm_lens._peek_jsonl_cached(str(path), stat.st_mtime, stat.st_size)
+    assert r["preview"] == "hi there"
+    assert r["last_preview"] == "hi there"
+
+
+def test_preview_handles_list_content(tmp_path):
+    """Regression: list-shape content (what _replace_content writes after an
+    edit) used to fall through to \"(empty)\" because the old check was
+    `isinstance(content, str)` only."""
+    import llm_lens
+    llm_lens._peek_jsonl_cached.cache_clear()
+    path = tmp_path / "proj" / "c.jsonl"
+    path.parent.mkdir(parents=True)
+    entry = {"uuid":"u1","type":"user",
+             "message":{"role":"user","content":[{"type":"text","text":"listy hi"}]}}
+    with open(path, "w") as f:
+        f.write(json.dumps(entry)+"\n")
+    stat = path.stat()
+    r = llm_lens._peek_jsonl_cached(str(path), stat.st_mtime, stat.st_size)
+    assert r["preview"] == "listy hi"
+    assert r["last_preview"] == "listy hi"
+
+
+def test_preview_skips_tool_result_only_user_messages(tmp_path):
+    """A user message whose content is only a tool_result block shouldn't
+    leak as the preview — it's not human prose. Should fall through to the
+    next user message with actual text."""
+    import llm_lens
+    llm_lens._peek_jsonl_cached.cache_clear()
+    path = tmp_path / "proj" / "c.jsonl"
+    path.parent.mkdir(parents=True)
+    with open(path, "w") as f:
+        f.write(json.dumps({"uuid":"u0","type":"user","message":{"role":"user",
+                "content":[{"type":"tool_result","tool_use_id":"x","content":"stdout"}]}})+"\n")
+        f.write(json.dumps({"uuid":"u1","type":"user","message":{"role":"user",
+                "content":"real first prompt"}})+"\n")
+        f.write(json.dumps({"uuid":"u2","type":"user","message":{"role":"user",
+                "content":"real last prompt"}})+"\n")
+        f.write(json.dumps({"uuid":"u3","type":"user","message":{"role":"user",
+                "content":[{"type":"tool_result","tool_use_id":"y","content":"more stdout"}]}})+"\n")
+    stat = path.stat()
+    r = llm_lens._peek_jsonl_cached(str(path), stat.st_mtime, stat.st_size)
+    assert r["preview"] == "real first prompt"
+    # Last user preview should skip the trailing tool_result-only message.
+    assert r["last_preview"] == "real last prompt"
+
+
+def test_preview_skips_assistant_tool_use(tmp_path):
+    """Assistant turns (even those containing tool_use) are not user messages
+    and never appear in preview."""
+    import llm_lens
+    llm_lens._peek_jsonl_cached.cache_clear()
+    path = tmp_path / "proj" / "c.jsonl"
+    path.parent.mkdir(parents=True)
+    with open(path, "w") as f:
+        f.write(json.dumps({"uuid":"a1","type":"assistant","message":{"role":"assistant",
+                "content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}})+"\n")
+        f.write(json.dumps({"uuid":"u1","type":"user","message":{"role":"user",
+                "content":"actual user prompt"}})+"\n")
+    stat = path.stat()
+    r = llm_lens._peek_jsonl_cached(str(path), stat.st_mtime, stat.st_size)
+    assert r["preview"] == "actual user prompt"
+    assert r["last_preview"] == "actual user prompt"
+
+
+def test_preview_handles_mixed_text_and_tool_result(tmp_path):
+    """Content with both a text block AND a tool_result should extract only
+    the text portion."""
+    import llm_lens
+    llm_lens._peek_jsonl_cached.cache_clear()
+    path = tmp_path / "proj" / "c.jsonl"
+    path.parent.mkdir(parents=True)
+    entry = {"uuid":"u1","type":"user","message":{"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"x","content":"ignore me"},
+        {"type":"text","text":"visible part"},
+    ]}}
+    with open(path, "w") as f:
+        f.write(json.dumps(entry)+"\n")
+    stat = path.stat()
+    r = llm_lens._peek_jsonl_cached(str(path), stat.st_mtime, stat.st_size)
+    assert r["preview"] == "visible part"
+    assert r["last_preview"] == "visible part"
+
+
+def test_preview_empty_when_no_user_messages(tmp_path):
+    import llm_lens
+    llm_lens._peek_jsonl_cached.cache_clear()
+    path = tmp_path / "proj" / "c.jsonl"
+    path.parent.mkdir(parents=True)
+    with open(path, "w") as f:
+        f.write(json.dumps({"uuid":"a1","type":"assistant","message":{"role":"assistant",
+                "content":[{"type":"text","text":"hi"}]}})+"\n")
+    stat = path.stat()
+    r = llm_lens._peek_jsonl_cached(str(path), stat.st_mtime, stat.st_size)
+    assert r["preview"] == "(empty)"
+    assert r["last_preview"] == "(empty)"
+
+
+def test_preview_last_differs_from_first_after_multiple_user_msgs(tmp_path):
+    """In multi-turn convos, first_preview = opening prompt, last_preview =
+    most recent user turn. UI toggles between them."""
+    import llm_lens
+    llm_lens._peek_jsonl_cached.cache_clear()
+    path = tmp_path / "proj" / "c.jsonl"
+    path.parent.mkdir(parents=True)
+    with open(path, "w") as f:
+        f.write(json.dumps({"uuid":"u1","type":"user","message":{"role":"user","content":"opener"}})+"\n")
+        f.write(json.dumps({"uuid":"a1","type":"assistant","message":{"role":"assistant",
+                "content":[{"type":"text","text":"ack"}]}})+"\n")
+        f.write(json.dumps({"uuid":"u2","type":"user","message":{"role":"user","content":"middle"}})+"\n")
+        f.write(json.dumps({"uuid":"a2","type":"assistant","message":{"role":"assistant",
+                "content":[{"type":"text","text":"ok"}]}})+"\n")
+        f.write(json.dumps({"uuid":"u3","type":"user","message":{"role":"user","content":"closer"}})+"\n")
+    stat = path.stat()
+    r = llm_lens._peek_jsonl_cached(str(path), stat.st_mtime, stat.st_size)
+    assert r["preview"] == "opener"
+    assert r["last_preview"] == "closer"
+
+
+def test_preview_last_works_on_large_file_via_tail(tmp_path):
+    """_tail_user_preview reads only the last ~64KB. A very long file with a
+    real closing message well before its end should still return that text
+    as long as it's in the tail window."""
+    import llm_lens
+    llm_lens._peek_jsonl_cached.cache_clear()
+    path = tmp_path / "proj" / "c.jsonl"
+    path.parent.mkdir(parents=True)
+    with open(path, "w") as f:
+        f.write(json.dumps({"uuid":"u1","type":"user","message":{"role":"user","content":"opener"}})+"\n")
+        # Pile on many assistant turns to push past trivial sizes
+        for i in range(50):
+            f.write(json.dumps({"uuid":f"a{i}","type":"assistant","message":{"role":"assistant",
+                    "content":[{"type":"text","text":"x" * 200}]}})+"\n")
+        f.write(json.dumps({"uuid":"ulast","type":"user","message":{"role":"user","content":"closer"}})+"\n")
+    stat = path.stat()
+    r = llm_lens._peek_jsonl_cached(str(path), stat.st_mtime, stat.st_size)
+    assert r["preview"] == "opener"
+    assert r["last_preview"] == "closer"
+
+
+def test_preview_survives_edit_of_first_user_message(client, tmp_path):
+    """Concrete regression: edit the first user message. The preview should
+    now show the edited text (not \"(empty)\", which was the old bug when
+    list-shape content was introduced by _replace_content)."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+    llm_lens._peek_jsonl_cached.cache_clear()
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [msg("u1", None, "original opening")])
+
+    r = client.post(
+        "/api/projects/proj/conversations/c/messages/u1/edit",
+        json={"text": "replaced opening"},
+    )
+    assert r.status_code == 200
+
+    r2 = client.get("/api/projects/proj/conversations").get_json()
+    items = r2["items"]
+    assert len(items) == 1
+    assert items[0]["preview"] == "replaced opening"
+    assert items[0]["last_preview"] == "replaced opening"
+
+
+
+def test_preview_last_falls_back_to_first_when_tail_cant_find(tmp_path, monkeypatch):
+    """When the tail reader can't locate a user message (very-long-file
+    pathology, or the tail window is all assistant / tool_result), the
+    returned `last_preview` falls back to `preview` rather than "(empty)".
+    This keeps the UI from showing empty strings for real convos just
+    because the last user turn lives beyond the tail read window."""
+    import llm_lens
+    llm_lens._peek_jsonl_cached.cache_clear()
+    # Force the tail reader to miss.
+    monkeypatch.setattr(llm_lens, "_tail_user_preview", lambda fp: None)
+    path = tmp_path / "proj" / "c.jsonl"
+    path.parent.mkdir(parents=True)
+    with open(path, "w") as f:
+        f.write(json.dumps({"uuid":"u1","type":"user","message":{"role":"user","content":"first only"}})+"\n")
+    stat = path.stat()
+    r = llm_lens._peek_jsonl_cached(str(path), stat.st_mtime, stat.st_size)
+    assert r["preview"] == "first only"
+    assert r["last_preview"] == "first only"
+
+
+def test_preview_both_empty_only_when_no_user_content(tmp_path):
+    """Both preview and last_preview stay "(empty)" only when a file has
+    no user messages at all (e.g. a file with just agent-setting / system
+    entries). Distinct signal for the UI so it can render accordingly."""
+    import llm_lens
+    llm_lens._peek_jsonl_cached.cache_clear()
+    path = tmp_path / "proj" / "c.jsonl"
+    path.parent.mkdir(parents=True)
+    with open(path, "w") as f:
+        f.write(json.dumps({"type":"agent-setting","agentSetting":"fixer","sessionId":"c"})+"\n")
+        f.write(json.dumps({"type":"system","subtype":"informational","content":"x"})+"\n")
+    stat = path.stat()
+    r = llm_lens._peek_jsonl_cached(str(path), stat.st_mtime, stat.st_size)
+    assert r["preview"] == "(empty)"
+    assert r["last_preview"] == "(empty)"
+
+
+def test_preview_after_delete_of_last_user_message(client, tmp_path):
+    """End-to-end: deleting the last user message should update last_preview
+    to whatever the new last user message is (fallback to first if single-turn)."""
+    import llm_lens
+    llm_lens.peek_cache._store.clear()
+    llm_lens._peek_jsonl_cached.cache_clear()
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [
+        msg("u1", None, "opening"),
+        msg("u2", "u1", "closing"),
+    ])
+
+    assert client.delete("/api/projects/proj/conversations/c/messages/u2").status_code == 200
+
+    r = client.get("/api/projects/proj/conversations").get_json()
+    item = r["items"][0]
+    assert item["preview"] == "opening"
+    # Only u1 remains — last should equal first (fallback path or direct match).
+    assert item["last_preview"] == "opening"

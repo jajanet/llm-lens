@@ -328,8 +328,11 @@ def test_preview_modal_has_skip_checkbox(preview_js):
     assert 'data-preview-skip' in preview_js
     assert 'type="checkbox"' in preview_js
 
-def test_preview_modal_has_apply_all_and_apply_selected(preview_js):
-    assert "data-preview-apply-all" in preview_js
+def test_preview_modal_has_select_all_and_apply_selected(preview_js):
+    # Apply all is gone; users click Select all (dynamic toggle) then Apply
+    # selected, matching the edit-convo pattern.
+    assert "data-preview-apply-all" not in preview_js
+    assert "data-preview-select-all" in preview_js
     assert "data-preview-apply-selected" in preview_js
     assert "data-preview-cancel" in preview_js
 
@@ -531,3 +534,322 @@ def test_transforms_exports_collapse_punct_repeats(transforms_js):
 
 def test_ensure_word_lists_fallback_includes_collapse_punct_repeats(messages_js):
     assert "collapse_punct_repeats: false" in messages_js or 'collapse_punct_repeats":false' in messages_js
+
+
+# Tag palette: the backend's NUM_COLORS is 8, so the CSS must define all
+# eight `.tag-color-N` classes plus `--tag-cN-bg` vars for both the
+# default (dark) theme block and the `body.light` override. If these go
+# out of sync with NUM_COLORS, the UI renders some tags with no color.
+def test_css_defines_eight_tag_colors_in_both_themes():
+    css = CSS.read_text()
+    for i in range(8):
+        assert f".tag-color-{i}" in css, f"missing .tag-color-{i}"
+        assert f"--tag-c{i}-bg" in css, f"missing --tag-c{i}-bg var"
+
+    import re
+    root_block = re.search(r":root\s*\{([^}]*)\}", css, re.DOTALL)
+    light_block = re.search(r"body\.light\s*\{([^}]*)\}", css, re.DOTALL)
+    assert root_block and light_block
+    for i in range(8):
+        assert f"--tag-c{i}-bg" in root_block.group(1), f":root missing --tag-c{i}-bg"
+        assert f"--tag-c{i}-bg" in light_block.group(1), f"body.light missing --tag-c{i}-bg"
+
+
+
+def test_preview_toggle_is_edit_mode_gated(convos_js):
+    """The preview-position toggle button should only render when
+    state.editMode is true — it's a curation-mode control, not always-on."""
+    # Find the button emit and confirm it's inside an `if (state.editMode)` block.
+    assert 'data-action="toggle-preview-position"' in convos_js
+    # Naive structural check: the button line must be preceded by an editMode
+    # guard within a reasonable window above.
+    idx = convos_js.index('data-action="toggle-preview-position"')
+    preceding = convos_js[max(0, idx - 800):idx]
+    assert "state.editMode" in preceding, (
+        "preview-position button should be gated by state.editMode"
+    )
+
+
+def test_preview_toggle_uses_full_word_message_not_msg(convos_js):
+    """Button label spells out 'message' — user preference."""
+    assert "Show first message" in convos_js
+    assert "Show last message" in convos_js
+    # And the abbreviated form is not shipped.
+    assert "First msg" not in convos_js
+    assert "Last msg" not in convos_js
+
+
+def test_preview_toggle_has_separator_before_view_mode_buttons(convos_js):
+    """A visual separator (vertical rule) sits between the preview toggle
+    and the list/grid view-mode group so they read as distinct clusters."""
+    # Find the list view-mode button; the separator should be just above it.
+    list_btn_idx = convos_js.index('data-mode="list"')
+    preceding = convos_js[max(0, list_btn_idx - 400):list_btn_idx]
+    assert "border-left" in preceding or "border-right" in preceding or "background:var(--border)" in preceding, (
+        "expected a visual separator (border/background) right before the view-mode buttons"
+    )
+
+
+
+def test_bulk_delete_injects_non_prose_warning(messages_js):
+    """deleteSelected() uses `_countNonProseIn` + `_nonProseWarningBlock` so
+    selecting any non-prose messages shows a warning in the confirm modal."""
+    assert "_countNonProseIn" in messages_js
+    assert "_nonProseWarningBlock" in messages_js
+    # deleteSelected must invoke both when building its confirm body.
+    del_start = messages_js.index("export function deleteSelected")
+    del_body = messages_js[del_start:del_start + 2000]
+    assert "_countNonProseIn(uuids)" in del_body
+    assert "_nonProseWarningBlock" in del_body
+
+
+def test_bulk_transform_confirm_mentions_non_prose_only_when_present(messages_js):
+    """bulkTransform's confirm path conditionally appends a non-prose note
+    based on `_countNonProseIn` — no more always-on noisy warning for
+    prose-only selections."""
+    bt_start = messages_js.index("export async function bulkTransform")
+    bt_body = messages_js[bt_start:bt_start + 3000]
+    assert "_countNonProseIn(ids)" in bt_body
+    # The old always-on phrasing should be gone.
+    assert "non-prose messages (with tool_use / thinking blocks) will have" not in bt_body
+
+
+def test_non_prose_helper_reads_backend_flags(messages_js):
+    """_isNonProseMsg consults the backend-provided has_tool_use /
+    has_thinking booleans — not a brittle re-parse of flattened content."""
+    assert "has_tool_use" in messages_js
+    assert "has_thinking" in messages_js
+    idx = messages_js.index("function _isNonProseMsg")
+    body = messages_js[idx:idx + 200]
+    assert "has_tool_use" in body and "has_thinking" in body
+
+
+
+def test_preview_modal_banner_is_collapsible_details_element():
+    """Non-prose banner in the preview modal uses <details>/<summary> so
+    it can be collapsed — avoids dominating the diff panel when most rows
+    are prose-only."""
+    p = read(ROOT / "llm_lens" / "static" / "js" / "preview.js")
+    assert 'preview-nonprose-banner' in p
+    idx = p.index('preview-nonprose-banner')
+    body = p[max(0, idx - 100):idx + 1000]
+    assert "<details" in body
+    assert "<summary" in body
+
+
+def test_preview_rows_mark_non_prose_with_warning_glyph():
+    """Per-row ⚠ marker on non-prose preview rows so user can see which
+    ones will lose structural content before applying."""
+    p = read(ROOT / "llm_lens" / "static" / "js" / "preview.js")
+    assert 'preview-nonprose-mark' in p
+    assert "row.nonProse" in p
+
+
+def test_bulk_transform_forwards_flags_to_preview_modal():
+    """bulkTransform must include has_tool_use/has_thinking on each
+    candidate — otherwise the preview modal can't flag non-prose rows."""
+    m = read(ROOT / "llm_lens" / "static" / "js" / "views" / "messages.js")
+    bt_start = m.index("export async function bulkTransform")
+    bt_body = m[bt_start:bt_start + 3000]
+    assert "has_tool_use: !!m.has_tool_use" in bt_body
+    assert "has_thinking: !!m.has_thinking" in bt_body
+
+
+
+def test_preview_banner_hides_when_all_non_prose_unchecked():
+    """Static invariant: updateNetDelta hides the non-prose banner when no
+    currently-checked rows are non-prose. Unchecking every non-prose row
+    in the preview makes the warning go away (nothing destructive left)."""
+    p = read(ROOT / "llm_lens" / "static" / "js" / "preview.js")
+    # The tracker set must be built
+    assert "const nonProseIds = new Set" in p
+    # updateNetDelta must toggle the banner based on checked-non-prose count
+    idx = p.index("function updateNetDelta")
+    body = p[idx:idx + 1200]
+    assert "checkedNonProse" in body
+    assert "preview-nonprose-banner" in body
+    assert 'display = checkedNonProse > 0 ? "" : "none"' in body
+
+
+
+def test_select_all_is_split_button_with_scope_menu():
+    """In edit mode, the Select all button is a split button whose dropdown
+    opens a scope menu with "Select prose only" and "Select non-prose only"."""
+    m = read(ROOT / "llm_lens" / "static" / "js" / "views" / "messages.js")
+    # Split button structure
+    assert 'data-action="open-select-scope-menu"' in m
+    # Menu items
+    assert 'data-action="select-scope"' in m
+    assert 'data-scope="prose"' in m
+    assert 'data-scope="non_prose"' in m
+    # Human-readable labels
+    assert "Select prose only" in m
+    assert "Select non-prose only" in m
+
+
+def test_select_by_scope_is_additive_and_respects_search_filter():
+    """selectByScope adds to state.msgSelected (doesn't replace), and
+    restricts to the currently-filtered message list so search + scope
+    compose naturally."""
+    m = read(ROOT / "llm_lens" / "static" / "js" / "views" / "messages.js")
+    idx = m.index("export function selectByScope")
+    body = m[idx:idx + 1200]
+    # additive
+    assert "state.msgSelected.add" in body
+    assert "state.msgSelected.clear" not in body
+    # respects the search filter
+    assert "state.msgSearch" in body
+
+
+def test_select_scope_menu_handlers_wired_in_main():
+    """Action handlers for the split button are registered in main.js."""
+    mj = read(ROOT / "llm_lens" / "static" / "js" / "main.js")
+    assert '"open-select-scope-menu"' in mj
+    assert '"select-scope"' in mj
+    assert "openSelectScopeMenu" in mj
+    assert "selectByScope" in mj
+
+
+
+def test_preview_modal_has_select_all_split_button_with_scope_menu():
+    """Preview modal carries the same Select all + split scope menu as the
+    main edit-mode toolbar, so users can quickly narrow the applied set to
+    prose-only / non-prose-only within the modal itself."""
+    p = read(ROOT / "llm_lens" / "static" / "js" / "preview.js")
+    # Split button
+    assert 'data-preview-select-all' in p
+    assert 'data-preview-scope-menu' in p
+    # Scope items
+    assert 'data-preview-scope="prose"' in p
+    assert 'data-preview-scope="non_prose"' in p
+    # Labels
+    assert "Select prose only" in p
+    assert "Select non-prose only" in p
+
+
+def test_preview_select_all_toggles_based_on_any_unchecked():
+    """Click-behavior: if anything is unchecked → select all; otherwise
+    deselect all. One button handles both."""
+    p = read(ROOT / "llm_lens" / "static" / "js" / "preview.js")
+    # Handler uses "anyUnchecked" to decide direction
+    assert "anyUnchecked" in p
+    # And it refreshes the net delta (which also refreshes the button label)
+    idx = p.index("anyUnchecked")
+    body = p[idx:idx + 400]
+    assert "updateNetDelta" in body
+
+
+
+def test_preview_modal_removes_apply_all_button():
+    """Preview modal no longer has a separate 'Apply all' button — the
+    Select all (toggle) + 'Apply selected' flow covers that case in two
+    clicks, and the topbar stays uncluttered."""
+    p = read(ROOT / "llm_lens" / "static" / "js" / "preview.js")
+    assert 'data-preview-apply-all' not in p
+    assert 'preview-apply-all' not in p
+
+
+def test_preview_select_all_label_is_dynamic_like_edit_convo_view():
+    """The preview modal's Select all button flips between
+    'Select all (N)' and 'Deselect all' based on current check state,
+    mirroring the edit-convo toolbar's behavior."""
+    p = read(ROOT / "llm_lens" / "static" / "js" / "preview.js")
+    # initial render uses the count-bearing label
+    assert "`Select all (${rows.length})`" in p
+    # updateNetDelta flips to Deselect all when all are checked
+    idx = p.index("function updateNetDelta")
+    body = p[idx:idx + 2000]
+    assert '"Deselect all"' in body
+    assert "allChecked" in body
+
+
+
+def test_preview_apply_selected_shows_live_count():
+    """Apply selected button shows the current checked count in parens and
+    disables when nothing is selected."""
+    p = read(ROOT / "llm_lens" / "static" / "js" / "preview.js")
+    assert "Apply selected (${rows.length})" in p
+    assert "Apply selected (${checked.size})" in p
+    # disabled state when zero
+    idx = p.index("data-preview-apply-selected]")
+    # Find the updateNetDelta reference that sets disabled
+    assert "applyBtn.disabled = checked.size === 0" in p
+
+
+# ── TagScope invariants ────────────────────────────────────────────────
+# Both scopes must expose the identical method surface so tag_components
+# can be written once and used from either view. If someone adds a
+# method to one scope and forgets the other, this test catches it.
+
+import re as _re
+
+
+def _scope_methods(factory_name):
+    """Parse tag_scope.js and return the set of property names present
+    on the object returned by the given factory (makeConvoScope or
+    makeProjectScope)."""
+    src = read(ROOT / "llm_lens" / "static" / "js" / "tag_scope.js")
+    m = _re.search(
+        rf"export function {factory_name}\(.*?\{{.*?return scope;\s*\}}",
+        src,
+        _re.DOTALL,
+    )
+    assert m, f"couldn't locate {factory_name}"
+    block = m.group(0)
+    # Match property names on the scope object: `name:`, `getLabels:`,
+    # `refresh: async () => ...`, etc.
+    return set(_re.findall(r"^\s{4}(\w+)\s*:", block, _re.MULTILINE))
+
+
+def test_both_scopes_share_the_same_surface():
+    convo = _scope_methods("makeConvoScope")
+    proj = _scope_methods("makeProjectScope")
+    # Both must expose the same property names — no divergence.
+    assert convo == proj, f"convo - proj: {convo - proj}; proj - convo: {proj - convo}"
+    # Minimum surface we rely on from tag_components:
+    required = {
+        "name", "onChange",
+        "getLabels", "getAssignments", "getAssignment", "getActiveFilters",
+        "setLabelsLocal", "setAssignmentsLocal", "setActiveFiltersLocal",
+        "setLabels", "setAssignment", "bulkAssign",
+        "refresh", "defaultIds",
+    }
+    missing = required - convo
+    assert not missing, f"scope missing required methods: {missing}"
+
+
+def test_tag_components_exports_expected_functions():
+    src = read(ROOT / "llm_lens" / "static" / "js" / "tag_components.js")
+    for name in [
+        "pickDefaultColor",
+        "renderSwatchRow",
+        "renderTagPills",
+        "renderTagBar",
+        "toggleTagFilter",
+        "toggleKeyTag",
+        "openTagEditor",
+        "renameTag",
+        "addNewTag",
+        "openTagAssignPopup",
+        "applyExistingTag",
+        "createAndAssignTag",
+    ]:
+        assert f"export function {name}" in src or f"export async function {name}" in src, \
+            f"tag_components.js missing export: {name}"
+
+
+def test_tag_bar_stamps_data_scope():
+    """Every tag-bar rendering path must stamp `data-scope` on its
+    elements so the click dispatcher can resolve the scope back. If we
+    drop this attribute, the wrong view's re-render fires (or none)."""
+    src = read(ROOT / "llm_lens" / "static" / "js" / "tag_components.js")
+    # All actionable elements inside the tag bar/editor carry data-scope.
+    assert 'data-scope="${scope.name}"' in src
+    # Popup roots too — apply/create actions read ctx from the popup.
+    assert 'popup.dataset.scope = scope.name' in src
+
+
+def test_api_has_project_tag_methods():
+    src = read(ROOT / "llm_lens" / "static" / "js" / "api.js")
+    for method in ("getProjectTags", "setProjectTagLabels", "assignProjectTags", "bulkAssignProjectTag"):
+        assert f"{method}:" in src or f"{method} =" in src, f"api.js missing {method}"

@@ -2,7 +2,7 @@
 
 import { state } from "../state.js";
 import { api } from "../api.js";
-import { esc, escAttr, highlightText, renderStatsModalBody } from "../utils.js";
+import { esc, escAttr, highlightText, renderStatsModalBody, fmtTokens, contextWindowFor } from "../utils.js";
 import { configureToolbar } from "../toolbar.js";
 import { showConfirmModal, showInfoModal } from "../modal.js";
 import { navigate } from "../router.js";
@@ -115,35 +115,60 @@ function copyIconSvg() {
   return '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="9" height="9" rx="1.5"></rect><path d="M3 10.5V3a1.5 1.5 0 0 1 1.5-1.5H11"></path></svg>';
 }
 
-function renderBreadcrumb() {
+export function renderBreadcrumb() {
   const display = state.convoName || (state.convoId ? state.convoId.slice(0, 8) : "Conversation");
   const copyBtn = state.convoId
     ? `<button class="copy-id-btn copy-id-btn-inline" data-action="copy-resume" data-id="${escAttr(state.convoId)}" title="Copy 'claude --resume ${escAttr(state.convoId)}'" aria-label="Copy resume command">${copyIconSvg()}</button>`
     : "";
-  // Tag pills for this conversation. Edit mode adds × to remove and + to add.
+
+  // Agent + context badges: same shape as the card/table views in the
+  // project page, sourced from api_conversation's `header` field. Agent
+  // badge hides when the session never set one; ctx badge hides when the
+  // convo has no main-thread assistant turn yet.
+  const header = state.msgData?.header || {};
+  const agentBadge = header.agent
+    ? `<span class="badge badge-agent" title="Agent: ${escAttr(header.agent)}">@${esc(header.agent)}</span>`
+    : "";
+  let ctxBadge = "";
+  const ctxTokens = (header.last_context_input_tokens || 0)
+                  + (header.last_context_cache_creation_tokens || 0)
+                  + (header.last_context_cache_read_tokens || 0);
+  if (ctxTokens) {
+    const win = contextWindowFor(header.last_model_for_context, ctxTokens, state.planContextWindow);
+    const ctxPct = Math.round(ctxTokens / win * 100);
+    ctxBadge = `<span class="badge" title="Context at last turn (how close to /compact): ${fmtTokens(ctxTokens)} of ${fmtTokens(win)}">ctx ${fmtTokens(ctxTokens)} <span class="stats-pct">(${ctxPct}%)</span></span>`;
+  }
+  const headerBadges = (agentBadge || ctxBadge)
+    ? `<span class="bc-header-badges">${agentBadge}${ctxBadge}</span>`
+    : "";
+
+  // Tag pills for this conversation. Edit mode adds × to remove and a
+  // "Tag this convo" button (always shown, even with zero tags — the
+  // popup supports inline label creation, same flow as the project-view
+  // "Tag N selected" button).
   let tagsHtml = "";
-  if (state.convoId && state.tagLabels && state.tagLabels.length) {
+  if (state.convoId) {
     const assigned = (state.tagAssignments || {})[state.convoId] || [];
-    const pills = assigned.map((i) => {
-      const label = state.tagLabels[i];
+    const byId = new Map((state.tagLabels || []).map((l) => [l.id, l]));
+    const pills = assigned.map((id) => {
+      const label = byId.get(id);
       if (!label || !label.name) return "";
       if (state.editMode) {
-        return `<span class="tag-pill tag-pill-sm tag-color-${label.color} tag-pill-removable" data-action="remove-convo-tag" data-tag="${i}" title="Click to remove">${esc(label.name)} <span class="tag-x">×</span></span>`;
+        return `<span class="tag-pill tag-pill-sm tag-color-${label.color} tag-pill-removable" data-action="remove-convo-tag" data-tag="${label.id}" title="Click to remove">${esc(label.name)} <span class="tag-x">×</span></span>`;
       }
       return `<span class="tag-pill tag-pill-sm tag-color-${label.color}">${esc(label.name)}</span>`;
     }).join("");
-    const hasLabels = state.tagLabels.some((l) => l && l.name);
-    const addBtn = state.editMode && hasLabels
-      ? `<button class="bc-tag-add" data-action="open-tag-picker" title="Add tag">+</button>`
+    const tagBtn = state.editMode
+      ? `<button class="btn btn-sm bc-tag-btn" data-action="open-convo-tag-popup" title="Tag this conversation">Tag this convo</button>`
       : "";
-    if (pills || addBtn) {
-      tagsHtml = `<span class="bc-tags">${pills}${addBtn}</span>`;
+    if (pills || tagBtn) {
+      tagsHtml = `<span class="bc-tags">${pills}${tagBtn}</span>`;
     }
   }
 
   // Agent segment: the parent-convo name becomes clickable, and a new leaf
-  // shows "Agent: <name>". Tag pills hide in agent view since they're
-  // parent-convo concerns, not per-run.
+  // shows "Agent: <name>". Tag pills + header badges hide in agent view
+  // since they're parent-convo concerns, not per-run.
   let convoSeg;
   if (state.agentRunId) {
     convoSeg =
@@ -151,7 +176,7 @@ function renderBreadcrumb() {
       ` <span class="bc-agent-name">Agent: ${esc(state.msgData?.agent_name || "agent")}</span>`;
     tagsHtml = "";
   } else {
-    convoSeg = `<span class="bc-convo-name">${esc(display)}</span>${copyBtn}${tagsHtml}`;
+    convoSeg = `<span class="bc-convo-name">${esc(display)}</span>${copyBtn}${headerBadges}${tagsHtml}`;
   }
 
   bc.innerHTML = `
@@ -177,9 +202,9 @@ export async function hydrateConvoTags() {
 }
 
 // Remove a tag from the current conversation (clicked × on a pill in bc).
-export async function removeConvoTag(tagIndex) {
+export async function removeConvoTag(tagId) {
   if (!state.convoId) return;
-  const current = (state.tagAssignments[state.convoId] || []).filter((i) => i !== tagIndex);
+  const current = (state.tagAssignments[state.convoId] || []).filter((i) => i !== tagId);
   state.tagAssignments[state.convoId] = current;
   try {
     await api.assignTags(state.folder, state.convoId, current);
@@ -193,10 +218,10 @@ export function openTagPicker(anchorEl) {
   document.querySelectorAll(".tag-picker").forEach((el) => el.remove());
   if (!state.convoId || !state.tagLabels) return;
   const assigned = new Set(state.tagAssignments[state.convoId] || []);
-  const available = state.tagLabels.map((l, i) => ({ ...l, i })).filter((l) => l.name);
+  const available = state.tagLabels.filter((l) => l && l.name);
   if (!available.length) return;
   const pills = available.map((l) =>
-    `<span class="tag-pill tag-pill-sm tag-color-${l.color}${assigned.has(l.i) ? " active" : ""}" data-action="pick-convo-tag" data-tag="${l.i}" title="${assigned.has(l.i) ? "Remove" : "Add"} '${escAttr(l.name)}'">${esc(l.name)}</span>`
+    `<span class="tag-pill tag-pill-sm tag-color-${l.color}${assigned.has(l.id) ? " active" : ""}" data-action="pick-convo-tag" data-tag="${l.id}" title="${assigned.has(l.id) ? "Remove" : "Add"} '${escAttr(l.name)}'">${esc(l.name)}</span>`
   ).join("");
   const picker = document.createElement("div");
   picker.className = "tag-picker";
@@ -217,11 +242,11 @@ export function openTagPicker(anchorEl) {
   }, 0);
 }
 
-export async function pickConvoTag(tagIndex) {
+export async function pickConvoTag(tagId) {
   if (!state.convoId) return;
   const current = new Set(state.tagAssignments[state.convoId] || []);
-  if (current.has(tagIndex)) current.delete(tagIndex);
-  else current.add(tagIndex);
+  if (current.has(tagId)) current.delete(tagId);
+  else current.add(tagId);
   const next = [...current].sort();
   state.tagAssignments[state.convoId] = next;
   try {
@@ -256,6 +281,7 @@ function renderToolbar() {
 
 export function render() {
   renderToolbar();
+  renderBreadcrumb();
 
   const main = state.msgData?.main || [];
   const q = state.msgSearch.toLowerCase();
@@ -267,7 +293,14 @@ export function render() {
     const allSelected = selectable.length > 0 &&
       selectable.every((m) => state.msgSelected.has(m.uuid));
     const label = allSelected ? "Deselect all" : `Select all (${selectable.length})`;
-    h += `<div class="chat-select-all"><button class="btn btn-sm" data-action="toggle-all-msgs">${label}</button></div>`;
+    const proseN = selectable.filter((m) => !m.has_tool_use && !m.has_thinking).length;
+    const nonProseN = selectable.length - proseN;
+    h += `<div class="chat-select-all">
+      <span class="split-btn">
+        <button class="btn btn-sm" data-action="toggle-all-msgs">${label}</button>
+        <button class="btn btn-sm split-arrow" data-action="open-select-scope-menu" title="Select by content type (prose-only / non-prose only)">▾</button>
+      </span>
+    </div>`;
   }
   h += renderChatMessages(filtered, q);
   h += "</div>";
@@ -278,7 +311,7 @@ export function render() {
         <span>${state.msgSelected.size} selected</span>
         <button class="btn" data-action="open-export-menu" title="Copy, download, or extract the selected messages.">Export/Extract ▾</button>
         <span class="split-btn">
-          <button class="btn" data-action="bulk-transform" data-kind="scrub" title="Scrub text on selected prose-only messages. Non-prose messages are skipped.">Scrub</button>
+          <button class="btn" data-action="bulk-transform" data-kind="scrub" title="Scrub text on selected messages. Non-prose messages have their tool_use / thinking blocks collapsed; stats are preserved via tombstones but raw block contents are lost.">Scrub</button>
           <button class="btn split-arrow" data-action="open-bulk-transform-menu" title="More text transforms">▾</button>
         </span>
         <button class="btn-danger" style="border-color:rgba(255,255,255,0.4);color:#fff" data-action="delete-selected" title="Rewrites original file in place. May break /resume in edge cases — duplicate the conversation first if you care about it.">Delete</button>
@@ -495,26 +528,36 @@ function renderChatMessages(msgs, query) {
 const expandedGroups = new Set();
 
 function renderSingleMsg(p, compact) {
-  const { m, html: c, hasText, toolNames, hasThinking } = p;
+  const { m, html: c, toolNames, hasThinking } = p;
   const role = m.role === "user" ? "user" : "assistant";
   const ck = state.msgSelected.has(m.uuid) ? "checked" : "";
   const checkHtml = m.uuid
     ? `<input type="checkbox" class="chat-check" ${ck} data-action="toggle-msg-sel" data-uuid="${escAttr(m.uuid)}">`
     : "";
-  // proseOnly matches backend `_is_prose_only`: text blocks only. Tool and
-  // thinking blocks carry structural meaning and must not be editable.
-  const proseOnly = m.uuid && hasText && !(toolNames && toolNames.length) && !hasThinking;
-  const transformBtn = proseOnly
+  const canEdit = !!m.uuid;
+  // Non-prose = has tool_use or thinking blocks. Editing collapses them to a
+  // single text block: stats are preserved via tombstones (tool_uses,
+  // commands, thinking_count, turn-token slices, per_model) but the raw
+  // block contents (bash command strings, tool inputs, thinking text) are
+  // overwritten permanently.
+  const isNonProse = !!((toolNames && toolNames.length) || hasThinking);
+  const editTitle = isNonProse
+    ? "Edit — collapses tool_use / thinking blocks to plain text. Stats preserved via tombstones; raw block contents are overwritten permanently."
+    : "Edit this message's text in place. Preserves usage/stats and resume chain.";
+  const transformBtn = canEdit
     ? `<span class="split-btn">
-        <button class="btn btn-sm" data-action="edit-msg" data-uuid="${escAttr(m.uuid)}" title="Edit this message's text in place. Preserves usage/stats and resume chain.">Edit</button>
+        <button class="btn btn-sm" data-action="edit-msg" data-uuid="${escAttr(m.uuid)}" data-non-prose="${isNonProse ? "1" : "0"}" title="${editTitle}">Edit${isNonProse ? " ⚠" : ""}</button>
         <button class="btn btn-sm split-arrow" data-action="open-transform-menu" data-uuid="${escAttr(m.uuid)}" title="More text transforms">▾</button>
       </span>`
     : "";
+  const delTitle = isNonProse
+    ? "Delete — removes the entry entirely. Stats preserved via tombstones (tool counts, bash breakdowns, thinking, token slices); raw block contents are gone forever. May break /resume."
+    : "Delete this message (rewrites file — may break /resume). Prefer Edit mode → Save to new convo for curation.";
   const actionsHtml = m.uuid
     ? `<span class="msg-actions-row">
         <button class="btn btn-sm" data-action="copy-msg" data-uuid="${escAttr(m.uuid)}" title="Copy">Copy</button>
         ${transformBtn}
-        <button class="btn-danger btn-sm btn-del-msg" data-action="delete-msg" data-uuid="${escAttr(m.uuid)}" title="Delete this message (rewrites file — may break /resume). Prefer Edit mode → Save to new convo for curation.">x</button>
+        <button class="btn-danger btn-sm btn-del-msg" data-action="delete-msg" data-uuid="${escAttr(m.uuid)}" data-non-prose="${isNonProse ? "1" : "0"}" title="${delTitle}">${isNonProse ? "x ⚠" : "x"}</button>
       </span>`
     : "";
   const ts = m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : "";
@@ -636,6 +679,59 @@ export function toggleAllMsgs() {
     for (const id of ids) state.msgSelected.add(id);
   }
   render();
+}
+
+// Select all messages whose shape matches `scope`:
+//   "prose"     — neither has_tool_use nor has_thinking
+//   "non_prose" — has_tool_use or has_thinking
+// Additive: adds to the current selection rather than replacing, so users
+// can stack "prose then non-prose" or intersect with a search filter.
+export function selectByScope(scope) {
+  const main = state.msgData?.main || [];
+  const q = state.msgSearch.toLowerCase();
+  const filtered = q ? main.filter((m) => (m.content || "").toLowerCase().includes(q)) : main;
+  const isProse = (m) => !m.has_tool_use && !m.has_thinking;
+  const picks = filtered
+    .filter((m) => !!m.uuid)
+    .filter((m) => scope === "prose" ? isProse(m) : !isProse(m));
+  for (const m of picks) state.msgSelected.add(m.uuid);
+  closeSelectScopeMenu();
+  render();
+}
+
+function closeSelectScopeMenu() {
+  const existing = document.querySelector(".select-scope-menu");
+  if (existing) existing.remove();
+}
+
+export function openSelectScopeMenu(anchorEl) {
+  const existing = document.querySelector(".select-scope-menu");
+  if (existing) { existing.remove(); return; }
+  const main = state.msgData?.main || [];
+  const q = state.msgSearch.toLowerCase();
+  const filtered = q ? main.filter((m) => (m.content || "").toLowerCase().includes(q)) : main;
+  const selectable = filtered.filter((m) => !!m.uuid);
+  const proseN = selectable.filter((m) => !m.has_tool_use && !m.has_thinking).length;
+  const nonProseN = selectable.length - proseN;
+
+  const menu = document.createElement("div");
+  menu.className = "transform-menu select-scope-menu";
+  menu.innerHTML =
+    `<button class="btn btn-sm transform-menu-item" data-action="select-scope" data-scope="prose" ${proseN ? "" : "disabled"}>Select prose only (${proseN})</button>` +
+    `<button class="btn btn-sm transform-menu-item" data-action="select-scope" data-scope="non_prose" ${nonProseN ? "" : "disabled"}>Select non-prose only (${nonProseN})</button>`;
+  const r = anchorEl.getBoundingClientRect();
+  menu.style.position = "absolute";
+  menu.style.top = `${r.bottom + window.scrollY + 4}px`;
+  menu.style.left = `${r.left + window.scrollX}px`;
+  document.body.appendChild(menu);
+
+  const onDocClick = (e) => {
+    if (!menu.contains(e.target) && e.target !== anchorEl) {
+      closeSelectScopeMenu();
+      document.removeEventListener("click", onDocClick, true);
+    }
+  };
+  setTimeout(() => document.addEventListener("click", onDocClick, true), 0);
 }
 
 export function openBulkTransformMenu(anchorEl) {
@@ -812,7 +908,42 @@ export async function copyMsg(uuid) {
   await navigator.clipboard.writeText(text);
 }
 
+
+
+// True when the message has tool_use or thinking blocks (structural data
+// that a text-only edit/scrub/delete destroys). Backend sets these flags
+// explicitly in _format_entry_message so the frontend doesn't have to
+// re-parse the flattened display content.
+function _isNonProseMsg(m) {
+  return !!(m && (m.has_tool_use || m.has_thinking));
+}
+
+function _countNonProseIn(uuids) {
+  const byId = new Map((state.msgData?.main || []).map((m) => [m.uuid, m]));
+  let n = 0;
+  for (const u of uuids) if (_isNonProseMsg(byId.get(u))) n++;
+  return n;
+}
+
+function _nonProseWarningBlock(n) {
+  if (!n) return "";
+  return `<div style="margin-top:10px; padding:6px 8px; background:var(--warn-bg, #fff3cd); border:1px solid var(--warn-border, #d9b84a); border-radius:4px; font-size:12px">
+    <strong>⚠ ${n} non-prose message${n === 1 ? "" : "s"} in selection.</strong>
+    These have tool_use / thinking blocks. Stats (tool counts, bash command breakdowns, thinking counts, token slices, per-model) are preserved via deleted-delta tombstones, but the raw block contents (bash command strings, tool inputs, thinking text) are gone forever.
+  </div>`;
+}
+
 export function deleteMsg(uuid) {
+  const btn = document.querySelector(`[data-action="delete-msg"][data-uuid="${cssUuid(uuid)}"]`);
+  const isNonProse = btn && btn.dataset.nonProse === "1";
+  const nonProseWarning = isNonProse
+    ? `<div style="margin-top:10px; padding:6px 8px; background:var(--warn-bg, #fff3cd); border:1px solid var(--warn-border, #d9b84a); border-radius:4px; font-size:12px">
+         <strong>⚠ Non-prose message.</strong> This message has tool_use / thinking blocks.
+         Stats (tool counts, bash command breakdowns, thinking counts, token slices, per-model breakdowns)
+         are preserved via deleted-delta tombstones, but the raw block contents
+         (bash command strings, tool inputs, thinking text) are gone forever.
+       </div>`
+    : "";
   showConfirmModal({
     title: "Delete message?",
     body: `Rewrites the original conversation file in place. This may break
@@ -821,7 +952,7 @@ export function deleteMsg(uuid) {
       <br><br><strong>Prefer Scrub</strong> if you only want to redact the
       text — it leaves <code>usage</code> and the chain intact, so it's
       strictly less invasive than delete.
-      <br>Or use Edit mode → "Save to new convo" to curate non-destructively.`,
+      <br>Or use Edit mode → "Save to new convo" to curate non-destructively.${nonProseWarning}`,
     onConfirm: async () => {
       await api.deleteMessage(state.folder, state.convoId, uuid);
       show(state.folder, state.convoId);
@@ -962,11 +1093,24 @@ export function editMsg(uuid) {
   const actions = bubble.querySelector(".msg-actions-row");
   if (!content) return;
 
+  // The edit button carries data-non-prose="1" when the message has
+  // tool_use or thinking blocks. In that case, saving collapses those
+  // blocks to plain text — stats survive via tombstones but raw block
+  // contents (bash commands, tool inputs, thinking text) are lost.
+  const editBtn = bubble.querySelector('[data-action="edit-msg"]');
+  const isNonProse = editBtn && editBtn.dataset.nonProse === "1";
+
   bubble.classList.add("editing");
   bubble._origContent = content.innerHTML;
   if (actions) bubble._origActions = actions.innerHTML;
 
+  const warning = isNonProse
+    ? `<div class="msg-edit-warning" style="margin-bottom:6px; padding:6px 8px; background:var(--warn-bg, #fff3cd); border:1px solid var(--warn-border, #d9b84a); border-radius:4px; font-size:12px">
+         <strong>⚠ Non-prose message.</strong> Saving will collapse tool_use / thinking blocks to this text. Stats (tool counts, bash command breakdowns, thinking counts, token slices) are preserved via deleted-delta tombstones, but the raw block contents (bash command strings, tool inputs, thinking text) will be overwritten permanently.
+       </div>`
+    : "";
   content.innerHTML =
+    warning +
     `<textarea class="msg-edit-ta" spellcheck="false"></textarea>` +
     `<div class="msg-edit-hint">Rewrites the file in place. Preserves usage/stats and resume chain — same caveats as scrub.</div>`;
   const ta = content.querySelector("textarea");
@@ -1396,7 +1540,10 @@ export async function bulkTransform(kind = "scrub") {
     const candidates = ids
       .map((id) => byId.get(id))
       .filter(Boolean)
-      .map((m) => ({ uuid: m.uuid, content: m.content || "", role: m.role }));
+      .map((m) => ({
+        uuid: m.uuid, content: m.content || "", role: m.role,
+        has_tool_use: !!m.has_tool_use, has_thinking: !!m.has_thinking,
+      }));
     const res = await showPreviewModal({ kind, label, candidates, opts: lists });
     if (!res) return;
     if (res.empty) {
@@ -1410,7 +1557,11 @@ export async function bulkTransform(kind = "scrub") {
     }
     if (accepted.size === 0) return;
   } else {
-    if (!confirm(`${label} for ${ids.length} selected message(s)? Non-prose messages will be skipped.`)) return;
+    const nonProseN = _countNonProseIn(ids);
+    const nonProseNote = nonProseN
+      ? `\n\n⚠ ${nonProseN} of the selected message${nonProseN === 1 ? " is" : "s are"} non-prose (tool_use / thinking blocks). Those blocks will be collapsed to the transformed text. Stats are preserved via deleted-delta tombstones, but raw block contents are lost.`
+      : "";
+    if (!confirm(`${label} for ${ids.length} selected message(s)?${nonProseNote}`)) return;
     accepted = new Map();
     for (const id of ids) {
       const m = byId.get(id);
@@ -1419,19 +1570,17 @@ export async function bulkTransform(kind = "scrub") {
     }
   }
 
-  let ok = 0, skipped = 0, errored = 0;
+  let ok = 0, errored = 0;
   for (const [id, newText] of accepted) {
     try {
       await api.editMessage(state.folder, state.convoId, id, newText);
       ok++;
     } catch (e) {
-      if ((e.message || "").startsWith("400")) skipped++;
-      else errored++;
+      errored++;
     }
   }
   state.msgSelected.clear();
-  if (errored) alert(`Applied to ${ok}. Skipped ${skipped} (non-prose). ${errored} failed — check server logs.`);
-  else if (skipped) alert(`Applied to ${ok}. Skipped ${skipped} (non-prose).`);
+  if (errored) alert(`Applied to ${ok}. ${errored} failed — check server logs.`);
   show(state.folder, state.convoId);
 }
 
@@ -1489,6 +1638,7 @@ export async function saveSelected() {
 export function deleteSelected() {
   const uuids = [...state.msgSelected];
   if (!uuids.length) return;
+  const nonProseN = _countNonProseIn(uuids);
   showConfirmModal({
     title: `Delete ${uuids.length} messages?`,
     body: `Rewrites the original conversation file in place. Cannot be undone,
@@ -1496,7 +1646,7 @@ export function deleteSelected() {
       replay semantics aren't publicly documented.
       <br><br><strong>Prefer Scrub</strong> on these messages if you only
       want to redact text — it preserves <code>usage</code> and the chain.
-      <br>Or use "Save to new convo" (non-destructive, creates a copy).`,
+      <br>Or use "Save to new convo" (non-destructive, creates a copy).${_nonProseWarningBlock(nonProseN)}`,
     onConfirm: async () => {
       for (const u of uuids) {
         await api.deleteMessage(state.folder, state.convoId, u);

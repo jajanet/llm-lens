@@ -1,29 +1,35 @@
 // Conversations view: list of all .jsonl files in a project.
 
-import { state, invalidateProjectsCache, setViewMode } from "../state.js";
+import { state, invalidateProjectsCache, setViewMode, togglePreviewPosition, persistSelections } from "../state.js";
 import { api } from "../api.js";
 import { timeAgo, timeAbs, fmtSize, esc, escAttr, arrow, toast, renderStatsInline, renderStatsModalBody, fmtTokens, contextWindowFor } from "../utils.js";
 import { configureToolbar } from "../toolbar.js";
 import { showConfirmModal, showInfoModal } from "../modal.js";
 import { navigate } from "../router.js";
 import { renderOverviewBar, hydrateOverview } from "./projects.js";
+import { convoScope, projectScope } from "../scopes.js";
+import * as Tags from "../tag_components.js";
 
 const app = document.getElementById("app");
 const bc = document.getElementById("breadcrumb");
 const PAGE = 30;
 
 export async function show(folder) {
+  const prevFolder = state.folder;
   state.view = "conversations";
   state.folder = folder;
 
   // Reset paging + filters on fresh navigation
   state.convoOffset = 0;
   state.convoItems = [];
-  state.selected.clear();
+  // Keep selection across accidental navigations while edit mode is
+  // on; wipe when switching folders (selection is per-folder) or when
+  // edit mode is off. localStorage mirrors this so hard reload works.
+  if (!state.editMode || prevFolder !== folder) state.selected.clear();
   state.search = "";
   state.sort = "recent";
   state.desc = true;
-  state.activeTagFilters = [];
+  convoScope.setActiveFiltersLocal([]);
   state.tagMode = null;
   state.smartSelect = null;
   state.smartMatches = new Set();
@@ -45,6 +51,7 @@ export async function show(folder) {
   render();
   hydrateOverview();
   hydrateTags();
+  hydrateProjectTags();
 }
 
 async function resolvePath(folder) {
@@ -53,8 +60,31 @@ async function resolvePath(folder) {
   state.path = proj ? proj.path : folder;
 }
 
-function renderBreadcrumb() {
-  bc.innerHTML = `<a data-action="nav-projects">Projects</a> / ${esc(state.path || "")}`;
+export function renderBreadcrumb() {
+  // Project-tag pills for the current folder. Always visible if the
+  // project has any assigned tags; edit mode adds × for remove and a
+  // "Tag this project" button. Mirrors the "Tag this convo" flow in
+  // messages.js — pointed at the project-tag namespace instead.
+  let tagsHtml = "";
+  if (state.folder) {
+    const assigned = projectScope.getAssignment(state.folder);
+    const byId = new Map(projectScope.getLabels().map((l) => [l.id, l]));
+    const pills = assigned.map((id) => {
+      const label = byId.get(id);
+      if (!label || !label.name) return "";
+      if (state.editMode) {
+        return `<span class="tag-pill tag-pill-sm tag-color-${label.color} tag-pill-removable" data-scope="projects" data-action="remove-project-tag" data-tag="${label.id}" title="Click to remove">${esc(label.name)} <span class="tag-x">×</span></span>`;
+      }
+      return `<span class="tag-pill tag-pill-sm tag-color-${label.color}">${esc(label.name)}</span>`;
+    }).join("");
+    const tagBtn = state.editMode
+      ? `<button class="btn btn-sm bc-tag-btn" data-scope="projects" data-action="open-project-tag-popup" title="Tag this project">Tag this project</button>`
+      : "";
+    if (pills || tagBtn) {
+      tagsHtml = `<span class="bc-tags">${pills}${tagBtn}</span>`;
+    }
+  }
+  bc.innerHTML = `<a data-action="nav-projects">Projects</a> / <span class="bc-convo-name">${esc(state.path || "")}</span>${tagsHtml}`;
 }
 
 async function fetchPage(append) {
@@ -158,212 +188,23 @@ async function hydrateStats(items) {
 
 async function hydrateTags() {
   try {
-    const data = await api.getTags(state.folder);
-    state.tagLabels = data.labels || [];
-    state.tagAssignments = data.assignments || {};
+    await convoScope.refresh();
   } catch {
-    state.tagLabels = [];
-    state.tagAssignments = {};
+    convoScope.setLabelsLocal([]);
+    convoScope.setAssignmentsLocal({});
   }
   render();
 }
 
-function renderTagPills(convoId) {
-  const indices = state.tagAssignments[convoId] || [];
-  return indices.map((i) => {
-    const label = state.tagLabels[i];
-    if (!label || !label.name) return "";
-    return `<span class="tag-pill tag-pill-sm tag-color-${label.color}">${esc(label.name)}</span>`;
-  }).join("");
+async function hydrateProjectTags() {
+  // The project-tag namespace is shared across views. Fetching here
+  // means jumping straight to `#/p/<folder>` (without going via the
+  // projects list) still has data for the breadcrumb pills.
+  try { await projectScope.refresh(); } catch { /* best-effort */ }
+  renderBreadcrumb();
 }
 
-function renderTagBar() {
-  const labels = state.tagLabels || [];
-  const namedCount = labels.filter((l) => l && l.name).length;
 
-  // Non-edit mode: only show filled pills as filters. Hide bar if no tags exist.
-  if (!state.editMode) {
-    if (!namedCount) return "";
-    let pills = "";
-    for (let i = 0; i < labels.length; i++) {
-      const l = labels[i];
-      if (!l || !l.name) continue;
-      const isActive = state.activeTagFilters.includes(i);
-      pills += `<span class="tag-pill tag-color-${l.color}${isActive ? " active" : ""}" data-action="toggle-tag-filter" data-tag="${i}" title="Filter by '${escAttr(l.name)}'">${esc(l.name)}</span>`;
-    }
-    return `<div class="tag-bar"><span class="tag-bar-label">Tags</span>${pills}</div>`;
-  }
-
-  // Edit mode: show all 5 slots. Filled ones get a pencil-on-hover for rename.
-  let pills = "";
-  for (let i = 0; i < labels.length; i++) {
-    const l = labels[i] || { name: "", color: i };
-    const isActive = state.activeTagFilters.includes(i);
-    if (l.name) {
-      pills += `<span class="tag-pill tag-pill-editable tag-color-${l.color}${isActive ? " active" : ""}" data-action="toggle-tag-filter" data-tag="${i}" title="Click body to filter">${esc(l.name)}<button class="tag-pencil" data-action="rename-tag-start" data-tag="${i}" title="Rename" aria-label="Rename tag">✎</button></span>`;
-    } else {
-      pills += `<span class="tag-pill tag-pill-empty" data-action="rename-tag-start" data-tag="${i}" title="Click to name this tag">Tag ${i + 1}</span>`;
-    }
-  }
-  return `<div class="tag-bar"><span class="tag-bar-label">Tags</span>${pills}</div>`;
-}
-
-export function toggleTagFilter(tagIndex) {
-  const idx = state.activeTagFilters.indexOf(tagIndex);
-  if (idx >= 0) state.activeTagFilters.splice(idx, 1);
-  else state.activeTagFilters.push(tagIndex);
-  render();
-  // Overview stats + graph should reflect the filtered slice.
-  hydrateOverview();
-}
-
-export async function renameTag(tagIndex) {
-  const label = state.tagLabels[tagIndex] || { name: "", color: tagIndex };
-  const el = app.querySelector(`.tag-bar [data-tag="${tagIndex}"]`);
-  if (!el) return;
-  const old = label.name || "";
-  el.outerHTML = `<input class="tag-rename-input" data-tag="${tagIndex}" value="${escAttr(old)}" placeholder="Tag name...">`;
-  const input = app.querySelector(`.tag-rename-input[data-tag="${tagIndex}"]`);
-  if (!input) return;
-  input.focus();
-  input.select();
-
-  let committed = false;
-  const commit = async () => {
-    if (committed) return;
-    committed = true;
-    const newName = input.value.trim().slice(0, 30);
-    // Ensure the labels array has 5 slots
-    while (state.tagLabels.length < 5) {
-      state.tagLabels.push({ name: "", color: state.tagLabels.length });
-    }
-    state.tagLabels[tagIndex] = { ...label, name: newName };
-    try {
-      await api.setTagLabels(state.folder, state.tagLabels);
-    } catch { /* best-effort */ }
-    render();
-  };
-  input.addEventListener("blur", commit);
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") input.blur();
-    if (e.key === "Escape") { input.value = old; input.blur(); }
-  });
-}
-
-export async function toggleConvoTag(convoId, tagIndex) {
-  const current = state.tagAssignments[convoId] || [];
-  const next = current.includes(tagIndex)
-    ? current.filter((i) => i !== tagIndex)
-    : [...current, tagIndex].sort();
-  state.tagAssignments[convoId] = next;
-  try {
-    await api.assignTags(state.folder, convoId, next);
-  } catch { /* best-effort */ }
-  render();
-}
-
-// Open a popup near the "Tag N selected" button: list existing named tags,
-// plus an inline input to create a new tag and apply it in one step.
-export function openTagAssignPopup(anchorEl) {
-  document.querySelectorAll(".tag-assign-popup").forEach((el) => el.remove());
-
-  const ids = state.selected.size > 0
-    ? [...state.selected]
-    : [...state.smartMatches];
-  if (!ids.length) return;
-
-  const labels = state.tagLabels || [];
-  const named = labels.map((l, i) => ({ ...l, i })).filter((l) => l.name);
-  const firstEmpty = labels.findIndex((l) => !l || !l.name);
-
-  let pillsHtml = named.map((l) =>
-    `<div class="tag-assign-row" data-action="apply-existing-tag" data-tag="${l.i}"><span class="tag-pill tag-pill-sm tag-color-${l.color}">${esc(l.name)}</span><span class="tag-assign-hint">apply to ${ids.length}</span></div>`
-  ).join("");
-  if (!named.length) pillsHtml = `<div class="tag-assign-empty">No named tags yet — create one below.</div>`;
-
-  const createHtml = firstEmpty >= 0
-    ? `<div class="tag-assign-create">
-         <input type="text" class="tag-assign-new-input" placeholder="Create new tag..." maxlength="30">
-         <button class="btn btn-sm" data-action="create-and-assign-tag" data-slot="${firstEmpty}">Create &amp; apply</button>
-       </div>`
-    : `<div class="tag-assign-empty">All 5 tag slots are in use — rename one first.</div>`;
-
-  const popup = document.createElement("div");
-  popup.className = "tag-assign-popup";
-  popup.innerHTML = `<div class="tag-assign-list">${pillsHtml}</div>${createHtml}`;
-  document.body.appendChild(popup);
-
-  const rect = anchorEl.getBoundingClientRect();
-  popup.style.top = `${rect.bottom + 4 + window.scrollY}px`;
-  popup.style.left = `${rect.left + window.scrollX}px`;
-
-  // Focus the create input if no tags named yet
-  const input = popup.querySelector(".tag-assign-new-input");
-  if (input && !named.length) input.focus();
-
-  // Dismiss on outside click
-  setTimeout(() => {
-    const close = (e) => {
-      if (!popup.contains(e.target) && e.target !== anchorEl) {
-        popup.remove();
-        document.removeEventListener("click", close);
-      }
-    };
-    document.addEventListener("click", close);
-  }, 0);
-}
-
-// Apply an existing tag to the current selection/matches pool.
-export async function applyExistingTag(tagIndex) {
-  const ids = state.selected.size > 0
-    ? [...state.selected]
-    : [...state.smartMatches];
-  if (!ids.length) return;
-  try {
-    await api.bulkAssignTag(state.folder, ids, tagIndex, true);
-  } catch { toast("Tag assign failed"); return; }
-  for (const id of ids) {
-    const cur = new Set(state.tagAssignments[id] || []);
-    cur.add(tagIndex);
-    state.tagAssignments[id] = [...cur].sort();
-  }
-  document.querySelectorAll(".tag-assign-popup").forEach((el) => el.remove());
-  render();
-  toast(`Tagged ${ids.length}`);
-}
-
-// Name an empty slot and immediately apply that new tag to the pool.
-export async function createAndAssignTag(slotIndex) {
-  const popup = document.querySelector(".tag-assign-popup");
-  const input = popup && popup.querySelector(".tag-assign-new-input");
-  const name = input ? input.value.trim().slice(0, 30) : "";
-  if (!name) {
-    if (input) input.focus();
-    return;
-  }
-  const ids = state.selected.size > 0
-    ? [...state.selected]
-    : [...state.smartMatches];
-  if (!ids.length) return;
-
-  // Ensure labels array has 5 slots
-  while (state.tagLabels.length < 5) {
-    state.tagLabels.push({ name: "", color: state.tagLabels.length });
-  }
-  state.tagLabels[slotIndex] = { name, color: state.tagLabels[slotIndex]?.color ?? slotIndex };
-  try {
-    await api.setTagLabels(state.folder, state.tagLabels);
-    await api.bulkAssignTag(state.folder, ids, slotIndex, true);
-  } catch { toast("Create + apply failed"); return; }
-  for (const id of ids) {
-    const cur = new Set(state.tagAssignments[id] || []);
-    cur.add(slotIndex);
-    state.tagAssignments[id] = [...cur].sort();
-  }
-  document.querySelectorAll(".tag-assign-popup").forEach((el) => el.remove());
-  render();
-  toast(`Tagged ${ids.length} with '${name}'`);
-}
 
 // ── Smart-select ──────────────────────────────────────────────────────
 
@@ -395,7 +236,9 @@ function computeSmartMatches(preset, threshold) {
       }
       case "edited": {
         const dd = s.deleted_delta || {};
-        if ((dd.messages_deleted || 0) > 0 || (dd.messages_scrubbed || 0) > 0) matches.add(c.id);
+        if ((dd.messages_deleted || 0) > 0
+            || (dd.messages_scrubbed || 0) > 0
+            || (dd.messages_edited || 0) > 0) matches.add(c.id);
         break;
       }
     }
@@ -476,6 +319,16 @@ function renderToolbar() {
     const srcLabel = selN > 0 ? "selected" : "matching";
     extra += `<button class="btn" data-action="open-tag-assign-popup" title="Apply a tag to all ${srcLabel}">Tag ${assignPool} ${srcLabel}</button> `;
   }
+  if (state.editMode) {
+    // Action-phrased button: label is what clicking does, not current state.
+    const nextIsLast = state.previewPosition === "first";
+    const posLabel = nextIsLast ? "Show last message" : "Show first message";
+    const posTitle = nextIsLast
+      ? "Switch the preview column to show each convo's last user message (resume context)."
+      : "Switch the preview column back to each convo's first user message (topic).";
+    extra += `<button class="btn" data-action="toggle-preview-position" title="${posTitle}">${posLabel}</button>`;
+  }
+  extra += `<span style="display:inline-block; width:1px; height:22px; background:var(--border); margin:0 4px; vertical-align:middle"></span>`;
   extra += `<button class="btn ${state.viewMode === "list" ? "active" : ""}" data-action="set-view-mode" data-mode="list">&#9776;</button>`;
   extra += `<button class="btn ${state.viewMode === "grid" ? "active" : ""}" data-action="set-view-mode" data-mode="grid">&#9638;</button>`;
 
@@ -489,27 +342,29 @@ function renderToolbar() {
 
 export function render() {
   renderToolbar();
+  renderBreadcrumb();
 
   let items = state.convoItems;
   if (state.search) {
     const q = state.search.toLowerCase();
     items = items.filter((c) =>
       c.preview.toLowerCase().includes(q) ||
+      (c.last_preview || "").toLowerCase().includes(q) ||
       (c.name && c.name.toLowerCase().includes(q))
     );
   }
   // Tag filter (OR logic)
-  if (state.activeTagFilters.length) {
-    const tags = state.activeTagFilters;
+  const activeFilters = convoScope.getActiveFilters();
+  if (activeFilters.length) {
     items = items.filter((c) => {
-      const assigned = state.tagAssignments[c.id] || [];
-      return assigned.some((t) => tags.includes(t));
+      const assigned = convoScope.getAssignment(c.id);
+      return assigned.some((t) => activeFilters.includes(t));
     });
   }
 
   const overviewHtml = renderOverviewBar();
   const smartBarHtml = renderSmartBar();
-  const tagBarHtml = renderTagBar();
+  const tagBarHtml = Tags.renderTagBar(convoScope, { editMode: state.editMode });
   const totalSize = items.reduce((s, c) => s + (c.size_kb || 0), 0);
 
   if (!items.length) {
@@ -532,10 +387,15 @@ function copyIconSvg() {
   return '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="9" height="9" rx="1.5"></rect><path d="M3 10.5V3a1.5 1.5 0 0 1 1.5-1.5H11"></path></svg>';
 }
 
+function newTabIconSvg() {
+  return '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2h4v4"></path><path d="M14 2 7.5 8.5"></path><path d="M12 9v4a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h4"></path></svg>';
+}
+
 function renderTable(items, totalSize) {
   const pct = (kb) => totalSize > 0 ? `${(kb / totalSize * 100).toFixed(1)}%` : "";
+  const allSel = items.length > 0 && items.every((c) => state.selected.has(c.id));
   let h = '<div class="tbl-wrap"><table class="tbl"><thead><tr>';
-  h += `<th class="col-check"><input type="checkbox" style="accent-color:var(--accent)" data-action="toggle-all-convos"></th>`;
+  h += `<th class="col-check"><input type="checkbox" style="accent-color:var(--accent)" ${allSel ? "checked" : ""} data-action="toggle-all-convos"></th>`;
   h += `<th class="col-name">Name</th>`;
   h += `<th data-action="sort-convos" data-col="recent">Preview${arrow(state, "recent")}</th>`;
   h += `<th data-action="sort-convos" data-col="size" style="text-align:right">Size${arrow(state, "size")}</th>`;
@@ -555,8 +415,11 @@ function renderTable(items, totalSize) {
       ? `<button class="btn btn-sm" data-action="unarchive-convo" data-id="${escAttr(c.id)}" title="Restore to ~/.claude/projects/">Unarch</button>`
       : `<button class="btn btn-sm" data-action="archive-convo" data-id="${escAttr(c.id)}" title="Removes from Claude Code's /resume list. Restore anytime from the Archived filter.">Arch</button>`;
     const archBadge = c.archived ? `<span class="badge badge-archived">archived</span> ` : "";
-    const tagPills = renderTagPills(c.id);
+    const tagPills = Tags.renderTagPills(convoScope, c.id);
     const copyBtn = `<button class="copy-id-btn" data-action="copy-resume" data-id="${escAttr(c.id)}" title="Copy 'claude --resume ${escAttr(c.id)}'" aria-label="Copy resume command">${copyIconSvg()}</button>`;
+    const convoHref = `#/p/${encodeURIComponent(state.folder)}/c/${encodeURIComponent(c.id)}`;
+    const openNewTabBtn = `<a class="open-new-tab-btn" data-action="noop-anchor" href="${convoHref}" target="_blank" rel="noopener" title="Open in new tab" aria-label="Open in new tab">${newTabIconSvg()}</a>`;
+    const agentPill = c.agent ? `<span class="badge badge-agent" title="Agent: ${escAttr(c.agent)}">@${esc(c.agent)}</span> ` : "";
 
     // Context cell: only render a value once stats have hydrated.
     let ctxCell = '<span class="stats-dim">—</span>';
@@ -575,10 +438,10 @@ function renderTable(items, totalSize) {
     h += `
       <tr class="${rowCls}${smartCls}" data-action="open-convo" data-id="${escAttr(c.id)}">
         <td class="col-check">
-          <input type="checkbox" class="item-check" ${ck} data-action="toggle-convo-sel" data-id="${escAttr(c.id)}">
+          <span class="check-hit" data-action="toggle-convo-sel" data-id="${escAttr(c.id)}"><input type="checkbox" class="item-check" ${ck} tabindex="-1"></span>
         </td>
-        <td class="col-name${dimCls}${loadCls}"><div class="col-name-wrap"><span class="col-name-text">${archBadge}${esc(nameText)}</span>${tagPills ? ` ${tagPills}` : ""}${copyBtn}</div></td>
-        <td class="col-preview">${esc(c.preview)}</td>
+        <td class="col-name${dimCls}${loadCls}"><div class="col-name-wrap"><span class="col-name-text">${archBadge}${agentPill}${esc(nameText)}</span>${tagPills ? ` ${tagPills}` : ""}${copyBtn}${openNewTabBtn}</div></td>
+        <td class="col-preview">${esc(state.previewPosition === "last" ? (c.last_preview || c.preview) : c.preview)}</td>
         <td class="col-size" style="text-align:right">${fmtSize(c.size_kb)} <span class="stats-pct">(${pct(c.size_kb)})</span></td>
         <td class="col-ctx" style="text-align:right">${ctxCell}</td>
         <td class="col-time" style="text-align:right" title="${escAttr(timeAbs(c.last_modified))}">${timeAgo(c.last_modified)}</td>
@@ -626,24 +489,29 @@ function renderCards(items, totalSize) {
       }
     }
 
+    const agentBadge = c.agent ? `<span class="badge badge-agent" title="Agent: ${escAttr(c.agent)}">@${esc(c.agent)}</span>` : "";
+
     const archBtn = c.archived
       ? `<button class="btn btn-sm" data-action="unarchive-convo" data-id="${escAttr(c.id)}" title="Restore to ~/.claude/projects/">Unarch</button>`
       : `<button class="btn btn-sm" data-action="archive-convo" data-id="${escAttr(c.id)}" title="Removes from Claude Code's /resume list. Restore anytime from the Archived filter.">Arch</button>`;
     const archBadge = c.archived ? `<span class="badge badge-archived">archived</span>` : "";
-    const tagPills = renderTagPills(c.id);
+    const tagPills = Tags.renderTagPills(convoScope, c.id);
     const copyBtn = `<button class="copy-id-btn" data-action="copy-resume" data-id="${escAttr(c.id)}" title="Copy 'claude --resume ${escAttr(c.id)}'" aria-label="Copy resume command">${copyIconSvg()}</button>`;
+    const convoHref = `#/p/${encodeURIComponent(state.folder)}/c/${encodeURIComponent(c.id)}`;
+    const openNewTabBtn = `<a class="open-new-tab-btn" data-action="noop-anchor" href="${convoHref}" target="_blank" rel="noopener" title="Open in new tab" aria-label="Open in new tab">${newTabIconSvg()}</a>`;
     h += `
       <div class="card${archCls}${smartCls}" data-action="open-convo" data-id="${escAttr(c.id)}">
-        <div class="card-name${dimCls}${loadCls}"><span class="card-name-text">${esc(nameText)}</span>${copyBtn}</div>
+        <div class="card-name${dimCls}${loadCls}"><span class="card-name-text">${esc(nameText)}</span>${copyBtn}${openNewTabBtn}</div>
         <div style="display:flex;align-items:start;gap:8px">
-          <input type="checkbox" class="item-check" ${ck} data-action="toggle-convo-sel" data-id="${escAttr(c.id)}" style="margin-top:2px">
-          <div class="card-preview" style="flex:1;-webkit-line-clamp:4">${esc(c.preview)}</div>
+          <span class="check-hit" data-action="toggle-convo-sel" data-id="${escAttr(c.id)}"><input type="checkbox" class="item-check" ${ck} tabindex="-1"></span>
+          <div class="card-preview" style="flex:1;-webkit-line-clamp:4">${esc(state.previewPosition === "last" ? (c.last_preview || c.preview) : c.preview)}</div>
         </div>
         <div class="card-stats">${statsInner}</div>
         <div class="card-footer">
           ${archBadge}${tagPills ? ` ${tagPills}` : ""}
           <span class="badge">${fmtSize(c.size_kb)} <span class="stats-pct">(${pct(c.size_kb)})</span></span>
           ${ctxBadge}
+          ${agentBadge}
           <span class="time-label" title="${escAttr(timeAbs(c.last_modified))}">${timeAgo(c.last_modified)}</span>
           <span style="flex:1"></span>
           ${archBtn}
@@ -686,8 +554,9 @@ export async function refreshCache() {
 export async function openProjectStats() {
   if (!state.folder) return;
   showInfoModal({ title: "Project stats", body: '<div class="stats-loading">loading...</div>' });
-  const tagsByFolder = state.activeTagFilters && state.activeTagFilters.length
-    ? { [state.folder]: state.activeTagFilters }
+  const convoFilters = convoScope.getActiveFilters();
+  const tagsByFolder = convoFilters.length
+    ? { [state.folder]: convoFilters }
     : null;
   let data;
   try {
@@ -709,8 +578,9 @@ export async function showStats() {
   if (!state.folder) return;
   showInfoModal({ title: `Project stats — ${esc(state.path || state.folder)}`, body: '<div class="stats-loading">loading...</div>' });
   // Pass tag filter through so the stats modal reflects whatever's active.
-  const tagsByFolder = state.activeTagFilters && state.activeTagFilters.length
-    ? { [state.folder]: state.activeTagFilters }
+  const convoFilters = convoScope.getActiveFilters();
+  const tagsByFolder = convoFilters.length
+    ? { [state.folder]: convoFilters }
     : null;
   let all;
   try {
@@ -778,14 +648,16 @@ export function setMode(mode) {
 export function toggleSel(id) {
   if (state.selected.has(id)) state.selected.delete(id);
   else state.selected.add(id);
+  persistSelections();
   render();
 }
 
-export function toggleAll(checked) {
-  for (const c of state.convoItems) {
-    if (checked) state.selected.add(c.id);
-    else state.selected.delete(c.id);
-  }
+export function toggleAll() {
+  const visible = state.convoItems || [];
+  const allSelected = visible.length > 0 && visible.every((c) => state.selected.has(c.id));
+  if (allSelected) for (const c of visible) state.selected.delete(c.id);
+  else for (const c of visible) state.selected.add(c.id);
+  persistSelections();
   render();
 }
 
@@ -921,4 +793,10 @@ export function bulkUnarchive() {
       ? `Restored ${ids.length - skipped}; ${skipped} skipped (live file exists)`
       : `Restored ${ids.length}`);
   })();
+}
+
+
+export function togglePreview() {
+  togglePreviewPosition();
+  render();
 }

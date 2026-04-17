@@ -73,11 +73,17 @@ export const state = {
   overviewScope: null,   // null = global; or project folder id
   overview: null,
 
-  // Tag system
-  tagLabels: [],           // [{name, color}, ...] for current folder
-  tagAssignments: {},      // {convo_id: [tagIndex, ...]}
-  activeTagFilters: [],    // tag indices currently filtering (OR)
-  tagMode: null,           // null or {tagIndex: N} for click-to-assign
+  // Tag system — per-project convo-tag namespace
+  tagLabels: [],           // [{id, name, color}, ...] for current folder
+  tagAssignments: {},      // {convo_id: [tag_id, ...]}
+  activeTagFilters: [],    // tag ids currently filtering (OR)
+  tagMode: null,           // null or {tagId: N} for click-to-assign
+
+  // Tag system — global project-tag namespace (single set across all projects)
+  projectTagLabels: [],           // [{id, name, color}, ...]
+  projectTagAssignments: {},      // {folder: [tag_id, ...]}
+  projectActiveTagFilters: [],    // tag ids currently filtering the projects view
+  projectSelected: new Set(),     // folders selected in edit mode (bulk-tag pool)
 
   // Smart-select presets
   smartSelect: null,       // null or {preset, threshold}
@@ -98,7 +104,8 @@ export const state = {
   // modal first. Togglable from the transform menu and from buttons inside
   // the preview modal itself.
   previewEnabled: localStorage.getItem("previewEnabled") !== "0",
-  previewView: localStorage.getItem("previewView") === "diff" ? "diff" : "inline"
+  previewView: localStorage.getItem("previewView") === "diff" ? "diff" : "inline",
+  previewPosition: localStorage.getItem("previewPosition") === "last" ? "last" : "first",
 };
 
 export function persist(key, value) {
@@ -108,6 +115,11 @@ export function persist(key, value) {
 export function setViewMode(mode) {
   state.viewMode = mode;
   persist("viewMode", mode);
+}
+
+export function togglePreviewPosition() {
+  state.previewPosition = state.previewPosition === "first" ? "last" : "first";
+  persist("previewPosition", state.previewPosition);
 }
 
 
@@ -143,4 +155,32 @@ export function setPreviewView(v) {
 
 export function invalidateProjectsCache() {
   state.projectsCache = null;
+}
+
+
+// ── Selection persistence ─────────────────────────────────────────
+// Edit-mode selections survive navigation + hard reload via localStorage.
+// Restored on app init; persisted after every mutation. Scoped by
+// `folder` so project-a selections don't leak into project-b.
+
+const SELECTION_STORAGE_KEY = "llm-lens:selections";
+
+export function persistSelections() {
+  try {
+    const payload = {
+      editMode: state.editMode,
+      folder: state.folder,
+      selected: Array.from(state.selected || []),
+      projectSelected: Array.from(state.projectSelected || []),
+    };
+    localStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(payload));
+  } catch { /* ignore quota / disabled-storage */ }
+}
+
+export function restoreSelections() {
+  try {
+    const raw = localStorage.getItem(SELECTION_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
 }

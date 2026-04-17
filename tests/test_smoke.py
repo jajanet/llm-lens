@@ -392,6 +392,40 @@ def test_smoke_delete_conversation_tombstones_stats(client, tmp_path):
     assert dd.get("output_tokens", 0) >= 1
 
 
+def test_smoke_edit_non_prose_tombstones_tool_and_command_counts(client, tmp_path):
+    """End-to-end: edit over a Bash tool_use message. Stats (tool_uses,
+    commands, messages_edited) must land in deleted_delta — the modal
+    relies on these to keep bash-command breakdowns accurate post-edit."""
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [user_msg("u1", None, "hi"), bash_msg("a1", "u1", "grep foo .")])
+    resp = client.post(
+        "/api/projects/proj/conversations/c/messages/a1/edit",
+        json={"text": "scrubbed"},
+    )
+    assert resp.status_code == 200
+    stats = client.get("/api/projects/proj/conversations/c/stats").get_json()
+    dd = stats["deleted_delta"]
+    assert dd["tool_uses"] == {"Bash": 1}
+    assert dd["commands"] == {"grep": 1}
+    assert dd["messages_edited"] == 1
+
+
+def test_smoke_edit_and_delete_work_on_subagent_file(client, tmp_path):
+    """Subagent run messages live in <convo>/subagents/agent-*.jsonl.
+    Both edit and delete must resolve that path — used to 404."""
+    convo = "c"
+    write_jsonl(tmp_path / "proj" / f"{convo}.jsonl", [user_msg("m1", None, "hi")])
+    sub = tmp_path / "proj" / convo / "subagents" / "agent-x-abc.jsonl"
+    write_jsonl(sub, [user_msg("s1", None, "a"), user_msg("s2", "s1", "b")])
+    assert client.post(
+        f"/api/projects/proj/conversations/{convo}/messages/s1/edit",
+        json={"text": "edited"},
+    ).status_code == 200
+    assert client.delete(
+        f"/api/projects/proj/conversations/{convo}/messages/s2"
+    ).status_code == 200
+
+
 def test_smoke_archive_then_unarchive_roundtrip(client, tmp_path):
     make_convo(tmp_path, folder="proj", convo="c")
     assert client.post("/api/projects/proj/conversations/c/archive").status_code == 200
@@ -652,3 +686,57 @@ def test_smoke_download_fields_empty_post_preserves_required(client_isolated_dow
     assert resp.status_code == 200
     data = resp.get_json()
     assert data["role"] is True and data["content"] is True
+
+
+
+def test_smoke_conversations_list_includes_last_preview(client, tmp_path):
+    """Project list exposes `last_preview` alongside `preview` so the UI can
+    toggle between showing the first user message (topic) or the last user
+    message (resume-where-I-left-off) per the user's choice."""
+    fp = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(fp, [
+        user_msg("u1", None, "FIRST hello"),
+        assistant_msg("a1", "u1", "ok"),
+        user_msg("u2", "a1", "LAST goodbye"),
+    ])
+    r = client.get("/api/projects/proj/conversations").get_json()
+    item = r["items"][0]
+    assert item["preview"] == "FIRST hello"
+    assert item["last_preview"] == "LAST goodbye"
+
+
+
+def test_smoke_messages_expose_has_tool_use_and_has_thinking_flags(client, tmp_path):
+    """Each message in the /conversations/<id> response should carry
+    `has_tool_use` / `has_thinking` booleans so the frontend can gate
+    non-prose warnings on bulk edit/delete/scrub actions without
+    re-parsing the flattened display content."""
+    path = tmp_path / "proj" / "c.jsonl"
+    write_jsonl(path, [
+        user_msg("u1", None, "hi"),
+        {"uuid": "a1", "parentUuid": "u1", "type": "assistant",
+         "message": {"role": "assistant", "model": "claude-test",
+                     "usage": {"input_tokens": 1, "output_tokens": 1,
+                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+                     "content": [
+                         {"type": "thinking", "thinking": "t"},
+                         {"type": "tool_use", "name": "Bash",
+                          "id": "tu1", "input": {"command": "ls"}},
+                         {"type": "text", "text": "ok"},
+                     ]}},
+        {"uuid": "a2", "parentUuid": "a1", "type": "assistant",
+         "message": {"role": "assistant", "model": "claude-test",
+                     "content": [{"type": "text", "text": "plain text"}]}},
+    ])
+    r = client.get("/api/projects/proj/conversations/c").get_json()
+    byId = {m["uuid"]: m for m in r["main"]}
+    # Assistant msg with tool_use + thinking is flagged non-prose.
+    assert byId["a1"].get("has_tool_use") is True
+    assert byId["a1"].get("has_thinking") is True
+    # Plain text assistant msg has neither flag (flags are set only when True,
+    # so checking absence here is acceptable — frontend falsy-checks them).
+    assert not byId["a2"].get("has_tool_use")
+    assert not byId["a2"].get("has_thinking")
+    # User msg: no tool_use/thinking possible.
+    assert not byId["u1"].get("has_tool_use")
+    assert not byId["u1"].get("has_thinking")

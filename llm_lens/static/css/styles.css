@@ -8,6 +8,14 @@
   --asst-text: #e0e0e0;
   --think-bg: #1a1a2e;
   --modal-bg: rgba(0,0,0,0.6);
+  --tag-c0-bg: #e55; --tag-c0-fg: #fff;
+  --tag-c1-bg: #58f; --tag-c1-fg: #fff;
+  --tag-c2-bg: #5b5; --tag-c2-fg: #fff;
+  --tag-c3-bg: #da3; --tag-c3-fg: #1a1a2e;
+  --tag-c4-bg: #b6e; --tag-c4-fg: #1a1a2e;
+  --tag-c5-bg: #2cd; --tag-c5-fg: #1a1a2e;
+  --tag-c6-bg: #e5a; --tag-c6-fg: #fff;
+  --tag-c7-bg: #f83; --tag-c7-fg: #1a1a2e;
 }
 body.light {
   --bg: #ffffff; --bg2: #f6f8fa; --bg3: #e1e4e8;
@@ -19,6 +27,14 @@ body.light {
   --asst-text: #1f2328;
   --think-bg: #f0f0ff;
   --modal-bg: rgba(0,0,0,0.3);
+  --tag-c0-bg: #da2e2e; --tag-c0-fg: #fff;
+  --tag-c1-bg: #2c63c6; --tag-c1-fg: #fff;
+  --tag-c2-bg: #1f8b3a; --tag-c2-fg: #fff;
+  --tag-c3-bg: #b87400; --tag-c3-fg: #fff;
+  --tag-c4-bg: #8843c8; --tag-c4-fg: #fff;
+  --tag-c5-bg: #0a8f8f; --tag-c5-fg: #fff;
+  --tag-c6-bg: #c32b8c; --tag-c6-fg: #fff;
+  --tag-c7-bg: #d55200; --tag-c7-fg: #fff;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -436,9 +452,17 @@ body[data-view="conversations"]:not(.edit-mode) [data-action="unarchive-convo"] 
   display: none;
 }
 
-body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
+body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"],
+body[data-view="projects"]:not(.edit-mode) .col-check,
+body[data-view="projects"]:not(.edit-mode) .item-check {
   display: none;
 }
+
+/* Tag pills row on project cards — sits between the title and the
+   preview/checkbox row. Inline layout so multi-tag projects wrap
+   cleanly without pushing the preview down. */
+.card-tagpills { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0 4px; }
+
 
 /* Per-convo stats block (card view only). Populated by hydrateStats once
    server-side scanning finishes; shows "loading..." placeholder until then. */
@@ -949,11 +973,14 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
 .tag-pill-empty { border: 1px dashed var(--border); color: var(--text3); background: transparent; }
 .tag-pill-empty:hover { border-color: var(--text2); }
 
-.tag-color-0 { background: #e55; color: #fff; }
-.tag-color-1 { background: #58f; color: #fff; }
-.tag-color-2 { background: #5b5; color: #fff; }
-.tag-color-3 { background: #da3; color: #fff; }
-.tag-color-4 { background: #b6e; color: #1a1a2e; }
+.tag-color-0 { background: var(--tag-c0-bg); color: var(--tag-c0-fg); }
+.tag-color-1 { background: var(--tag-c1-bg); color: var(--tag-c1-fg); }
+.tag-color-2 { background: var(--tag-c2-bg); color: var(--tag-c2-fg); }
+.tag-color-3 { background: var(--tag-c3-bg); color: var(--tag-c3-fg); }
+.tag-color-4 { background: var(--tag-c4-bg); color: var(--tag-c4-fg); }
+.tag-color-5 { background: var(--tag-c5-bg); color: var(--tag-c5-fg); }
+.tag-color-6 { background: var(--tag-c6-bg); color: var(--tag-c6-fg); }
+.tag-color-7 { background: var(--tag-c7-bg); color: var(--tag-c7-fg); }
 
 .tag-pill-sm { font-size: 10px; padding: 0 5px; }
 
@@ -1007,9 +1034,12 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
 .tag-pill-editable .tag-pencil:hover { opacity: 1; }
 
 /* × on removable breadcrumb tags */
-.tag-pill-removable { cursor: pointer; }
-.tag-pill-removable .tag-x { margin-left: 2px; opacity: 0.75; font-weight: bold; }
-.tag-pill-removable:hover .tag-x { opacity: 1; }
+/* Matches the tag-bar pencil's hover-reveal pattern: resting state
+   shows just the tag name, hover exposes the action glyph. Keeps the
+   breadcrumb pills consistent with the rest of the tag UI. */
+.tag-pill-removable { cursor: pointer; position: relative; padding-right: 8px; }
+.tag-pill-removable .tag-x { display: none; margin-left: 2px; font-weight: bold; opacity: 0.85; }
+.tag-pill-removable:hover .tag-x { display: inline; opacity: 1; }
 
 /* Assign-tag popup (toolbar button → popup) */
 .tag-assign-popup {
@@ -1286,3 +1316,73 @@ body[data-view="projects"]:not(.edit-mode) [data-action="delete-project"] {
 .wordlists-modal .modal-actions {
   flex-shrink: 0;
 }
+
+.badge-agent {
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg2));
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  font-weight: 500;
+}
+
+.open-new-tab-btn {
+  flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0; border: 1px solid transparent;
+  background: transparent; color: var(--text3); border-radius: 4px;
+  cursor: pointer; opacity: 0; text-decoration: none;
+  transition: opacity 0.12s, color 0.12s, background 0.12s, border-color 0.12s;
+}
+.open-new-tab-btn:hover { color: var(--accent); background: var(--bg2); border-color: var(--border); }
+table.tbl tr:hover .open-new-tab-btn, .card:hover .open-new-tab-btn, .open-new-tab-btn:focus-visible { opacity: 1; }
+
+.bc-header-badges { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: middle; }
+
+.tag-edit-row { display: inline-flex; align-items: center; gap: 6px; padding: 0 2px; }
+.tag-edit-row .tag-rename-input { margin: 0; }
+.tag-swatch-row { display: inline-flex; gap: 4px; }
+.tag-swatch {
+  width: 14px; height: 14px; border-radius: 50%;
+  cursor: pointer; border: 2px solid transparent;
+  box-sizing: content-box; padding: 0;
+}
+.tag-swatch.selected { border-color: var(--text); }
+.tag-swatch:hover { filter: brightness(1.15); }
+.tag-swatch-0 { background: var(--tag-c0-bg); }
+.tag-swatch-1 { background: var(--tag-c1-bg); }
+.tag-swatch-2 { background: var(--tag-c2-bg); }
+.tag-swatch-3 { background: var(--tag-c3-bg); }
+.tag-swatch-4 { background: var(--tag-c4-bg); }
+.tag-swatch-5 { background: var(--tag-c5-bg); }
+.tag-swatch-6 { background: var(--tag-c6-bg); }
+.tag-swatch-7 { background: var(--tag-c7-bg); }
+
+
+/* Enlarged click target around a checkbox. Wrap the <input> with a
+   label.check-hit so clicking anywhere in the padded area toggles
+   selection — fixes the "accidentally opened the project/convo because
+   I missed the tiny checkbox" problem. Negative margin keeps layout
+   unchanged. */
+.check-hit {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 8px; cursor: pointer; border-radius: 4px;
+  transition: background 0.1s;
+}
+.check-hit:hover { background: var(--bg3); }
+.check-hit input { pointer-events: none; }
+table.tbl td.col-check { padding: 0; width: 32px; }
+table.tbl td.col-check .check-hit {
+  width: 100%; height: 100%; box-sizing: border-box; border-radius: 0;
+}
+
+
+/* Inline the projects-view bulk-action controls with the project-tag
+   bar so "N selected / Tag N selected / Clear" sits on the right of
+   the same row as the tag pills — saves a line of vertical space
+   when editing and keeps the controls visually linked to the tags
+   they operate on. */
+.tag-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.tag-row .tag-bar { flex: 1 1 auto; margin: 0; }
+.tag-bar-bulk {
+  display: inline-flex; align-items: center; gap: 8px;
+  margin-left: auto; font-size: 12px; color: var(--text2);
+}
+.tag-bar-sel-count { white-space: nowrap; }

@@ -89,10 +89,13 @@ function renderRow(row, view) {
     ? renderStacked(row.ops, row.before, row.after)
     : `<div class="preview-inline">${renderInline(row.ops, row.before, row.after)}</div>`;
   const delta = `<span class="preview-delta">+${row.delta.add} / -${row.delta.rem}</span>`;
-  return `<div class="preview-row" data-uuid="${esc(row.uuid)}">
+  const nonProseMark = row.nonProse
+    ? ` <span class="preview-nonprose-mark" title="Non-prose: this message has tool_use / thinking blocks that will be collapsed. Stats preserved via tombstones; raw block contents are lost.">⚠</span>`
+    : "";
+  return `<div class="preview-row${row.nonProse ? " preview-row-nonprose" : ""}" data-uuid="${esc(row.uuid)}">
     <label class="preview-check">
       <input type="checkbox" data-preview-check data-uuid="${esc(row.uuid)}" checked>
-      ${delta}
+      ${delta}${nonProseMark}
     </label>
     <div class="preview-body">${body}</div>
   </div>`;
@@ -107,7 +110,14 @@ export function computeRows(kind, candidates, opts) {
     catch { continue; }
     if (after === before) continue;
     const ops = diffWords(before, after);
-    rows.push({ uuid: m.uuid, before, after, ops, delta: deltaOf(ops, before, after) });
+    rows.push({
+      uuid: m.uuid, before, after, ops,
+      delta: deltaOf(ops, before, after),
+      // Backend-provided flags — true when editing this message will collapse
+      // tool_use / thinking blocks (structural content lost; stats survive via
+      // deleted-delta tombstones).
+      nonProse: !!(m.has_tool_use || m.has_thinking),
+    });
   }
   return rows;
 }
@@ -131,17 +141,28 @@ export function showPreviewModal({ kind, label, candidates, opts }) {
       <div class="modal preview-modal">
         <button class="modal-close" data-preview-close aria-label="Close">&times;</button>
         <h3 class="preview-title">${esc(label || kind)} — ${rows.length} message${rows.length === 1 ? "" : "s"} will change</h3>
+        ${(() => {
+          const n = rows.filter((r) => r.nonProse).length;
+          if (!n) return "";
+          return `<details class="preview-nonprose-banner" style="margin:8px 14px; padding:6px 8px; background:var(--warn-bg, #fff3cd); border:1px solid var(--warn-border, #d9b84a); border-radius:4px; font-size:12px">
+            <summary style="cursor:pointer"><strong>⚠ ${n} of ${rows.length} message${rows.length === 1 ? "" : "s"} ${n === 1 ? "is" : "are"} non-prose</strong> — click for details</summary>
+            <div style="margin-top:6px">Applying will collapse tool_use / thinking blocks in those messages to the transformed text. Stats (tool counts, bash command breakdowns, thinking, token slices, per-model) are preserved via deleted-delta tombstones, but the raw block contents are lost. Flagged rows below are marked with ⚠.</div>
+          </details>`;
+        })()}
         <div class="preview-topbar">
           <div class="preview-view-toggle" role="tablist">
             <button class="btn btn-sm ${view === "inline" ? "active" : ""}" data-preview-view="inline">Inline</button>
             <button class="btn btn-sm ${view === "diff" ? "active" : ""}" data-preview-view="diff">Diff</button>
           </div>
           <div class="preview-topbar-actions">
+            <span class="split-btn">
+              <button class="btn btn-sm" data-preview-select-all title="Toggle: select all rows / deselect all rows">Select all (${rows.length})</button>
+              <button class="btn btn-sm split-arrow" data-preview-scope-menu title="Select by content type (prose / non-prose only)">▾</button>
+            </span>
             <label class="preview-skip-check" title="Skip this modal the next time you run a transform. Re-enable from the transform menu.">
               <input type="checkbox" data-preview-skip>
               Don't preview next time
             </label>
-            <button class="btn btn-sm preview-apply-all" data-preview-apply-all>Apply all</button>
           </div>
         </div>
         <div class="modal-body preview-body-scroll" data-preview-list>
@@ -150,13 +171,16 @@ export function showPreviewModal({ kind, label, candidates, opts }) {
         <div class="modal-actions preview-bottombar">
           <button class="btn-cancel" data-preview-cancel>Cancel</button>
           <span class="preview-net-delta" data-preview-net aria-label="Net character delta across checked rows"></span>
-          <button class="btn-confirm-delete" data-preview-apply-selected>Apply selected</button>
+          <button class="btn-confirm-delete" data-preview-apply-selected>Apply selected (${rows.length})</button>
         </div>
       </div>`;
     document.body.appendChild(overlay);
 
     const byId = new Map(rows.map((r) => [r.uuid, { before: r.before, after: r.after }]));
     const deltaById = new Map(rows.map((r) => [r.uuid, r.delta]));
+    // Banner visibility follows currently-checked non-prose rows: unchecking
+    // every non-prose row hides the warning (nothing destructive remains).
+    const nonProseIds = new Set(rows.filter((r) => r.nonProse).map((r) => r.uuid));
 
     function finish(acceptedIds) {
       document.removeEventListener("keydown", onKey, true);
@@ -175,16 +199,32 @@ export function showPreviewModal({ kind, label, candidates, opts }) {
     function updateNetDelta() {
       const checked = collectChecked();
       let add = 0, rem = 0;
+      let checkedNonProse = 0;
       for (const id of checked) {
         const d = deltaById.get(id);
         if (d) { add += d.add; rem += d.rem; }
+        if (nonProseIds.has(id)) checkedNonProse++;
       }
       const net = add - rem;
       const netStr = net === 0 ? "±0" : (net > 0 ? `+${net}` : `${net}`);
       const box = overlay.querySelector("[data-preview-net]");
-      if (!box) return;
-      box.textContent = `+${add} / -${rem} · net ${netStr}`;
-      box.classList.toggle("preview-net-empty", checked.size === 0);
+      if (box) {
+        box.textContent = `+${add} / -${rem} · net ${netStr}`;
+        box.classList.toggle("preview-net-empty", checked.size === 0);
+      }
+      const banner = overlay.querySelector(".preview-nonprose-banner");
+      if (banner) banner.style.display = checkedNonProse > 0 ? "" : "none";
+      // Dynamic Select/Deselect label — matches the edit-convo toolbar pattern.
+      const selBtn = overlay.querySelector("[data-preview-select-all]");
+      if (selBtn) {
+        const allChecked = checked.size === rows.length;
+        selBtn.textContent = allChecked ? "Deselect all" : `Select all (${rows.length})`;
+      }
+      const applyBtn = overlay.querySelector("[data-preview-apply-selected]");
+      if (applyBtn) {
+        applyBtn.textContent = `Apply selected (${checked.size})`;
+        applyBtn.disabled = checked.size === 0;
+      }
     }
 
     function rerenderList() {
@@ -229,13 +269,59 @@ export function showPreviewModal({ kind, label, candidates, opts }) {
         rerenderList();
         return;
       }
-      if (t.matches("[data-preview-apply-all]")) {
-        finish(new Set(rows.map((r) => r.uuid))); return;
-      }
       if (t.matches("[data-preview-apply-selected]")) {
         finish(collectChecked()); return;
       }
+      if (t.matches("[data-preview-select-all]")) {
+        const boxes = overlay.querySelectorAll("[data-preview-check]");
+        const anyUnchecked = [...boxes].some((b) => !b.checked);
+        boxes.forEach((b) => { b.checked = anyUnchecked; });
+        updateNetDelta();
+        return;
+      }
+      if (t.matches("[data-preview-scope-menu]")) {
+        openScopeMenu(t);
+        return;
+      }
+      if (t.matches("[data-preview-scope]")) {
+        const scope = t.dataset.previewScope;  // "prose" | "non_prose"
+        const isProse = scope === "prose";
+        overlay.querySelectorAll("[data-preview-check]").forEach((b) => {
+          const isNP = nonProseIds.has(b.dataset.uuid);
+          b.checked = isProse ? !isNP : isNP;
+        });
+        closeScopeMenu();
+        updateNetDelta();
+        return;
+      }
     });
+
+    function closeScopeMenu() {
+      const m = overlay.querySelector(".preview-scope-menu");
+      if (m) m.remove();
+    }
+    function openScopeMenu(anchorEl) {
+      closeScopeMenu();
+      const proseN = rows.filter((r) => !r.nonProse).length;
+      const nonProseN = rows.length - proseN;
+      const menu = document.createElement("div");
+      menu.className = "transform-menu preview-scope-menu";
+      menu.innerHTML =
+        `<button class="btn btn-sm transform-menu-item" data-preview-scope="prose" ${proseN ? "" : "disabled"}>Select prose only (${proseN})</button>` +
+        `<button class="btn btn-sm transform-menu-item" data-preview-scope="non_prose" ${nonProseN ? "" : "disabled"}>Select non-prose only (${nonProseN})</button>`;
+      const r = anchorEl.getBoundingClientRect();
+      menu.style.position = "absolute";
+      menu.style.top = `${r.bottom + window.scrollY + 4}px`;
+      menu.style.left = `${r.left + window.scrollX}px`;
+      document.body.appendChild(menu);
+      const onDoc = (ev) => {
+        if (!menu.contains(ev.target) && ev.target !== anchorEl) {
+          closeScopeMenu();
+          document.removeEventListener("click", onDoc, true);
+        }
+      };
+      setTimeout(() => document.addEventListener("click", onDoc, true), 0);
+    }
 
     updateNetDelta();
   });

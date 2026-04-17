@@ -1,15 +1,24 @@
-"""Persistent per-project tag storage.
+"""Persistent multi-namespace tag store.
 
-Manages ~/.cache/llm-lens/tags.json — separate from sessions.json so tags
-survive peek_cache.hard_clear(). Uses the same lock + debounce-flush pattern.
+On-disk schema v2:
 
-Structure:
     {
-      "folder-name": {
-        "labels": [{"name": "bug fix", "color": 0}, ...],   # up to 5
-        "assignments": {"convo-id": [0, 2], ...}
-      }
+      "schema": 2,
+      "convos":  {folder: {labels, assignments, next_id}},
+      "projects": {labels, assignments, next_id},
+      "_seeded": ["projects"]   # namespaces we already seeded defaults for
     }
+
+Old schema v1 was a flat `{folder: {labels, assignments}}`. We migrate
+it on load; see `_migrate_schema`. The upgrade preserves all existing
+convo-tag data byte-for-byte (just nests it under `"convos"`), so
+the wire format the frontend sees is unchanged.
+
+Concurrency: a module-level `_lock` serializes mutations. Each public
+entry point briefly holds the lock, constructs a fresh `TagSet` over
+the relevant dict slice, runs the operation, and releases the lock.
+The `TagSet` itself is not thread-safe — that responsibility lives
+here, on purpose, so the primitive stays testable in isolation.
 """
 
 import atexit
@@ -18,12 +27,21 @@ import os
 import threading
 from pathlib import Path
 
+from .tag_set import TagSet, NUM_COLORS  # noqa: F401 (NUM_COLORS re-exported)
+
+SCHEMA_VERSION = 2
 CACHE_DIR = Path.home() / ".cache" / "llm-lens"
 TAGS_PATH = CACHE_DIR / "tags.json"
 FLUSH_DELAY = 2.0
-MAX_LABELS = 5
 
-_DEFAULT_LABELS = [{"name": "", "color": i} for i in range(MAX_LABELS)]
+# Seeded once on fresh installs. Deliberately small so users aren't
+# overwhelmed; they can delete / rename / recolor freely. Existing
+# installs being migrated from v1 are NOT reseeded (see _migrate_schema).
+DEFAULT_PROJECT_TAGS = [
+    {"name": "work",     "color": 1},
+    {"name": "creative", "color": 4},
+    {"name": "tools",    "color": 2},
+]
 
 _lock = threading.Lock()
 _store: dict = {}
@@ -31,23 +49,83 @@ _dirty = False
 _flush_timer: threading.Timer | None = None
 
 
+# ── Schema + load ─────────────────────────────────────────────────────
+
+def _fresh_store() -> dict:
+    return {
+        "schema": SCHEMA_VERSION,
+        "convos": {},
+        "projects": {"labels": [], "assignments": {}, "next_id": 0},
+        "_seeded": [],
+    }
+
+
+def _migrate_schema(data: dict) -> dict:
+    """Upgrade a raw on-disk dict to schema v2. Idempotent.
+
+    v1 is recognized by the absence of a `schema` key and a flat
+    `{folder: {labels, assignments}}` shape. We nest every such entry
+    under `"convos"` and mark `"projects"` as already-seeded so that
+    existing users don't suddenly see three unexpected project tags
+    appear on next load.
+    """
+    if data.get("schema") == SCHEMA_VERSION:
+        data.setdefault("convos", {})
+        data.setdefault(
+            "projects",
+            {"labels": [], "assignments": {}, "next_id": 0},
+        )
+        data.setdefault("_seeded", [])
+        return data
+    migrated = _fresh_store()
+    # v1 → v2: existing users shouldn't be surprised by new defaults.
+    migrated["_seeded"] = ["projects"]
+    for key, val in data.items():
+        if key in ("schema", "convos", "projects", "_seeded"):
+            continue
+        if isinstance(val, dict) and ("labels" in val or "assignments" in val):
+            migrated["convos"][key] = val
+    return migrated
+
+
+def _seed_fresh_defaults():
+    """Populate `projects` defaults exactly once per fresh install.
+
+    Gated by `_seeded` so a user who intentionally deletes every
+    project tag doesn't get the defaults resurrected. The v1→v2
+    migration path adds "projects" to `_seeded` upfront, so existing
+    installs are opted out.
+    """
+    global _dirty
+    seeded = _store.setdefault("_seeded", [])
+    if "projects" in seeded:
+        return
+    projects_slice = _store.setdefault(
+        "projects", {"labels": [], "assignments": {}, "next_id": 0}
+    )
+    if not projects_slice.get("labels"):
+        ts = TagSet(projects_slice)
+        ts.set_labels(DEFAULT_PROJECT_TAGS)
+    seeded.append("projects")
+    _dirty = True
+
+
 def _load():
     global _store
     try:
         with open(TAGS_PATH, "r") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            _store = data
+            raw = json.load(fh)
+        _store = _migrate_schema(raw) if isinstance(raw, dict) else _fresh_store()
     except (OSError, json.JSONDecodeError):
-        _store = {}
+        _store = _fresh_store()
+    _seed_fresh_defaults()
+
 
 _load()
-
-
-# On abrupt shutdown (kill, SIGTERM), the debounce timer may not fire. Flush
-# synchronously at exit so the in-memory store always makes it to disk.
 atexit.register(lambda: flush())
 
+
+# ── Persistence ──────────────────────────────────────────────────────
 
 def _schedule_flush():
     global _flush_timer
@@ -78,92 +156,111 @@ def flush():
         pass
 
 
-def get_project(folder: str) -> dict:
-    """Return {"labels": [...], "assignments": {...}} for a folder."""
-    with _lock:
-        project = _store.get(folder)
-    if not project:
-        return {"labels": list(_DEFAULT_LABELS), "assignments": {}}
-    return {
-        "labels": project.get("labels", list(_DEFAULT_LABELS)),
-        "assignments": project.get("assignments", {}),
-    }
-
-
-def set_labels(folder: str, labels: list[dict]):
-    """Replace label definitions for a folder (max 5)."""
+def _mark_dirty():
     global _dirty
-    labels = labels[:MAX_LABELS]
+    _dirty = True
+
+
+# ── Namespace resolution ─────────────────────────────────────────────
+
+def _slot_for(namespace: tuple) -> dict:
+    """Return (creating if needed) the dict slice that backs a namespace.
+
+    Caller must hold `_lock`. Recognized namespaces:
+    * `("convos", folder)` — one set per project folder.
+    * `("projects",)`       — single global set of project-level tags.
+    """
+    if namespace == ("projects",):
+        return _store.setdefault(
+            "projects", {"labels": [], "assignments": {}, "next_id": 0}
+        )
+    if len(namespace) == 2 and namespace[0] == "convos":
+        convos = _store.setdefault("convos", {})
+        return convos.setdefault(
+            namespace[1], {"labels": [], "assignments": {}, "next_id": 0}
+        )
+    raise ValueError(f"unknown tag namespace: {namespace!r}")
+
+
+# ── Generic namespace API ────────────────────────────────────────────
+
+def get(namespace: tuple) -> dict:
+    """Return a `{labels, assignments}` snapshot for a namespace.
+
+    Construction of the TagSet may trigger a lazy migration of legacy
+    5-slot data, so we always schedule a flush after this call.
+    """
     with _lock:
-        project = _store.setdefault(folder, {})
-        project["labels"] = labels
-        _dirty = True
+        ts = TagSet(_slot_for(namespace), on_change=_mark_dirty)
+        out = ts.snapshot()
+    _schedule_flush()  # no-op if nothing got dirty
+    return out
+
+
+def set_labels_ns(namespace: tuple, labels: list):
+    with _lock:
+        ts = TagSet(_slot_for(namespace), on_change=_mark_dirty)
+        ts.set_labels(labels)
     _schedule_flush()
 
 
-def assign(folder: str, convo_id: str, tag_indices: list[int]):
-    """Set the tags for one conversation (replaces prior assignment)."""
-    global _dirty
-    tag_indices = [i for i in tag_indices if 0 <= i < MAX_LABELS]
+def assign_ns(namespace: tuple, key: str, tag_ids: list):
     with _lock:
-        project = _store.setdefault(folder, {})
-        assignments = project.setdefault("assignments", {})
-        if tag_indices:
-            assignments[convo_id] = sorted(set(tag_indices))
-        else:
-            assignments.pop(convo_id, None)
-        _dirty = True
+        ts = TagSet(_slot_for(namespace), on_change=_mark_dirty)
+        ts.assign(key, tag_ids)
     _schedule_flush()
 
 
-def bulk_assign(folder: str, convo_ids: list[str], tag_index: int, add: bool) -> int:
-    """Add or remove a single tag from multiple conversations. Returns count."""
-    global _dirty
-    if not (0 <= tag_index < MAX_LABELS):
-        return 0
-    count = 0
+def bulk_assign_ns(namespace: tuple, keys: list, tag_id: int, add: bool) -> int:
     with _lock:
-        project = _store.setdefault(folder, {})
-        assignments = project.setdefault("assignments", {})
-        for cid in convo_ids:
-            current = set(assignments.get(cid, []))
-            if add:
-                if tag_index not in current:
-                    current.add(tag_index)
-                    count += 1
-            else:
-                if tag_index in current:
-                    current.discard(tag_index)
-                    count += 1
-            if current:
-                assignments[cid] = sorted(current)
-            else:
-                assignments.pop(cid, None)
-        if count:
-            _dirty = True
+        ts = TagSet(_slot_for(namespace), on_change=_mark_dirty)
+        count = ts.bulk_assign(keys, tag_id, add)
     _schedule_flush()
     return count
 
 
-def remove_conversation(folder: str, convo_id: str):
-    """Clean up tags when a conversation is deleted."""
-    global _dirty
+def remove_key_ns(namespace: tuple, key: str):
     with _lock:
-        project = _store.get(folder)
-        if not project:
-            return
-        assignments = project.get("assignments", {})
-        if convo_id in assignments:
-            del assignments[convo_id]
-            _dirty = True
+        ts = TagSet(_slot_for(namespace), on_change=_mark_dirty)
+        ts.remove_key(key)
     _schedule_flush()
 
 
+# ── Backward-compat convo-tag shortcuts ──────────────────────────────
+
+def get_project(folder: str) -> dict:
+    return get(("convos", folder))
+
+
+def set_labels(folder: str, labels: list):
+    set_labels_ns(("convos", folder), labels)
+
+
+def assign(folder: str, convo_id: str, tag_ids: list):
+    assign_ns(("convos", folder), convo_id, tag_ids)
+
+
+def bulk_assign(folder: str, convo_ids: list, tag_id: int, add: bool) -> int:
+    return bulk_assign_ns(("convos", folder), convo_ids, tag_id, add)
+
+
+def remove_conversation(folder: str, convo_id: str):
+    remove_key_ns(("convos", folder), convo_id)
+
+
 def remove_folder(folder: str):
-    """Clean up when a project is deleted."""
+    """Clean up when a project is deleted: drop the folder's convo-tag
+    set entirely, and scrub its id from project-tag assignments too
+    (the folder may itself have been tagged at the project level)."""
     global _dirty
     with _lock:
-        if folder in _store:
-            del _store[folder]
+        convos = _store.setdefault("convos", {})
+        if folder in convos:
+            del convos[folder]
+            _dirty = True
+        projects = _store.get("projects", {})
+        assignments = projects.get("assignments", {})
+        if folder in assignments:
+            del assignments[folder]
             _dirty = True
     _schedule_flush()

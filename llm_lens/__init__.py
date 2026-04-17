@@ -71,13 +71,107 @@ def _move_preserving_mtime(src: Path, dst: Path):
 # LRU cache – keyed on (path, mtime, size) so edits/new files invalidate
 # ---------------------------------------------------------------------------
 
+def _tail_user_preview(filepath: Path) -> str | None:
+    """Return the last non-meta user message's text preview, or None.
+
+    Reads the file's tail and parses lines backwards, expanding the read
+    window progressively until a prose user message is found or we've
+    covered the whole file. Expanding widens because Claude Code convos
+    often end with long assistant turns / tool_results that push the last
+    user message far back from EOF.
+
+    Stops at the first user message with prose text (skips tool_result-only
+    entries and `<local-command>` artifacts).
+    """
+    try:
+        size = filepath.stat().st_size
+    except OSError:
+        return None
+    if size == 0:
+        return None
+
+    def _extract(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    parts.append(b.get("text") or "")
+            return "".join(parts)
+        return ""
+
+    # Progressive tail reads: start small, double until we find a user
+    # message or we've read the whole file. Cap at 4MB to keep worst-case
+    # bounded for the 99th-percentile large convo files.
+    windows = [256_000, 1_000_000, 4_000_000]
+    for window in windows:
+        try:
+            with open(filepath, "rb") as fh:
+                start = max(0, size - window)
+                fh.seek(start)
+                chunk = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+
+        lines = chunk.splitlines()
+        # Drop the (likely truncated) first line unless we read from byte 0.
+        if start > 0 and lines:
+            lines = lines[1:]
+
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("isMeta"):
+                continue
+            msg = entry.get("message") or {}
+            if msg.get("role") != "user":
+                continue
+            text = _extract(msg.get("content"))
+            if not text or text.startswith("<local-command"):
+                continue
+            return re.sub(r"<[^>]+>", "", text[:200]).strip()
+
+        # Already covered whole file — no user message found; stop expanding.
+        if start == 0:
+            return None
+
+    return None
+
+
 @lru_cache(maxsize=512)
 def _peek_jsonl_cached(filepath_str: str, mtime: float, size: int) -> dict:
-    """Cached peek: only re-reads when file changes."""
+    """Cached peek: only re-reads when file changes.
+
+    Returns `preview` (first user message's text) and `last_preview` (last
+    user message's text, via tail read). Handles both string and
+    list-of-blocks content shapes — list shape happens after in-place edits
+    (`_replace_content` writes `[{"type":"text","text":...}]`) and in
+    subagent flows; without both-shape handling the project list silently
+    showed "(empty)".
+    """
     filepath = Path(filepath_str)
     cwd = None
     preview = None
     first_ts = None
+    agent = None
+
+    def _extract_user_text(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    parts.append(b.get("text") or "")
+            return "".join(parts)
+        return ""
+
     with open(filepath, "r") as fh:
         for i, line in enumerate(fh):
             if i >= 30:
@@ -91,26 +185,58 @@ def _peek_jsonl_cached(filepath_str: str, mtime: float, size: int) -> dict:
                 continue
             if entry.get("type") == "file-history-snapshot":
                 continue
+            if entry.get("type") == "agent-setting":
+                val = entry.get("agentSetting")
+                if val:
+                    agent = val
+                continue
             if not cwd and entry.get("cwd"):
                 cwd = entry["cwd"]
             if not first_ts and entry.get("timestamp"):
                 first_ts = entry["timestamp"]
             role = entry.get("message", {}).get("role")
             content = entry.get("message", {}).get("content", "")
-            if role == "user" and isinstance(content, str) and not entry.get("isMeta") and not content.startswith("<local-command"):
-                if not preview:
-                    preview = re.sub(r"<[^>]+>", "", content[:200]).strip()
-                    if cwd:
-                        break
-    return {"cwd": cwd, "preview": preview or "(empty)", "first_ts": first_ts}
+            if role == "user" and not entry.get("isMeta"):
+                text = _extract_user_text(content)
+                if text and not text.startswith("<local-command"):
+                    if not preview:
+                        preview = re.sub(r"<[^>]+>", "", text[:200]).strip()
+
+    last_preview = _tail_user_preview(filepath)
+    # Fall back to first preview when the tail window can't surface a user
+    # message (very long files where the last user message lives >4MB back
+    # from EOF, or single-turn convos where first == last). Only files with
+    # genuinely no user content stay "(empty)" on both.
+    if not last_preview and preview:
+        last_preview = preview
+    return {
+        "cwd": cwd,
+        "preview": preview or "(empty)",
+        "last_preview": last_preview or "(empty)",
+        "first_ts": first_ts,
+        "agent": agent,
+    }
 
 
 def _peek(filepath: Path, stat: os.stat_result) -> dict:
     cached = peek_cache.get(filepath, stat)
-    if cached and "preview" in cached:
-        return {"cwd": cached.get("cwd"), "preview": cached["preview"], "first_ts": cached.get("first_ts")}
+    if cached and "preview" in cached and "agent" in cached and "last_preview" in cached:
+        return {
+            "cwd": cached.get("cwd"),
+            "preview": cached["preview"],
+            "last_preview": cached["last_preview"],
+            "first_ts": cached.get("first_ts"),
+            "agent": cached.get("agent"),
+        }
     result = _peek_jsonl_cached(str(filepath), stat.st_mtime, stat.st_size)
-    peek_cache.set(filepath, stat, preview=result["preview"], cwd=result["cwd"], first_ts=result["first_ts"])
+    peek_cache.set(
+        filepath, stat,
+        preview=result["preview"],
+        last_preview=result["last_preview"],
+        cwd=result["cwd"],
+        first_ts=result["first_ts"],
+        agent=result.get("agent"),
+    )
     return result
 
 
@@ -216,12 +342,248 @@ def _extract_command_name(cmd: str) -> str:
     return tokens[0].rsplit("/", 1)[-1]
 
 
+def _empty_stats() -> dict:
+    """Canonical empty shape for the stats delta schema.
+
+    The tombstone `deleted_delta` shape is kept equal to this so that adding
+    a new field here auto-flows through every destructive op (edit, scrub,
+    per-msg delete, whole-file delete) and through `api_overview` aggregation.
+
+    Identity fields (`models` list, `git_branch`, `last_context_*`,
+    `last_model_for_context`) are intentionally NOT in this shape — they're
+    per-file snapshots, not delta-able quantities.
+    """
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "tool_uses": {},
+        "commands": {},
+        "thinking_count": 0,
+        "tool_turn_tokens": {},
+        "command_turn_tokens": {},
+        "thinking_output_tokens_estimate": {},
+        "slash_commands": {},
+        "compact_summary_chars": 0,
+        "queued_count": 0,
+        "compact_count": 0,
+        "away_count": 0,
+        "info_count": 0,
+        "scheduled_count": 0,
+        "per_model": {},
+    }
+
+
+def _empty_per_model_entry() -> dict:
+    """Shape of a `per_model[model]` entry — same delta-able content-derived
+    fields as `_empty_stats()` minus file-level keys. No recursive per_model."""
+    return {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_creation_tokens": 0,
+        "tool_uses": {}, "commands": {},
+        "thinking_count": 0,
+        "tool_turn_tokens": {}, "command_turn_tokens": {},
+    }
+
+
+def _ttt_bucket(d: dict, name: str) -> dict:
+    return d.setdefault(name, {k: 0 for k in _TTT_FIELDS})
+
+
+def _text_len_of(content) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        n = 0
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                n += len(b.get("text") or "")
+        return n
+    return 0
+
+
+def _accumulate_entry_into(acc: dict, entry: dict, ctx: dict):
+    """Fold one JSONL entry's stats into `acc` in place.
+
+    `ctx` is a mutable dict carrying cross-entry state:
+      - "last_model": str — last assistant model seen (for sidechain entries
+        missing a model field on the message)
+      - "pending_compact": bool — true when the previous system entry was a
+        compact_boundary; the next non-meta user message's text length is
+        credited to compact_summary_chars
+
+    Populates the full `_empty_stats()` shape including `per_model[mkey]`.
+    File-level identity fields (`models`, `git_branch`, `last_context_*`)
+    are NOT populated here — they stay in `_stats_cached`'s loop.
+    """
+    t = entry.get("type")
+    st = entry.get("subtype")
+    if t == "queue-operation":
+        acc["queued_count"] = acc.get("queued_count", 0) + 1
+    elif t == "system":
+        if st == "local_command":
+            m = _CMD_NAME_RE.search(entry.get("content") or "")
+            if m:
+                n = m.group(1).strip()
+                acc["slash_commands"][n] = acc["slash_commands"].get(n, 0) + 1
+        elif st == "compact_boundary":
+            acc["compact_count"] = acc.get("compact_count", 0) + 1
+            ctx["pending_compact"] = True
+        elif st == "away_summary":
+            acc["away_count"] = acc.get("away_count", 0) + 1
+        elif st == "informational":
+            acc["info_count"] = acc.get("info_count", 0) + 1
+        elif st == "scheduled_task_fire":
+            acc["scheduled_count"] = acc.get("scheduled_count", 0) + 1
+
+    msg = entry.get("message") or {}
+    if isinstance(msg.get("content"), str):
+        for m in _CMD_NAME_RE.finditer(msg["content"]):
+            n = m.group(1).strip()
+            acc["slash_commands"][n] = acc["slash_commands"].get(n, 0) + 1
+
+    role = msg.get("role")
+
+    if ctx.get("pending_compact") and role == "user" and not entry.get("isMeta"):
+        acc["compact_summary_chars"] = acc.get("compact_summary_chars", 0) + _text_len_of(msg.get("content"))
+        ctx["pending_compact"] = False
+
+    if role != "assistant":
+        return
+
+    model = msg.get("model")
+    if model:
+        ctx["last_model"] = model
+    mkey = model or ctx.get("last_model") or "?"
+    pm = acc["per_model"].setdefault(mkey, _empty_per_model_entry())
+
+    usage = msg.get("usage") or {}
+    in_t = int(usage.get("input_tokens") or 0)
+    out_t = int(usage.get("output_tokens") or 0)
+    cr_t = int(usage.get("cache_read_input_tokens") or 0)
+    cc_t = int(usage.get("cache_creation_input_tokens") or 0)
+    acc["input_tokens"] += in_t
+    acc["output_tokens"] += out_t
+    acc["cache_read_tokens"] += cr_t
+    acc["cache_creation_tokens"] += cc_t
+    pm["input_tokens"] += in_t
+    pm["output_tokens"] += out_t
+    pm["cache_read_tokens"] += cr_t
+    pm["cache_creation_tokens"] += cc_t
+
+    tool_block_entries = []
+    text_chars_turn = 0
+    content = msg.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type")
+            if bt == "tool_use":
+                name = block.get("name") or "?"
+                acc["tool_uses"][name] = acc["tool_uses"].get(name, 0) + 1
+                pm["tool_uses"][name] = pm["tool_uses"].get(name, 0) + 1
+                cname = None
+                if name == "Bash":
+                    cmd = (block.get("input") or {}).get("command", "")
+                    cname = _extract_command_name(cmd) or None
+                    if cname:
+                        acc["commands"][cname] = acc["commands"].get(cname, 0) + 1
+                        pm["commands"][cname] = pm["commands"].get(cname, 0) + 1
+                tool_block_entries.append((name, cname))
+            elif bt == "thinking":
+                acc["thinking_count"] += 1
+                pm["thinking_count"] += 1
+            elif bt == "text":
+                text_chars_turn += len(block.get("text") or "")
+
+    has_thinking_block = any(
+        isinstance(b, dict) and b.get("type") == "thinking"
+        for b in (content if isinstance(content, list) else [])
+    )
+    if has_thinking_block and out_t:
+        response_tokens_est = text_chars_turn // 4
+        est = max(0, min(out_t, out_t - response_tokens_est))
+        if est > 0:
+            acc["thinking_output_tokens_estimate"][mkey] = (
+                acc["thinking_output_tokens_estimate"].get(mkey, 0) + est
+            )
+
+    n_blocks = len(tool_block_entries)
+    if n_blocks:
+        share_in = in_t / n_blocks
+        share_out = out_t / n_blocks
+        share_cr = cr_t / n_blocks
+        share_cc = cc_t / n_blocks
+        for tname, cname in tool_block_entries:
+            for tgt in (
+                _ttt_bucket(acc["tool_turn_tokens"], tname),
+                _ttt_bucket(pm["tool_turn_tokens"], tname),
+            ):
+                tgt["input_tokens"] += share_in
+                tgt["output_tokens"] += share_out
+                tgt["cache_read_tokens"] += share_cr
+                tgt["cache_creation_tokens"] += share_cc
+            if cname:
+                for tgt in (
+                    _ttt_bucket(acc["command_turn_tokens"], cname),
+                    _ttt_bucket(pm["command_turn_tokens"], cname),
+                ):
+                    tgt["input_tokens"] += share_in
+                    tgt["output_tokens"] += share_out
+                    tgt["cache_read_tokens"] += share_cr
+                    tgt["cache_creation_tokens"] += share_cc
+
+
+def _diff_stats(before: dict, after: dict) -> dict:
+    """Positive per-key difference between two stats dicts. Recursive over
+    nested dicts. Scalars: max(0, b - a). Type-mismatched keys are skipped.
+    Sparse output — keys with zero diff are omitted."""
+    out: dict = {}
+    for k, bv in (before or {}).items():
+        av = after.get(k) if isinstance(after, dict) else None
+        if isinstance(bv, dict):
+            sub = _diff_stats(bv, av if isinstance(av, dict) else {})
+            if sub:
+                out[k] = sub
+        elif isinstance(bv, (int, float)):
+            d = bv - (av or 0)
+            if d > 0:
+                out[k] = d
+    return out
+
+
+def _ctx_at(entries: list, target_uuid: str) -> dict:
+    """Replay cross-entry ctx state up to (but not including) `target_uuid`.
+
+    Used by destructive endpoints so `_message_stats` sees the correct
+    `pending_compact` / `last_model` state when computing before/after
+    tombstone diffs. Without this, edits to the first user message after a
+    compact_boundary would miss the `compact_summary_chars` credit.
+
+    O(target_index). Fine for typical files.
+    """
+    ctx = {"last_model": "?", "pending_compact": False}
+    scratch = _empty_stats()
+    for e in entries:
+        if e.get("uuid") == target_uuid:
+            break
+        _accumulate_entry_into(scratch, e, ctx)
+    return ctx
+
+
 @lru_cache(maxsize=256)
 def _stats_cached(filepath_str: str, mtime: float, size: int):
     """One-pass aggregation of model(s), token totals, tool-use and thinking
     block counts, shell-command frequencies (from Bash tool_use blocks),
     and the session's starting git branch. Token counts come from each
     assistant message's real `message.usage` — no estimation.
+
+    The per-entry extraction is delegated to `_accumulate_entry_into` so the
+    exact same code path feeds both whole-file scan and single-message
+    tombstone deltas (`_message_stats`). The delta schema therefore tracks
+    the full live shape — no fields are dropped on destructive ops.
 
     Per-model breakdowns (`per_model`) include `tool_uses`, `commands`,
     `thinking_count`, `tool_turn_tokens`, and `command_turn_tokens`.
@@ -245,48 +607,14 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
 
     Thinking / compaction cost estimates (`thinking_output_tokens_estimate`
     is per model, `compact_summary_chars` is scalar) support the estimate
-    rows in the cost tab. See their comments in the loop for methodology.
+    rows in the cost tab. See `_accumulate_entry_into` for methodology.
     """
-    input_tokens = output_tokens = cache_read = cache_creation = 0
-    models = []
-    tool_uses = {}
-    commands: dict = {}
-    thinking_count = 0
-    tool_turn_tokens: dict = {}
-    command_turn_tokens: dict = {}
+    acc = _empty_stats()
+    models: list = []
     git_branch = None
-    per_model: dict = {}
-    last_model = "?"
     last_ctx_in = last_ctx_cc = last_ctx_cr = 0
     last_ctx_model = ""
-
-    slash_commands: dict = {}
-    queued_count = 0
-    compact_count = 0
-    away_count = 0
-    info_count = 0
-    scheduled_count = 0
-
-    thinking_output_tokens_estimate: dict = {}  # model -> int
-    compact_summary_chars = 0
-    pending_compact = False  # next non-meta user message is the summary
-
-    def _ttt_bucket(d: dict, name: str):
-        return d.setdefault(name, {
-            "input_tokens": 0.0, "output_tokens": 0.0,
-            "cache_read_tokens": 0.0, "cache_creation_tokens": 0.0,
-        })
-
-    def _text_len_of(content):
-        if isinstance(content, str):
-            return len(content)
-        if isinstance(content, list):
-            n = 0
-            for b in content:
-                if isinstance(b, dict) and b.get("type") == "text":
-                    n += len(b.get("text") or "")
-            return n
-        return 0
+    ctx = {"last_model": "?", "pending_compact": False}
 
     try:
         with open(filepath_str, "r") as fh:
@@ -301,226 +629,69 @@ def _stats_cached(filepath_str: str, mtime: float, size: int):
                 if git_branch is None and entry.get("gitBranch"):
                     git_branch = entry["gitBranch"]
 
-                t = entry.get("type")
-                st = entry.get("subtype")
-                if t == "queue-operation":
-                    queued_count += 1
-                elif t == "system":
-                    if st == "local_command":
-                        m = _CMD_NAME_RE.search(entry.get("content") or "")
-                        if m:
-                            n = m.group(1).strip()
-                            slash_commands[n] = slash_commands.get(n, 0) + 1
-                    elif st == "compact_boundary":
-                        compact_count += 1
-                        pending_compact = True
-                    elif st == "away_summary":
-                        away_count += 1
-                    elif st == "informational":
-                        info_count += 1
-                    elif st == "scheduled_task_fire":
-                        scheduled_count += 1
+                _accumulate_entry_into(acc, entry, ctx)
 
+                # File-level identity fields: tracked here, not in the extractor.
                 msg = entry.get("message") or {}
-                if isinstance(msg.get("content"), str):
-                    for m in _CMD_NAME_RE.finditer(msg["content"]):
-                        n = m.group(1).strip()
-                        slash_commands[n] = slash_commands.get(n, 0) + 1
-
-                role = msg.get("role")
-
-                # Compaction estimate: the injected summary shows up as the
-                # first non-meta user message after a compact_boundary. Its
-                # character length is the best proxy we have for the
-                # compaction's output size — Anthropic doesn't log the
-                # compaction API call itself in the JSONL.
-                if pending_compact and role == "user" and not entry.get("isMeta"):
-                    compact_summary_chars += _text_len_of(msg.get("content"))
-                    pending_compact = False
-
-                if role != "assistant":
-                    continue
-
-                model = msg.get("model")
-                if model and model not in models:
-                    models.append(model)
-                if model:
-                    last_model = model
-                mkey = model or last_model
-                pm = per_model.setdefault(mkey, {
-                    "input_tokens": 0, "output_tokens": 0,
-                    "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                    "tool_uses": {}, "commands": {},
-                    "thinking_count": 0,
-                    "tool_turn_tokens": {}, "command_turn_tokens": {},
-                })
-
-                usage = msg.get("usage") or {}
-                in_t = int(usage.get("input_tokens") or 0)
-                out_t = int(usage.get("output_tokens") or 0)
-                cr_t = int(usage.get("cache_read_input_tokens") or 0)
-                cc_t = int(usage.get("cache_creation_input_tokens") or 0)
-                input_tokens += in_t
-                output_tokens += out_t
-                cache_read += cr_t
-                cache_creation += cc_t
-                pm["input_tokens"] += in_t
-                pm["output_tokens"] += out_t
-                pm["cache_read_tokens"] += cr_t
-                pm["cache_creation_tokens"] += cc_t
-
-                if not entry.get("isSidechain"):
-                    last_ctx_in = in_t
-                    last_ctx_cc = cc_t
-                    last_ctx_cr = cr_t
-                    last_ctx_model = mkey
-
-                tool_block_entries = []
-                thinking_chars_turn = 0
-                text_chars_turn = 0
-                content = msg.get("content")
-                if isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        bt = block.get("type")
-                        if bt == "tool_use":
-                            name = block.get("name") or "?"
-                            tool_uses[name] = tool_uses.get(name, 0) + 1
-                            pm["tool_uses"][name] = pm["tool_uses"].get(name, 0) + 1
-                            cname = None
-                            if name == "Bash":
-                                cmd = (block.get("input") or {}).get("command", "")
-                                cname = _extract_command_name(cmd) or None
-                                if cname:
-                                    commands[cname] = commands.get(cname, 0) + 1
-                                    pm["commands"][cname] = pm["commands"].get(cname, 0) + 1
-                            tool_block_entries.append((name, cname))
-                        elif bt == "thinking":
-                            thinking_count += 1
-                            pm["thinking_count"] += 1
-                            thinking_chars_turn += len(block.get("thinking") or "")
-                        elif bt == "text":
-                            text_chars_turn += len(block.get("text") or "")
-
-                # Thinking prorate: turns with any thinking block attribute
-                # `output_tokens - (text_chars / 4)` to thinking. Anthropic
-                # often redacts thinking content (stores signature only, no
-                # text) so we can't use thinking_chars as a signal. Visible
-                # text length divided by the standard English chars/token
-                # ratio gives the response side; the residual is thinking.
-                # Clamped to [0, out_t] to guard against short-response
-                # overshoot. Superscript note in the modal explains this.
-                has_thinking_block = any(
-                    isinstance(b, dict) and b.get("type") == "thinking"
-                    for b in (content if isinstance(content, list) else [])
-                )
-                if has_thinking_block and out_t:
-                    response_tokens_est = text_chars_turn // 4
-                    est = max(0, min(out_t, out_t - response_tokens_est))
-                    if est > 0:
-                        thinking_output_tokens_estimate[mkey] = (
-                            thinking_output_tokens_estimate.get(mkey, 0) + est
-                        )
-
-                n_blocks = len(tool_block_entries)
-                if n_blocks:
-                    share_in = in_t / n_blocks
-                    share_out = out_t / n_blocks
-                    share_cr = cr_t / n_blocks
-                    share_cc = cc_t / n_blocks
-                    for tname, cname in tool_block_entries:
-                        for tgt in (
-                            _ttt_bucket(tool_turn_tokens, tname),
-                            _ttt_bucket(pm["tool_turn_tokens"], tname),
-                        ):
-                            tgt["input_tokens"] += share_in
-                            tgt["output_tokens"] += share_out
-                            tgt["cache_read_tokens"] += share_cr
-                            tgt["cache_creation_tokens"] += share_cc
-                        if cname:
-                            for tgt in (
-                                _ttt_bucket(command_turn_tokens, cname),
-                                _ttt_bucket(pm["command_turn_tokens"], cname),
-                            ):
-                                tgt["input_tokens"] += share_in
-                                tgt["output_tokens"] += share_out
-                                tgt["cache_read_tokens"] += share_cr
-                                tgt["cache_creation_tokens"] += share_cc
+                if msg.get("role") == "assistant":
+                    model = msg.get("model")
+                    if model and model not in models:
+                        models.append(model)
+                    if not entry.get("isSidechain"):
+                        usage = msg.get("usage") or {}
+                        last_ctx_in = int(usage.get("input_tokens") or 0)
+                        last_ctx_cc = int(usage.get("cache_creation_input_tokens") or 0)
+                        last_ctx_cr = int(usage.get("cache_read_input_tokens") or 0)
+                        last_ctx_model = model or ctx.get("last_model") or ""
     except OSError:
         pass
 
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "cache_read_tokens": cache_read,
-        "cache_creation_tokens": cache_creation,
-        "models": models,
-        "tool_uses": tool_uses,
-        "thinking_count": thinking_count,
-        "git_branch": git_branch,
-        "per_model": per_model,
-        "commands": commands,
-        "tool_turn_tokens": tool_turn_tokens,
-        "command_turn_tokens": command_turn_tokens,
-        "last_context_input_tokens": last_ctx_in,
-        "last_context_cache_creation_tokens": last_ctx_cc,
-        "last_context_cache_read_tokens": last_ctx_cr,
-        "last_model_for_context": last_ctx_model,
-        "slash_commands": slash_commands,
-        "queued_count": queued_count,
-        "compact_count": compact_count,
-        "away_count": away_count,
-        "info_count": info_count,
-        "scheduled_count": scheduled_count,
-        "thinking_output_tokens_estimate": thinking_output_tokens_estimate,
-        "compact_summary_chars": compact_summary_chars,
-    }
+    out = dict(acc)
+    out["models"] = models
+    out["git_branch"] = git_branch
+    out["last_context_input_tokens"] = last_ctx_in
+    out["last_context_cache_creation_tokens"] = last_ctx_cc
+    out["last_context_cache_read_tokens"] = last_ctx_cr
+    out["last_model_for_context"] = last_ctx_model
+    return out
 
 
-def _message_stats(entry: dict) -> dict:
-    """Extract the same shape as `_stats_cached` but for one parsed JSONL entry.
+def _message_stats(entry: dict, ctx: dict | None = None) -> dict:
+    """Per-entry stats in the canonical `_empty_stats()` shape.
 
-    Used by delete paths to compute the stats delta to tombstone before the
-    file is mutated. Mirrors the per-entry branch in `_stats_cached`.
+    Used by destructive endpoints (edit, scrub, per-msg delete) to compute
+    before/after tombstone deltas. The extractor is shared with
+    `_stats_cached`, so the delta schema covers every field the live scan
+    produces — nothing drops silently on mutation.
+
+    `ctx` carries cross-entry state if the caller has it (e.g.
+    `pending_compact` after a compact_boundary). Defaults to fresh state.
     """
-    result = {
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_read_tokens": 0, "cache_creation_tokens": 0,
-        "tool_uses": {}, "thinking_count": 0,
-    }
-    msg = entry.get("message") or {}
-    if msg.get("role") != "assistant":
-        return result
-    usage = msg.get("usage") or {}
-    result["input_tokens"] = int(usage.get("input_tokens") or 0)
-    result["output_tokens"] = int(usage.get("output_tokens") or 0)
-    result["cache_read_tokens"] = int(usage.get("cache_read_input_tokens") or 0)
-    result["cache_creation_tokens"] = int(usage.get("cache_creation_input_tokens") or 0)
-    content = msg.get("content")
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            t = block.get("type")
-            if t == "tool_use":
-                name = block.get("name") or "?"
-                result["tool_uses"][name] = result["tool_uses"].get(name, 0) + 1
-            elif t == "thinking":
-                result["thinking_count"] += 1
-    return result
+    acc = _empty_stats()
+    if ctx is None:
+        ctx = {"last_model": "?", "pending_compact": False}
+    _accumulate_entry_into(acc, entry, ctx)
+    return acc
 
 
 def _fold_delta_into(target: dict, delta: dict):
-    """Merge a `deleted_delta` dict into an accumulator in place."""
+    """Recursively fold `delta` into `target` in place. Scalars sum; dicts
+    recurse. Type-mismatched keys are skipped (defensive)."""
     if not delta:
         return
-    for k in ("input_tokens", "output_tokens", "cache_read_tokens",
-              "cache_creation_tokens", "thinking_count", "messages_deleted",
-              "messages_scrubbed"):
-        target[k] = target.get(k, 0) + (delta.get(k) or 0)
-    for name, count in (delta.get("tool_uses") or {}).items():
-        target["tool_uses"][name] = target["tool_uses"].get(name, 0) + count
+    for k, v in delta.items():
+        if isinstance(v, dict):
+            existing = target.get(k)
+            if existing is None:
+                target[k] = {}
+            elif not isinstance(existing, dict):
+                continue
+            _fold_delta_into(target[k], v)
+        elif isinstance(v, (int, float)):
+            existing = target.get(k, 0)
+            if isinstance(existing, dict):
+                continue
+            target[k] = (existing or 0) + v
 
 
 _TTT_FIELDS = ("input_tokens", "output_tokens",
@@ -702,6 +873,10 @@ def _format_entry_message(entry):
       3. Slash-command / queue / system events: top-level `entry.content`
          with no `message` object. Normalized into a pseudo-message with a
          prefix marker that the frontend renders as a badge.
+
+    Sets `has_tool_use` / `has_thinking` / `has_tool_result` booleans on the
+    output so the frontend can gate non-prose warnings (bulk edit/delete/scrub
+    UI) without re-parsing the flattened display content.
     """
     if entry.get("type") == "file-history-snapshot":
         return None
@@ -714,9 +889,6 @@ def _format_entry_message(entry):
                 "message": inner.get("message") or {},
             }
 
-    # Normalize "envelope 3" entries into a pseudo-message. Assigns a
-    # prefix marker by subtype so the frontend can render the right badge
-    # (see `_collapse_command_wrappers` and the processContent regex).
     if "message" not in entry and isinstance(entry.get("content"), str):
         t = entry.get("type")
         st = entry.get("subtype")
@@ -726,7 +898,7 @@ def _format_entry_message(entry):
             role, prefix = "user", "[Queued] "
         elif t == "system":
             if st == "local_command":
-                role, prefix = "system", ""  # content already carries <command-name>
+                role, prefix = "system", ""
             elif st == "away_summary":
                 role, prefix = "system", "[Away] "
             elif st == "compact_boundary":
@@ -738,7 +910,6 @@ def _format_entry_message(entry):
             else:
                 role, prefix = "system", "[System] "
         else:
-            # Unknown shape — skip rather than render as garbage.
             return None
         entry = {**entry, "message": {"role": role, "content": prefix + entry["content"]}}
 
@@ -751,6 +922,10 @@ def _format_entry_message(entry):
     usage = message_obj.get("usage")
     is_meta = entry.get("isMeta", False)
 
+    has_tool_use = False
+    has_thinking = False
+    has_tool_result = False
+
     tool_commands = []
     if isinstance(content, list):
         parts = []
@@ -761,6 +936,7 @@ def _format_entry_message(entry):
             if t == "text":
                 parts.append(block.get("text", ""))
             elif t == "tool_use":
+                has_tool_use = True
                 name = block.get("name", "?")
                 tid = block.get("id", "")
                 parts.append(f"[Tool: {name}:{tid}]")
@@ -769,8 +945,10 @@ def _format_entry_message(entry):
                     if cmd:
                         tool_commands.append({"id": tid, "command": cmd})
             elif t == "tool_result":
+                has_tool_result = True
                 parts.append("[Tool Result]")
             elif t == "thinking":
+                has_thinking = True
                 th = block.get("thinking", "")
                 if th:
                     parts.append(f"<thinking>{th}</thinking>")
@@ -791,6 +969,12 @@ def _format_entry_message(entry):
         msg["model"] = model
     if isinstance(usage, dict) and usage:
         msg["usage"] = usage
+    if has_tool_use:
+        msg["has_tool_use"] = True
+    if has_thinking:
+        msg["has_thinking"] = True
+    if has_tool_result:
+        msg["has_tool_result"] = True
     return msg
 
 
@@ -1257,24 +1441,12 @@ def api_overview():
     since_iso = (datetime.utcfromtimestamp(cutoff).isoformat() + "Z") if cutoff else None
     until_iso = (datetime.utcfromtimestamp(cutoff_upper).isoformat() + "Z") if cutoff_upper else None
 
-    totals = {
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_read_tokens": 0, "cache_creation_tokens": 0,
-        "tool_uses": {}, "thinking_count": 0,
-        "per_model": {}, "commands": {},
-        "tool_turn_tokens": {}, "command_turn_tokens": {},
-    }
-    archived_total = {
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_read_tokens": 0, "cache_creation_tokens": 0,
-        "tool_uses": {}, "thinking_count": 0, "messages_deleted": 0,
-        "commands": {}, "tool_turn_tokens": {}, "command_turn_tokens": {},
-    }
-    deleted_total = {
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_read_tokens": 0, "cache_creation_tokens": 0,
-        "tool_uses": {}, "thinking_count": 0, "messages_deleted": 0,
-    }
+    # All aggregation shapes derive from _empty_stats() so adding a new
+    # stat field auto-flows through totals, archived, deleted, and
+    # per-bucket folds without touching this function.
+    totals = _empty_stats()
+    archived_total = {**_empty_stats(), "messages_deleted": 0}
+    deleted_total = {**_empty_stats(), "messages_deleted": 0}
     models_seen: list = []
     branches_seen: list = []
     by_period: dict = {}
@@ -1283,30 +1455,23 @@ def api_overview():
     seen_paths: set = set()
 
     def _mk_bucket():
+        # archived_delta and deleted_delta use the full _empty_stats() shape
+        # (plus messages_deleted counter) so every tombstoned field surfaces.
         return {
             "input_tokens": 0, "cache_read_tokens": 0,
             "cache_creation_tokens": 0, "output_tokens": 0,
             "tool_calls": 0, "tool_uses": {}, "convos": 0,
             "per_model": {},
-            "archived_delta": {
-                "input_tokens": 0, "output_tokens": 0,
-                "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                "tool_uses": {}, "thinking_count": 0, "messages_deleted": 0,
-            },
-            "deleted_delta": {
-                "input_tokens": 0, "output_tokens": 0,
-                "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                "tool_uses": {}, "thinking_count": 0, "messages_deleted": 0,
-            },
+            "archived_delta": {**_empty_stats(), "messages_deleted": 0},
+            "deleted_delta": {**_empty_stats(), "messages_deleted": 0},
         }
 
     def _fold_into_bucket_delta(bucket_key: str, field: str, delta: dict):
         b = by_period.setdefault(bucket_key, _mk_bucket())
-        _fold_delta_into(b.setdefault(field, {
-            "input_tokens": 0, "output_tokens": 0,
-            "cache_read_tokens": 0, "cache_creation_tokens": 0,
-            "tool_uses": {}, "thinking_count": 0, "messages_deleted": 0,
-        }), delta)
+        _fold_delta_into(
+            b.setdefault(field, {**_empty_stats(), "messages_deleted": 0}),
+            delta,
+        )
 
     folder = request.args.get("folder")
 
@@ -1649,8 +1814,11 @@ def api_conversations(folder):
             "size_kb": round(size_kb, 1),
             "last_modified": _mtime_iso(stat.st_mtime),
             "preview": peek["preview"][:150],
+            "last_preview": peek.get("last_preview", "(empty)")[:150],
             "cwd": peek["cwd"],
         }
+        if peek.get("agent"):
+            c["agent"] = peek["agent"]
         if sort == "msgs":
             cached = peek_cache.get(f, stat)
             if cached and "message_count" in cached:
@@ -1846,12 +2014,23 @@ def api_conversation(folder, convo_id):
         agent_runs.append(out)
     agent_runs.sort(key=lambda r: r["first_ts"] or "")
 
+    peek = _peek(filepath, stat)
+    stats = _stats(filepath, stat)
+    header = {
+        "agent": peek.get("agent"),
+        "last_context_input_tokens": stats.get("last_context_input_tokens"),
+        "last_context_cache_creation_tokens": stats.get("last_context_cache_creation_tokens"),
+        "last_context_cache_read_tokens": stats.get("last_context_cache_read_tokens"),
+        "last_model_for_context": stats.get("last_model_for_context"),
+    }
+
     return jsonify({
         "main": page_main,
         "total": total_main,
         "offset": page_start,
         "limit": limit,
         "agent_runs": agent_runs,
+        "header": header,
     })
 
 
@@ -2085,6 +2264,7 @@ def api_archived_conversations(folder):
             "size_kb": round(stat.st_size / 1024, 1),
             "last_modified": _mtime_iso(stat.st_mtime),
             "preview": peek["preview"][:150],
+            "last_preview": peek.get("last_preview", "(empty)")[:150],
             "cwd": peek["cwd"],
             "archived": True,
         })
@@ -2184,9 +2364,49 @@ def api_bulk_assign_tag(folder):
     """Add or remove a single tag from multiple conversations."""
     payload = request.get_json(silent=True) or {}
     ids = payload.get("ids", [])
-    tag_index = payload.get("tag", 0)
+    tag_id = payload.get("tag", 0)
     add = payload.get("add", True)
-    count = tag_store.bulk_assign(folder, ids, tag_index, add)
+    count = tag_store.bulk_assign(folder, ids, tag_id, add)
+    return jsonify({"ok": True, "count": count})
+
+
+# ── Project-tag namespace ────────────────────────────────────────────
+# Parallel to the per-folder convo-tag endpoints above, but operating on
+# the single project-level tag set. Assignments are keyed by folder name
+# (not convo id), so "tag this project" vs. "tag this conversation" are
+# cleanly separated namespaces — they can share label names, they can
+# share colors, but their id spaces and assignment tables never mix.
+
+
+@app.route("/api/tags/projects")
+def api_get_project_tags():
+    """Return the project-level label definitions + folder→tag assignments."""
+    return jsonify(tag_store.get(("projects",)))
+
+
+@app.route("/api/tags/projects/labels", methods=["PUT"])
+def api_set_project_tag_labels():
+    labels = (request.get_json(silent=True) or {}).get("labels", [])
+    tag_store.set_labels_ns(("projects",), labels)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/tags/projects/assign", methods=["POST"])
+def api_assign_project_tags():
+    payload = request.get_json(silent=True) or {}
+    folder = payload.get("folder", "")
+    tags = payload.get("tags", [])
+    tag_store.assign_ns(("projects",), folder, tags)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/tags/projects/bulk-assign", methods=["POST"])
+def api_bulk_assign_project_tag():
+    payload = request.get_json(silent=True) or {}
+    folders = payload.get("folders", [])
+    tag_id = payload.get("tag", 0)
+    add = payload.get("add", True)
+    count = tag_store.bulk_assign_ns(("projects",), folders, tag_id, add)
     return jsonify({"ok": True, "count": count})
 
 
@@ -2221,10 +2441,48 @@ def _strip_blocks(entry, drop_tool_use_ids=None, drop_tool_result_ids=None):
     return bool(kept)
 
 
+def _find_message_file(folder: str, convo_id: str, msg_uuid: str) -> Path | None:
+    """Locate the JSONL file containing `msg_uuid`.
+
+    Searches the main convo file first, then subagent run files under
+    `<convo_id>/subagents/*.jsonl`. Returns the file Path or None.
+
+    Enables edit/delete on subagent-run messages (which live in separate
+    files from the main convo) without requiring the frontend to pass a
+    file hint — the backend resolves it.
+    """
+    main = CLAUDE_PROJECTS_DIR / folder / f"{convo_id}.jsonl"
+    candidates = []
+    if main.exists():
+        candidates.append(main)
+    sub = _subagents_dir(folder, convo_id)
+    if sub.is_dir():
+        candidates.extend(sorted(sub.glob("agent-*.jsonl")))
+    for fp in candidates:
+        try:
+            with open(fp, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("uuid") == msg_uuid:
+                        return fp
+        except OSError:
+            continue
+    return None
+
+
 @app.route("/api/projects/<folder>/conversations/<convo_id>/messages/<msg_uuid>", methods=["DELETE"])
 def api_delete_message(folder, convo_id, msg_uuid):
-    filepath = CLAUDE_PROJECTS_DIR / folder / f"{convo_id}.jsonl"
-    if not filepath.exists():
+    # Resolve the actual file — message may live in the main convo OR in a
+    # subagent run file (<convo_id>/subagents/agent-*.jsonl). Without this
+    # lookup, deletes on subagent-view messages returned 404.
+    filepath = _find_message_file(folder, convo_id, msg_uuid)
+    if not filepath:
         return jsonify({"error": "Not found"}), 404
 
     pre_stat = filepath.stat()
@@ -2246,11 +2504,15 @@ def api_delete_message(folder, convo_id, msg_uuid):
     if not deleted:
         return jsonify({"error": "Message not found"}), 404
 
-    # Accumulate stats about the message being removed BEFORE we mutate, so
-    # the totals survive the re-scan. Children whose blocks get stripped are
-    # usually tool_result-only; we don't count those separately (their tokens
-    # are already attributed to the parent assistant turn).
-    delta = _message_stats(deleted)
+    # Tombstone the full per-entry stats so totals survive the re-scan.
+    # Uses the uniform before/after pattern with after = empty (message is
+    # fully removed). ctx is replayed to the target's position so fields
+    # that depend on cross-entry state (compact_summary_chars) are captured.
+    # Children whose tool_result blocks get stripped below are already
+    # accounted for in the parent assistant turn — we don't double-count.
+    ctx_base = _ctx_at(entries, msg_uuid)
+    before = _message_stats(deleted, ctx=dict(ctx_base))
+    delta = _diff_stats(before, _empty_stats())
     delta["messages_deleted"] = 1
     peek_cache.accumulate_deleted(filepath, pre_stat, delta)
 
@@ -2613,18 +2875,29 @@ def _save_download_fields(data: dict) -> dict:
     methods=["POST"],
 )
 def api_edit_message(folder, convo_id, msg_uuid):
-    """Replace the text content of a prose-only message in place.
+    """Replace the text content of a message in place.
 
     Body: {"text": "<new content>"}. Preserves `usage`, `uuid`, `parentUuid`,
     `sessionId`, and message shape. Same resume-chain caveats as scrub.
+
+    Stats preservation: computes before/after `_message_stats` with ctx
+    replayed to the target's position, and tombstones the positive diff.
+    When the edit collapses tool_use / thinking / Bash content, the lost
+    counts (tool_uses, commands, thinking_count, tool_turn_tokens,
+    command_turn_tokens, thinking_output_tokens_estimate, plus per-model
+    breakdowns) move into `deleted_delta`. Tokens stay at 0 in the delta
+    because `usage` is preserved on the message. Always bumps
+    `messages_edited` so the "edited" smart filter matches even for
+    prose-only edits that produce an empty stats diff.
     """
     payload = request.get_json(silent=True) or {}
     new_text = payload.get("text")
     if not isinstance(new_text, str):
         return jsonify({"error": "Missing 'text' (string) in body."}), 400
 
-    filepath = CLAUDE_PROJECTS_DIR / folder / f"{convo_id}.jsonl"
-    if not filepath.exists():
+    # Resolve the actual file — may be the main convo or a subagent run file.
+    filepath = _find_message_file(folder, convo_id, msg_uuid)
+    if not filepath:
         return jsonify({"error": "Not found"}), 404
 
     pre_stat = filepath.stat()
@@ -2646,16 +2919,16 @@ def api_edit_message(folder, convo_id, msg_uuid):
     if not target:
         return jsonify({"error": "Message not found"}), 404
 
-    message = target.get("message") or {}
-    if not _is_prose_only(message):
-        return jsonify({
-            "error": "Edit only applies to prose-only messages (text blocks "
-                     "only — no tool_use, tool_result, thinking, or images)."
-        }), 400
+    ctx_base = _ctx_at(entries, msg_uuid)
+    before = _message_stats(target, ctx=dict(ctx_base))
 
+    message = target.get("message") or {}
     _replace_content(message, new_text)
 
-    peek_cache.accumulate_deleted(filepath, pre_stat, {"messages_scrubbed": 1})
+    after = _message_stats(target, ctx=dict(ctx_base))
+    delta = _diff_stats(before, after)
+    delta["messages_edited"] = 1
+    peek_cache.accumulate_deleted(filepath, pre_stat, delta)
 
     with open(filepath, "w") as f:
         for e in entries:

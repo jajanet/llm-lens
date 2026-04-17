@@ -15,14 +15,6 @@ import threading
 import time
 from pathlib import Path
 
-# Active-stats fields that should be zeroed on full-file deletion. Kept here
-# so `mark_deleted` doesn't need to know about the call site's shape.
-_ACTIVE_SCALAR_FIELDS = ("input_tokens", "output_tokens",
-                         "cache_read_tokens", "cache_creation_tokens",
-                         "thinking_count")
-_ACTIVE_DICT_FIELDS = ("tool_uses", "per_model")
-_ACTIVE_LIST_FIELDS = ("models",)
-
 CACHE_DIR = Path.home() / ".cache" / "llm-lens"
 CACHE_PATH = CACHE_DIR / "sessions.json"
 FLUSH_DELAY = 2.0  # seconds
@@ -201,15 +193,28 @@ def iter_all():
         return [(k, dict(v)) for k, v in _store.items()]
 
 
-def _merge_delta(target: dict, delta: dict):
-    """In-place add numeric fields and merge dict-of-counts fields."""
+def _merge_delta(target: dict, delta: dict, _depth: int = 0):
+    """Recursively fold `delta` into `target` in place. Scalars sum; dicts
+    recurse. Type-mismatched keys are skipped. Depth-limited (max 16) as a
+    defensive cap — the real stats shape only goes 3 levels deep
+    (per_model[model][tool_turn_tokens][tool][input_tokens])."""
+    if not delta or _depth > 16:
+        return
     for k, v in delta.items():
         if isinstance(v, dict):
-            sub = target.setdefault(k, {})
-            for kk, vv in v.items():
-                sub[kk] = sub.get(kk, 0) + vv
+            existing = target.get(k)
+            if existing is None:
+                target[k] = {}
+            elif not isinstance(existing, dict):
+                continue
+            if target[k] is v:
+                continue
+            _merge_delta(target[k], v, _depth + 1)
         elif isinstance(v, (int, float)):
-            target[k] = target.get(k, 0) + v
+            existing = target.get(k, 0)
+            if isinstance(existing, dict):
+                continue
+            target[k] = (existing or 0) + v
 
 
 def accumulate_deleted(filepath, stat, delta: dict):
@@ -239,30 +244,35 @@ def accumulate_deleted(filepath, stat, delta: dict):
 
 
 def mark_deleted(filepath, final_stats: dict):
-    """Tombstone an entry: move its active stats into `deleted_delta`, zero
-    actives, drop mtime/size so it won't accidentally rematch if the path is
-    reused by a new file. Safe to call multiple times (deltas add)."""
+    """Tombstone an entry: move all quantity fields from `final_stats` into
+    `deleted_delta`, zero actives, drop mtime/size so it won't rematch if the
+    path is reused. Safe to call multiple times (deltas add).
+
+    The delta shape ≡ `_empty_stats()` shape. Identity fields (`models` list,
+    `git_branch`, `last_context_*`, `last_model_for_context`) are filtered
+    out — they're per-file snapshots, not aggregateable quantities.
+
+    `deleted_delta` and `archived_delta` keys on the incoming stats are
+    skipped: `_stats()` decorates its live output with an echo of the
+    existing tombstone, so re-folding would double-count any prior edit
+    or per-message delete tombstones into a nested `deleted_delta` sub-dict.
+    """
     global _dirty
     key = str(filepath)
+    delta = {}
+    for k, v in (final_stats or {}).items():
+        if k in ("deleted_delta", "archived_delta"):
+            continue
+        if k.startswith("last_context_") or k == "last_model_for_context":
+            continue
+        if isinstance(v, dict) and v:
+            delta[k] = v
+        elif isinstance(v, (int, float)) and v:
+            delta[k] = v
     with _lock:
         entry = _store.get(key, {})
         dd = entry.get("deleted_delta") or {}
-
-        delta = {}
-        for k in _ACTIVE_SCALAR_FIELDS:
-            v = final_stats.get(k) or 0
-            if v:
-                delta[k] = v
-        for k in _ACTIVE_DICT_FIELDS:
-            v = final_stats.get(k)
-            if isinstance(v, dict) and v:
-                # per_model values are themselves dicts; flatten into tool_uses
-                # for the top-level delta, skip per_model (we don't surface it
-                # in the deleted view — keep the delta shape flat).
-                if k == "tool_uses":
-                    delta[k] = dict(v)
         _merge_delta(dd, delta)
-
         new_entry = {
             "mtime": None,
             "size": 0,

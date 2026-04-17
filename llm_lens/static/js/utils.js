@@ -834,17 +834,31 @@ function renderStatsCombined(s, opts) {
     const add = (obj) => { for (const [n, c] of Object.entries(obj || {})) out[n] = (out[n] || 0) + c; };
     if (f.active) add(s.commands);
     if (f.archived) add(a.commands);
+    if (f.deleted) add(d.commands);
     return out;
   };
   // Session-artifact counters (slash commands, queued drafts, compactions,
-  // …) aren't tombstoned across archive/delete states — they're either
-  // present in the current file or not. Pull straight from `s`.
-  const slashCommands = s.slash_commands || {};
-  const queuedCount = s.queued_count || 0;
-  const compactCount = s.compact_count || 0;
-  const awayCount = s.away_count || 0;
-  const infoCount = s.info_count || 0;
-  const scheduledCount = s.scheduled_count || 0;
+  // …) ARE now tombstoned on every edit/scrub/delete, so union them across
+  // active/archived/deleted per the filter toggles. When the "deleted"
+  // filter is off, behavior matches the pre-tombstone UI (counters appear
+  // only from the current file).
+  const mergeCountDict = (key) => {
+    const out = {};
+    const add = (obj) => { for (const [n, c] of Object.entries(obj || {})) out[n] = (out[n] || 0) + c; };
+    if (f.active) add(s[key]);
+    if (f.archived) add(a[key]);
+    if (f.deleted) add(d[key]);
+    return out;
+  };
+  const sumCounter = (k) => (f.active ? (s[k] || 0) : 0)
+                          + (f.archived ? (a[k] || 0) : 0)
+                          + (f.deleted  ? (d[k] || 0) : 0);
+  const slashCommands = mergeCountDict("slash_commands");
+  const queuedCount = sumCounter("queued_count");
+  const compactCount = sumCounter("compact_count");
+  const awayCount = sumCounter("away_count");
+  const infoCount = sumCounter("info_count");
+  const scheduledCount = sumCounter("scheduled_count");
   const eff = {
     input_tokens: sum("input_tokens"),
     output_tokens: sum("output_tokens"),
@@ -868,7 +882,26 @@ function renderStatsCombined(s, opts) {
   const toolEntries = Object.entries(eff.tool_uses).sort((a, b) => b[1] - a[1]);
   const toolTotal = toolEntries.reduce((n, [, c]) => n + c, 0);
 
-  const costCarrier = { ...eff, models: s.models, per_model: s.per_model };
+  // per_model union across active/archived/deleted so tool/command cost
+  // breakdowns and total cost survive edit/scrub/delete. Tombstoned
+  // per_model entries carry the same shape as live per_model (tokens,
+  // tool_uses, commands, tool_turn_tokens, command_turn_tokens,
+  // thinking_count).
+  const foldRecursive = (tgt, src0) => {
+    for (const [k, v] of Object.entries(src0 || {})) {
+      if (v && typeof v === "object") {
+        if (!tgt[k] || typeof tgt[k] !== "object") tgt[k] = {};
+        foldRecursive(tgt[k], v);
+      } else if (typeof v === "number") {
+        tgt[k] = (tgt[k] || 0) + v;
+      }
+    }
+  };
+  const mergedPerModel = {};
+  if (f.active)   foldRecursive(mergedPerModel, s.per_model);
+  if (f.archived) foldRecursive(mergedPerModel, a.per_model);
+  if (f.deleted)  foldRecursive(mergedPerModel, d.per_model);
+  const costCarrier = { ...eff, models: s.models, per_model: mergedPerModel };
   const costIn  = costByType(costCarrier, "input_tokens");
   const costCR  = costByType(costCarrier, "cache_read_tokens");
   const costCW  = costByType(costCarrier, "cache_creation_tokens");
