@@ -414,6 +414,10 @@ document.body.addEventListener("mouseover", (e) => {
   }
 });
 
+const appEl = document.getElementById("app");
+document.getElementById("scroll-top").addEventListener("click", () => appEl.scrollTo({ top: 0, behavior: "smooth" }));
+document.getElementById("scroll-bottom").addEventListener("click", () => appEl.scrollTo({ top: appEl.scrollHeight, behavior: "smooth" }));
+
 // Fetch the effective context-window plan once on boot. Sets state.planContextWindow
 // which contextWindowFor uses as an override. Fire-and-forget; if this races with
 // the first stats render, the next render will pick it up (re-renders are cheap).
