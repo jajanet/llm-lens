@@ -271,7 +271,7 @@ function renderToolbar() {
   // the button would let the user kick off a redundant fetch that then
   // also resets pagination counters in a confusing way.
   if (!state.agentRunId && state.msgOffset > 0 && !state.msgSearch) {
-    extra += `<button class="btn" data-action="load-earlier-msgs">Earlier (${state.msgOffset})</button> `;
+    extra += `<span class="split-btn"><button class="btn" data-action="load-earlier-msgs">Earlier (${state.msgOffset})</button><button class="btn split-arrow" data-action="open-earlier-menu" title="More options">▾</button></span> `;
   }
   // Agent-run index — comprehensive list (anchored + standalone). Anchored
   // runs also have inline `→` markers in the transcript; this button is
@@ -499,9 +499,10 @@ function processContent(raw, commands) {
 
   const visible = c.replace(/__THINK_\d+__/g, "").replace(/__TOOL_\d+__/g, "").trim();
   const hasText = Boolean(visible);
+  const lineCount = visible ? visible.split("\n").length : 0;
   const hasTools = toolBadges.length > 0;
   const hasThinking = thinkingBlocks.length > 0;
-  if (!hasText && !hasThinking && !hasTools) return { html: "", hasText: false, toolNames: [], hasThinking: false };
+  if (!hasText && !hasThinking && !hasTools) return { html: "", hasText: false, lineCount: 0, toolNames: [], hasThinking: false };
 
   c = esc(c);
   if (state.showWhitespace) {
@@ -511,7 +512,7 @@ function processContent(raw, commands) {
   thinkingBlocks.forEach((html, i) => { c = c.replace(`__THINK_${i}__`, html); });
   toolBadges.forEach((html, i) => { c = c.replace(`__TOOL_${i}__`, html); });
   c = c.replace(/\n/g, "<br>");
-  return { html: c, hasText, toolNames, hasThinking };
+  return { html: c, hasText, lineCount, toolNames, hasThinking };
 }
 
 
@@ -556,7 +557,7 @@ function renderChatMessages(msgs, query) {
     const c = processContent(m.content || "", m.commands);
     if (!c.html) continue;
     const finalHtml = query ? highlightText(c.html, query) : c.html;
-    processed.push({ m, html: finalHtml, hasText: c.hasText, toolNames: c.toolNames, hasThinking: c.hasThinking });
+    processed.push({ m, html: finalHtml, hasText: c.hasText, lineCount: c.lineCount, toolNames: c.toolNames, hasThinking: c.hasThinking });
   }
 
   const qLower = (query || "").toLowerCase();
@@ -606,13 +607,15 @@ function renderChatMessages(msgs, query) {
 const expandedGroups = new Set();
 
 function renderSingleMsg(p, compact) {
-  const { m, html: c, toolNames, hasThinking } = p;
+  const { m, html: c, lineCount, toolNames, hasThinking } = p;
   const role = m.role === "user" ? "user" : "assistant";
   const ck = state.msgSelected.has(m.uuid) ? "checked" : "";
   const checkHtml = m.uuid
     ? `<input type="checkbox" class="chat-check" ${ck} data-action="toggle-msg-sel" data-uuid="${escAttr(m.uuid)}">`
     : "";
   const canEdit = !!m.uuid;
+  const LONG_LINES = 5;
+  const isLong = !compact && lineCount > LONG_LINES;
   // Non-prose = has tool_use or thinking blocks. Editing collapses them to a
   // single text block: stats are preserved via tombstones (tool_uses,
   // commands, thinking_count, turn-token slices, per_model) but the raw
@@ -658,7 +661,11 @@ function renderSingleMsg(p, compact) {
     }
   }
 
-  return `<div class="chat-msg ${role}${compact ? " compact" : ""}">${checkHtml}<div class="${bubbleCls}"${bubbleUuidAttr}>${actionsHtml}${metaHtml}<div class="msg-content">${c}${agentInline}</div></div></div>`;
+  const longHtml = isLong
+    ? `<div class="msg-content msg-long-collapsed">${c}${agentInline}</div><div class="msg-long-expand" data-action="toggle-msg-expand">Show more ▾</div>`
+    : `<div class="msg-content">${c}${agentInline}</div>`;
+
+  return `<div class="chat-msg ${role}${compact ? " compact" : ""}">${checkHtml}<div class="${bubbleCls}"${bubbleUuidAttr}>${actionsHtml}${metaHtml}${longHtml}</div></div></div>`;
 }
 
 function renderToolGroup(items, groupId, expanded) {
@@ -689,6 +696,41 @@ export async function loadEarlier() {
   state.msgData.main = earlier.main.concat(state.msgData.main);
   state.msgOffset = newOffset;
   render();
+}
+
+export async function loadEntireConvo() {
+  if (state.msgOffset <= 0) return;
+  const all = await api.messages(state.folder, state.convoId, { offset: 0, limit: state.msgOffset });
+  state.msgData.main = all.main.concat(state.msgData.main);
+  state.msgOffset = 0;
+  render();
+}
+
+export function openEarlierMenu(anchorEl) {
+  const existing = document.querySelector(".transform-menu[data-earlier='1']");
+  if (existing) { existing.remove(); return; }
+  document.querySelectorAll(".transform-menu").forEach((el) => el.remove());
+
+  const menu = document.createElement("div");
+  menu.className = "transform-menu";
+  menu.dataset.earlier = "1";
+  menu.innerHTML = `<button class="btn btn-sm transform-menu-item" data-action="load-entire-convo" title="Load all remaining messages from the beginning of the conversation.">Load entire convo</button>`;
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.position = "absolute";
+  menu.style.left = `${rect.left + window.scrollX}px`;
+  menu.style.visibility = "hidden";
+  document.body.appendChild(menu);
+  menu.style.top = `${rect.bottom + window.scrollY + 2}px`;
+  menu.style.visibility = "";
+  setTimeout(() => {
+    const handler = (ev) => {
+      if (!menu.contains(ev.target) && ev.target !== anchorEl) {
+        menu.remove();
+        document.removeEventListener("click", handler, true);
+      }
+    };
+    document.addEventListener("click", handler, true);
+  }, 0);
 }
 
 export function toggleWhitespace() {
@@ -1703,6 +1745,66 @@ export function downloadRawConvo() {
   a.remove();
 }
 
+export function openRawConvoMenu(anchorEl) {
+  const existing = document.querySelector(".transform-menu[data-raw-convo='1']");
+  if (existing) { existing.remove(); return; }
+  document.querySelectorAll(".transform-menu").forEach((el) => el.remove());
+
+  const menu = document.createElement("div");
+  menu.className = "transform-menu";
+  menu.dataset.rawConvo = "1";
+  menu.innerHTML = `<button class="btn btn-sm transform-menu-item" data-action="download-raw-convo" title="Download the full conversation's original JSONL — preserves all metadata, parent chain, tool blocks.">Download raw convo</button>`;
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.position = "absolute";
+  menu.style.left = `${rect.left + window.scrollX}px`;
+  menu.style.visibility = "hidden";
+  document.body.appendChild(menu);
+  menu.style.top = `${rect.bottom + window.scrollY + 2}px`;
+  menu.style.visibility = "";
+  setTimeout(() => {
+    const handler = (ev) => {
+      if (!menu.contains(ev.target) && ev.target !== anchorEl) {
+        menu.remove();
+        document.removeEventListener("click", handler, true);
+      }
+    };
+    document.addEventListener("click", handler, true);
+  }, 0);
+}
+
+export async function previewRawConvo() {
+  if (!state.folder || !state.convoId) return;
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `
+    <div class="modal modal-wide" style="max-width:880px">
+      <button class="modal-close" data-modal-cancel aria-label="Close">&times;</button>
+      <h3>Raw JSONL — ${esc(state.convoId || "conversation")}</h3>
+      <div class="modal-body" style="max-height:calc(100vh - 200px)">
+        <div class="stats-loading">loading…</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-cancel" data-modal-cancel>Close</button>
+        <button class="btn-confirm-delete" data-action="download-raw-convo" title="Download the raw JSONL file">Download</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const close = () => overlay.remove();
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay || e.target.matches("[data-modal-cancel]")) close();
+  });
+
+  let text;
+  try {
+    text = await api.fetchRawConvo(state.folder, state.convoId);
+  } catch (e) {
+    overlay.querySelector(".modal-body").innerHTML = `<div class="stats-dim">Failed to load: ${esc(e.message)}</div>`;
+    return;
+  }
+  overlay.querySelector(".modal-body").innerHTML = `<pre style="margin:0;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.5;font-family:ui-monospace,SFMono-Regular,SF Mono,Menlo,monospace">${esc(text)}</pre>`;
+}
+
 export async function saveSelected() {
   const uuids = [...state.msgSelected];
   if (!uuids.length) return;
@@ -1759,6 +1861,13 @@ export function toggleToolGroup(groupId) {
   if (expandedGroups.has(groupId)) expandedGroups.delete(groupId);
   else expandedGroups.add(groupId);
   render();
+}
+
+export function toggleMsgExpand(el) {
+  const bubble = el.closest(".chat-bubble");
+  const content = bubble.querySelector(".msg-content");
+  const collapsed = content.classList.toggle("msg-long-collapsed");
+  el.textContent = collapsed ? "Show more ▾" : "Show less ▴";
 }
 
 

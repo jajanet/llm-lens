@@ -154,6 +154,12 @@ export const api = {
   rawConversationUrl: (folder, convoId) =>
     `/api/projects/${encodeURIComponent(folder)}/conversations/${encodeURIComponent(convoId)}/raw`,
 
+  fetchRawConvo: async (folder, convoId) => {
+    const r = await fetch(`/api/projects/${encodeURIComponent(folder)}/conversations/${encodeURIComponent(convoId)}/raw`);
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    return r.text();
+  },
+
   extractMessages: (folder, convoId, uuids) =>
     json(`/api/projects/${folder}/conversations/${convoId}/extract`, {
       method: "POST",

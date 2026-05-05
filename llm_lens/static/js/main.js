@@ -206,6 +206,8 @@ const actions = {
 
   // Messages view
   "load-earlier-msgs":()       => Messages.loadEarlier(),
+  "open-earlier-menu": (_e, el) => Messages.openEarlierMenu(el),
+  "load-entire-convo":()       => Messages.loadEntireConvo(),
   "open-agent":       (_e, el) => navigate(`/p/${encodeURIComponent(state.folder)}/c/${encodeURIComponent(state.convoId)}/a/${encodeURIComponent(el.dataset.runId)}`),
   "open-agents-menu": (_e, el) => Messages.openAgentsMenu(el),
   "open-stats-modal": ()       => {
@@ -271,6 +273,8 @@ const actions = {
   "open-export-menu": (_e, el) => Messages.openExportMenu(el),
   "open-jsonl-fields":()       => Messages.openJsonlFieldsModal(),
   "download-raw-convo":()      => Messages.downloadRawConvo(),
+  "preview-raw-convo": ()       => Messages.previewRawConvo(),
+  "open-raw-convo-menu": (_e, el) => Messages.openRawConvoMenu(el),
   "set-stats-view":   (_e, el) => {
     const modal = el.closest(".modal");
     if (!modal) return;
@@ -284,6 +288,7 @@ const actions = {
     const t = document.getElementById(el.dataset.target);
     if (t) t.style.display = t.style.display === "none" ? "block" : "none";
   },
+  "toggle-msg-expand": (_e, el) => Messages.toggleMsgExpand(el),
 
   // View mode — delegates to the current view
   "set-view-mode":    (_e, el) => {
